@@ -187,14 +187,215 @@ def sanitizer_symbol_problems(nm_output: str) -> list[str]:
     return problems
 
 
-def onnx_link_problems(link_output: str) -> list[str]:
-    accepted = ("libonnxruntime.1.31.0.dylib", "libonnxruntime.so.1.31.0")
-    if any(name in link_output for name in accepted):
-        return []
-    return [
-        "benchmark binary does not link the pinned ONNX Runtime 1.31.0 CPU library "
-        "(expected libonnxruntime.1.31.0.dylib or libonnxruntime.so.1.31.0)"
+RECOGNIZED_ORT_INSTALL_NAMES = frozenset(
+    {
+        "libonnxruntime.1.31.0.dylib",
+        "libonnxruntime.1.dylib",
+        "libonnxruntime.so.1.31.0",
+        "libonnxruntime.so.1",
+    }
+)
+VERSIONED_ORT_FILENAMES = (
+    "libonnxruntime.1.31.0.dylib",
+    "libonnxruntime.so.1.31.0",
+)
+
+
+def install_basename(token: str) -> str:
+    return token.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def parse_otool_dependencies(link_output: str) -> list[str]:
+    """Dependency install names from otool -L. The Mach-O version field is ignored."""
+    names = []
+    for line in link_output.splitlines():
+        if not line.startswith((" ", "\t")):
+            continue
+        text = line.strip()
+        for marker in (" (compatibility", " (architecture"):
+            if marker in text:
+                text = text.split(marker, 1)[0]
+        text = text.strip()
+        if text:
+            names.append(text)
+    return names
+
+
+def parse_ldd_dependencies(link_output: str) -> list[tuple[str, str | None]]:
+    found = []
+    for line in link_output.splitlines():
+        if "=>" not in line:
+            continue
+        left, right = line.split("=>", 1)
+        name = left.strip()
+        target = right.strip()
+        if target.startswith("not found"):
+            found.append((name, None))
+            continue
+        path = target.split(" (", 1)[0].strip()
+        found.append((name, path or None))
+    return found
+
+
+def parse_rpaths(load_command_output: str) -> list[str]:
+    rpaths = []
+    command = ""
+    for line in load_command_output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("cmd "):
+            command = stripped.split(None, 1)[1]
+            continue
+        if command != "LC_RPATH" or not stripped.startswith("path "):
+            continue
+        payload = stripped[len("path ") :]
+        rpaths.append(payload.split(" (offset", 1)[0].strip())
+    return rpaths
+
+
+def expand_loader_token(token: str, binary: pathlib.Path) -> pathlib.Path:
+    for prefix in ("@executable_path", "@loader_path"):
+        if token == prefix:
+            return binary.parent
+        marker = prefix + "/"
+        if token.startswith(marker):
+            return binary.parent / token[len(marker) :]
+    return pathlib.Path(token)
+
+
+def require_runtime_version(runtime_root: pathlib.Path) -> None:
+    version_file = runtime_root / "VERSION_NUMBER"
+    if not version_file.is_file():
+        raise CollectorError(f"ONNX Runtime VERSION_NUMBER is missing: {version_file}")
+    text = version_file.read_text(encoding="utf-8").strip()
+    if text != ONNXRUNTIME_VERSION:
+        raise CollectorError(
+            f"ONNX Runtime VERSION_NUMBER is {text!r}, expected {ONNXRUNTIME_VERSION!r}"
+        )
+
+
+def expected_versioned_library(runtime_root: pathlib.Path) -> pathlib.Path:
+    present = [
+        runtime_root / "lib" / name
+        for name in VERSIONED_ORT_FILENAMES
+        if (runtime_root / "lib" / name).is_file()
     ]
+    if len(present) != 1:
+        raise CollectorError(
+            "pinned ONNX Runtime installation does not contain exactly one "
+            f"1.31.0 library under {runtime_root / 'lib'}, found {len(present)}"
+        )
+    return present[0].resolve()
+
+
+def select_ort_install_names(names: list[str]) -> list[str]:
+    ort_names = [name for name in names if "onnxruntime" in install_basename(name).lower()]
+    if not ort_names:
+        raise CollectorError("benchmark binary does not link ONNX Runtime")
+    unrecognized = [
+        name for name in ort_names if install_basename(name) not in RECOGNIZED_ORT_INSTALL_NAMES
+    ]
+    if unrecognized:
+        raise CollectorError(f"unrecognized ONNX Runtime dependency: {unrecognized[0]}")
+    if len(ort_names) != 1:
+        raise CollectorError(
+            "ONNX Runtime library resolution is ambiguous: " + ", ".join(ort_names)
+        )
+    return ort_names
+
+
+def existing_library_candidate(candidate: pathlib.Path) -> pathlib.Path | None:
+    if candidate.is_symlink() and not candidate.exists():
+        raise CollectorError(
+            "ONNX Runtime symlink target is missing: "
+            f"{candidate} -> {os.readlink(candidate)}"
+        )
+    if not candidate.exists():
+        return None
+    return candidate
+
+
+def macho_resolution_candidates(
+    install_name: str,
+    binary: pathlib.Path,
+    rpaths: list[str],
+) -> list[pathlib.Path]:
+    if install_name.startswith("@rpath/"):
+        relative = install_name[len("@rpath/") :]
+        if not rpaths:
+            raise CollectorError(f"unable to resolve {install_name}: the binary has no LC_RPATH entries")
+        found = []
+        searched = []
+        for rpath in rpaths:
+            candidate = expand_loader_token(rpath, binary) / relative
+            searched.append(str(candidate))
+            located = existing_library_candidate(candidate)
+            if located is not None:
+                found.append(located)
+        if not found:
+            raise CollectorError(
+                f"unable to resolve {install_name}: searched {', '.join(searched)}"
+            )
+        return found
+    if install_name.startswith(("@executable_path", "@loader_path", "/")):
+        candidate = expand_loader_token(install_name, binary)
+        located = existing_library_candidate(candidate)
+        if located is None:
+            raise CollectorError(f"unable to resolve {install_name}: {candidate} does not exist")
+        return [located]
+    raise CollectorError(
+        f"unable to resolve {install_name}: install name is not @rpath, "
+        "@executable_path, @loader_path, or an absolute path"
+    )
+
+
+def require_pinned_library(resolved: list[pathlib.Path], runtime_root: pathlib.Path) -> pathlib.Path:
+    unique = list(dict.fromkeys(path.resolve() for path in resolved))
+    if len(unique) != 1:
+        raise CollectorError(
+            "ONNX Runtime library resolution is ambiguous: "
+            + ", ".join(str(path) for path in unique)
+        )
+    chosen = unique[0]
+    root = runtime_root.resolve()
+    expected = expected_versioned_library(runtime_root)
+    if not chosen.is_relative_to(root):
+        raise CollectorError(
+            f"resolved ONNX Runtime library {chosen} is outside the pinned installation {root}"
+        )
+    if chosen != expected:
+        raise CollectorError(
+            f"resolved ONNX Runtime library {chosen} is not the pinned 1.31.0 library {expected}"
+        )
+    return chosen
+
+
+def verify_linked_onnx_runtime(
+    *,
+    binary: pathlib.Path,
+    runtime_root: pathlib.Path,
+    link_output: str,
+    load_command_output: str = "",
+) -> pathlib.Path:
+    """Resolve the linked ONNX Runtime library onto the pinned 1.31.0 file."""
+    require_runtime_version(runtime_root)
+    if "=>" in link_output:
+        entries = parse_ldd_dependencies(link_output)
+        names = select_ort_install_names([name for name, _target in entries])
+        install_name = names[0]
+        target = next(path for name, path in entries if name == install_name)
+        if target is None:
+            raise CollectorError(f"unable to resolve {install_name}: loader reported not found")
+        located = existing_library_candidate(pathlib.Path(target))
+        if located is None:
+            raise CollectorError(f"unable to resolve {install_name}: {target} does not exist")
+        return require_pinned_library([located], runtime_root)
+    names = select_ort_install_names(parse_otool_dependencies(link_output))
+    candidates = macho_resolution_candidates(
+        names[0],
+        binary,
+        parse_rpaths(load_command_output),
+    )
+    return require_pinned_library(candidates, runtime_root)
 
 
 def version_text_problems(stdout: str, stderr: str, returncode: int) -> list[str]:
@@ -505,7 +706,7 @@ def locate_build_dir(binary: pathlib.Path) -> pathlib.Path:
     return binary.parent
 
 
-def read_version_number(cache: dict[str, str], build_dir: pathlib.Path) -> str:
+def locate_pinned_runtime(cache: dict[str, str], build_dir: pathlib.Path) -> pathlib.Path:
     root = cache.get("INFEREDGE_ONNXRUNTIME_ROOT", "")
     candidates: list[pathlib.Path] = []
     if root:
@@ -520,12 +721,14 @@ def read_version_number(cache: dict[str, str], build_dir: pathlib.Path) -> str:
             "expected one ONNX Runtime VERSION_NUMBER file under the build "
             f"directory, found {len(files)}. Refusing to guess the runtime version"
         )
-    text = files[0].read_text(encoding="utf-8").strip()
-    if text != ONNXRUNTIME_VERSION:
-        raise CollectorError(
-            f"ONNX Runtime VERSION_NUMBER is {text!r}, expected {ONNXRUNTIME_VERSION!r}"
-        )
-    return text
+    runtime_root = files[0].parent
+    require_runtime_version(runtime_root)
+    return runtime_root
+
+
+def read_version_number(cache: dict[str, str], build_dir: pathlib.Path) -> str:
+    version_file = locate_pinned_runtime(cache, build_dir) / "VERSION_NUMBER"
+    return version_file.read_text(encoding="utf-8").strip()
 
 
 def query_text(runner, args: list[str], cwd: pathlib.Path | None = None) -> ProcessResult:
@@ -626,16 +829,29 @@ def preflight(
     if symbol_problems:
         raise CollectorError("; ".join(symbol_problems))
 
+    runtime_root = locate_pinned_runtime(cache, build_dir)
     linked = query_text(runner, link_tool_args(binary))
-    if linked.returncode != 0:
+    if linked.returncode != 0 and not linked.stdout.strip():
         raise CollectorError(
             "could not identify the ONNX Runtime library linked into the benchmark binary: "
             f"{linked.stderr.strip() or linked.stdout.strip()}"
         )
-    link_problems = onnx_link_problems(linked.stdout + linked.stderr)
-    if link_problems:
-        raise CollectorError("; ".join(link_problems))
-    onnx_version = read_version_number(cache, build_dir)
+    load_command_output = ""
+    if platform.system() == "Darwin":
+        load_commands = query_text(runner, ["otool", "-l", str(binary)])
+        if load_commands.returncode != 0:
+            raise CollectorError(
+                "could not read Mach-O load commands for the benchmark binary: "
+                f"{load_commands.stderr.strip() or load_commands.stdout.strip()}"
+            )
+        load_command_output = load_commands.stdout
+    resolved_library = verify_linked_onnx_runtime(
+        binary=binary,
+        runtime_root=runtime_root,
+        link_output=linked.stdout + linked.stderr,
+        load_command_output=load_command_output,
+    )
+    onnx_version = (runtime_root / "VERSION_NUMBER").read_text(encoding="utf-8").strip()
 
     version = query_text(runner, [str(binary), "--version"])
     version_problems = version_text_problems(version.stdout, version.stderr, version.returncode)
@@ -697,6 +913,7 @@ def preflight(
             "benchmark_binary_sha256": sha256_file(binary),
             "benchmark_tool_version": TOOL_VERSION,
             "onnxruntime_link_output": linked.stdout,
+            "onnxruntime_resolved_library": str(resolved_library),
         },
         "verified_configuration": {
             "cmake_build_type": cache["CMAKE_BUILD_TYPE"],
@@ -917,12 +1134,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runs", type=int, default=5, help="Counted runs per workload")
     parser.add_argument("--delay-seconds", type=float, default=5.0)
     parser.add_argument("--expected-commit", default=EXPECTED_COMMIT)
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Check the Release binary and repository, then exit without running trials",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.preflight_only:
+            checked = preflight(
+                repo_root=pathlib.Path(args.repo_root).resolve(),
+                binary=pathlib.Path(args.binary).resolve(),
+                expected_commit=args.expected_commit,
+                warmup=args.warmup,
+                iterations=args.iterations,
+                check_interval=args.check_interval,
+                counted_runs=args.runs,
+                delay_seconds=args.delay_seconds,
+            )
+            print("preflight passed")
+            print(checked["queried"]["onnxruntime_resolved_library"])
+            return 0
         run_set = collect(args)
     except CollectorError as exc:
         print(f"error: {exc}", file=sys.stderr)

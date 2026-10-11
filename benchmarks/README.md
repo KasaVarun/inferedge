@@ -6,6 +6,8 @@
 
 Use a dedicated Release build. Debug and ASan/UBSan binaries are rejected. The collector reads `CMakeCache.txt` beside the binary, records the compiler and linker flags it finds, and refuses the run when `CMAKE_BUILD_TYPE` is not `Release` or when sanitizer flags or sanitizer symbols are present. It does not assume a particular optimization spelling such as `-O3`.
 
+ONNX Runtime must be the pinned 1.31.0 CPU package selected by that build. On macOS the load command may name `@rpath/libonnxruntime.1.dylib` or the fully versioned `libonnxruntime.1.31.0.dylib`. The collector reads `LC_RPATH`, expands `@executable_path` and `@loader_path`, follows the symlink, and requires the resolved file to be `lib/libonnxruntime.1.31.0.dylib` inside that package. On Linux it accepts `libonnxruntime.so.1` and `libonnxruntime.so.1.31.0` under the same rule. A filename that merely contains `onnxruntime` is not enough, and the Mach-O current-version field is not treated as proof. `--preflight-only` runs these checks and does not start a trial.
+
 Configure and build:
 
 ```bash

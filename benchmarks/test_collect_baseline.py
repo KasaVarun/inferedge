@@ -16,6 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from benchmarks.collect_baseline import (  # noqa: E402
     EXPECTED_COMMIT,
+    CollectorError,
     ProcessResult,
     approved_untracked_paths,
     assess_build_cache,
@@ -27,6 +28,7 @@ from benchmarks.collect_baseline import (  # noqa: E402
     subprocess_runner,
     trial_ids,
     validate_report,
+    verify_linked_onnx_runtime,
 )
 
 ADD_MODEL = "/models/add_f32.onnx"
@@ -428,6 +430,176 @@ class CollectionProtocolTest(unittest.TestCase):
             "CMAKE_EXE_LINKER_FLAGS": "",
             "CMAKE_EXE_LINKER_FLAGS_RELEASE": "",
         }
+
+
+class OnnxLinkageTest(unittest.TestCase):
+    def test_macos_versioned_dylib_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            versioned = self._runtime(root, "libonnxruntime.1.31.0.dylib")
+            resolved = self._verify_macho(root, "@rpath/libonnxruntime.1.31.0.dylib", [root / "lib"])
+            self.assertEqual(resolved, versioned.resolve())
+
+    def test_macos_abi_symlink_resolves_to_pinned_library(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            versioned = self._runtime(root, "libonnxruntime.1.31.0.dylib")
+            (root / "lib" / "libonnxruntime.1.dylib").symlink_to("libonnxruntime.1.31.0.dylib")
+            resolved = self._verify_macho(root, "@rpath/libonnxruntime.1.dylib", [root / "lib"])
+            self.assertEqual(resolved, versioned.resolve())
+
+    def test_wrong_runtime_version_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            self._runtime(root, "libonnxruntime.1.31.0.dylib", version="1.22.0")
+            with self.assertRaises(CollectorError) as caught:
+                self._verify_macho(root, "@rpath/libonnxruntime.1.31.0.dylib", [root / "lib"])
+            self.assertIn("1.22.0", str(caught.exception))
+
+    def test_missing_symlink_target_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            (root / "lib").mkdir()
+            (root / "VERSION_NUMBER").write_text("1.31.0\n", encoding="utf-8")
+            (root / "lib" / "libonnxruntime.1.dylib").symlink_to("libonnxruntime.1.31.0.dylib")
+            with self.assertRaises(CollectorError) as caught:
+                self._verify_macho(root, "@rpath/libonnxruntime.1.dylib", [root / "lib"])
+            self.assertIn("symlink target is missing", str(caught.exception))
+
+    def test_library_outside_pinned_installation_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = pathlib.Path(temporary)
+            root = base / "pinned"
+            self._runtime(root, "libonnxruntime.1.31.0.dylib")
+            foreign = base / "other" / "libonnxruntime.1.31.0.dylib"
+            foreign.parent.mkdir()
+            foreign.write_bytes(b"foreign")
+            (root / "lib" / "libonnxruntime.1.dylib").symlink_to(foreign)
+            with self.assertRaises(CollectorError) as caught:
+                self._verify_macho(root, "@rpath/libonnxruntime.1.dylib", [root / "lib"])
+            self.assertIn("outside the pinned installation", str(caught.exception))
+
+    def test_ambiguous_resolution_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            self._runtime(root, "libonnxruntime.1.31.0.dylib")
+            first = root / "rpath-a"
+            second = root / "rpath-b"
+            first.mkdir()
+            second.mkdir()
+            (first / "libonnxruntime.1.dylib").write_bytes(b"a")
+            (second / "libonnxruntime.1.dylib").write_bytes(b"b")
+            with self.assertRaises(CollectorError) as caught:
+                self._verify_macho(
+                    root,
+                    "@rpath/libonnxruntime.1.dylib",
+                    [first, second],
+                )
+            self.assertIn("ambiguous", str(caught.exception))
+
+    def test_unrecognized_dylib_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            self._runtime(root, "libonnxruntime.1.31.0.dylib")
+            link = (
+                "inferedge-bench:\n"
+                "\t@rpath/libonnxruntime.dylib (compatibility version 1.0.0, current version 1.31.0)\n"
+            )
+            with self.assertRaises(CollectorError) as caught:
+                verify_linked_onnx_runtime(
+                    binary=pathlib.Path("/tmp/inferedge-bench"),
+                    runtime_root=root,
+                    link_output=link,
+                    load_command_output=self._rpaths([root / "lib"]),
+                )
+            self.assertIn("unrecognized ONNX Runtime dependency", str(caught.exception))
+
+    def test_linux_versioned_library_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            versioned = self._runtime(root, "libonnxruntime.so.1.31.0")
+            link = f"\tlibonnxruntime.so.1.31.0 => {versioned} (0x1000)\n"
+            resolved = verify_linked_onnx_runtime(
+                binary=pathlib.Path("/tmp/inferedge-bench"),
+                runtime_root=root,
+                link_output=link,
+            )
+            self.assertEqual(resolved, versioned.resolve())
+
+    def test_linux_soname_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            versioned = self._runtime(root, "libonnxruntime.so.1.31.0")
+            soname = root / "lib" / "libonnxruntime.so.1"
+            soname.symlink_to("libonnxruntime.so.1.31.0")
+            link = f"\tlibonnxruntime.so.1 => {soname} (0x1000)\n"
+            resolved = verify_linked_onnx_runtime(
+                binary=pathlib.Path("/tmp/inferedge-bench"),
+                runtime_root=root,
+                link_output=link,
+            )
+            self.assertEqual(resolved, versioned.resolve())
+
+    def test_missing_onnx_runtime_dependency_is_rejected(self) -> None:
+        link = (
+            "inferedge-bench:\n"
+            "\t/usr/lib/libc++.1.dylib (compatibility version 1.0.0, current version 1.31.0)\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            self._runtime(root, "libonnxruntime.1.31.0.dylib")
+            with self.assertRaises(CollectorError) as caught:
+                verify_linked_onnx_runtime(
+                    binary=pathlib.Path("/tmp/inferedge-bench"),
+                    runtime_root=root,
+                    link_output=link,
+                )
+            self.assertIn("does not link ONNX Runtime", str(caught.exception))
+
+    def test_unresolved_dependency_has_an_explicit_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            self._runtime(root, "libonnxruntime.1.31.0.dylib")
+            empty = root / "empty"
+            empty.mkdir()
+            with self.assertRaises(CollectorError) as caught:
+                self._verify_macho(root, "@rpath/libonnxruntime.1.dylib", [empty])
+            message = str(caught.exception)
+            self.assertIn("unable to resolve @rpath/libonnxruntime.1.dylib", message)
+            self.assertIn(str(empty / "libonnxruntime.1.dylib"), message)
+
+    def _runtime(self, root: pathlib.Path, filename: str, version: str = "1.31.0") -> pathlib.Path:
+        library = root / "lib"
+        library.mkdir(parents=True)
+        (root / "VERSION_NUMBER").write_text(version + "\n", encoding="utf-8")
+        versioned = library / filename
+        versioned.write_bytes(b"ort")
+        return versioned
+
+    def _rpaths(self, paths: list[pathlib.Path]) -> str:
+        return "".join(
+            "          cmd LC_RPATH\n"
+            "      cmdsize 16\n"
+            f"         path {path} (offset 12)\n"
+            for path in paths
+        )
+
+    def _verify_macho(
+        self,
+        root: pathlib.Path,
+        install_name: str,
+        rpaths: list[pathlib.Path],
+    ) -> pathlib.Path:
+        link = (
+            "inferedge-bench:\n"
+            f"\t{install_name} (compatibility version 1.0.0, current version 1.31.0)\n"
+        )
+        return verify_linked_onnx_runtime(
+            binary=pathlib.Path("/tmp/inferedge-bench"),
+            runtime_root=root,
+            link_output=link,
+            load_command_output=self._rpaths(rpaths),
+        )
 
 
 if __name__ == "__main__":
