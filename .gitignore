@@ -1,0 +1,33 @@
+# Build trees
+/build/
+/build-*/
+/out/
+/cmake-build-*/
+
+# CMake and Ninja artifacts if a generator is run in the source tree
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+build.ninja
+.ninja_deps
+.ninja_log
+CTestTestfile.cmake
+Testing/
+_deps/
+compile_commands.json
+
+# Compiler and linker output
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.exe
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
