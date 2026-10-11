@@ -47,7 +47,7 @@ target_compile_features(inferedge_core PUBLIC cxx_std_20)
 target_compile_definitions(inferedge_core PUBLIC INFEREDGE_VERSION="${PROJECT_VERSION}")
 target_link_libraries(inferedge_core PUBLIC inferedge_warnings)
 
-add_executable(inferedge src/main.cpp)
+add_executable(inferedge src/main.cpp src/run_command.cpp)
 target_link_libraries(inferedge PRIVATE inferedge_core)
 
 include(FetchContent)
@@ -84,9 +84,13 @@ set(INFEREDGE_ADD_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/models/add_f32.onnx")
 set(INFEREDGE_ADD_MODEL_SHA256 "37eb1b1b1adee439d2d14b91a0b217bd15ab809610d1271ea821d56e6400a447")
 set(INFEREDGE_INT64_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/models/int64_echo.onnx")
 set(INFEREDGE_INT64_MODEL_SHA256 "4bae136df39291cfccfb7a1b9b0f03186598326f441f755095459ab03805b145")
-set(INFEREDGE_MODEL_PATHS "${INFEREDGE_ADD_MODEL}" "${INFEREDGE_INT64_MODEL}")
-set(INFEREDGE_MODEL_HASHES "${INFEREDGE_ADD_MODEL_SHA256}" "${INFEREDGE_INT64_MODEL_SHA256}")
-set(INFEREDGE_MODEL_LABELS "Add" "int64 Identity")
+set(INFEREDGE_RANK2_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/models/rank2_f32.onnx")
+set(INFEREDGE_RANK2_MODEL_SHA256 "193fc307deda81dee0e3b0f5999809a80d92ec46070c66c187b4578daefb5bc2")
+set(INFEREDGE_MODEL_PATHS
+    "${INFEREDGE_ADD_MODEL}" "${INFEREDGE_INT64_MODEL}" "${INFEREDGE_RANK2_MODEL}")
+set(INFEREDGE_MODEL_HASHES
+    "${INFEREDGE_ADD_MODEL_SHA256}" "${INFEREDGE_INT64_MODEL_SHA256}" "${INFEREDGE_RANK2_MODEL_SHA256}")
+set(INFEREDGE_MODEL_LABELS "Add" "int64 Identity" "rank-2 float32")
 foreach(model_path expected_hash model_label IN ZIP_LISTS
         INFEREDGE_MODEL_PATHS INFEREDGE_MODEL_HASHES INFEREDGE_MODEL_LABELS)
     if(NOT EXISTS "${model_path}")
@@ -110,6 +114,12 @@ target_link_libraries(
     inferedge_onnx
     PUBLIC onnxruntime::onnxruntime
     PRIVATE inferedge_warnings
+)
+
+target_link_libraries(inferedge PRIVATE inferedge_onnx)
+set_target_properties(inferedge PROPERTIES
+    BUILD_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
+    INSTALL_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
 )
 
 add_executable(
@@ -137,8 +147,22 @@ set_target_properties(inferedge_onnx_smoke PROPERTIES
     INSTALL_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
 )
 
+target_sources(inferedge_tests PRIVATE tests/cli_inference_test.cpp)
+target_compile_definitions(
+    inferedge_tests
+    PRIVATE
+        "INFEREDGE_EXECUTABLE=\"$<TARGET_FILE:inferedge>\""
+        "INFEREDGE_ADD_MODEL_PATH=\"${INFEREDGE_ADD_MODEL}\""
+        "INFEREDGE_INVALID_MODEL_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/data/not_a_model.bin\""
+        "INFEREDGE_RANK2_MODEL_PATH=\"${INFEREDGE_RANK2_MODEL}\""
+)
+add_dependencies(inferedge_tests inferedge)
+
 include(GoogleTest)
-gtest_discover_tests(inferedge_tests)
+gtest_discover_tests(
+    inferedge_tests
+    PROPERTIES ENVIRONMENT "ORT_DISABLE_TELEMETRY=1"
+)
 gtest_discover_tests(
     inferedge_onnx_smoke
     PROPERTIES ENVIRONMENT "ORT_DISABLE_TELEMETRY=1"

@@ -1,8 +1,8 @@
 # InferEdge
 
-InferEdge is a high-performance C++ inference runtime and scheduler. The repository has a C++20 build, a small command-line executable, unit tests, formatting, and Linux CI. Configure downloads the pinned ONNX Runtime 1.31.0 CPU library and links it into an ONNX test executable.
+InferEdge is a high-performance C++ inference runtime and scheduler. The repository has a C++20 build, a command-line executable, unit tests, formatting, and Linux CI. Configure downloads the pinned ONNX Runtime 1.31.0 CPU library and links it into `inferedge` and the ONNX test executable.
 
-The executable can introduce itself. It does not load models. `inferedge_onnx` loads one ONNX model into a reusable CPU session, and the ONNX test executable runs that engine.
+`inferedge_onnx` loads one ONNX model into a reusable CPU session. The `inferedge` executable parses a command and calls that session. `inferedge_core` does not link ONNX Runtime.
 
 ```text
 ./inferedge --help
@@ -11,12 +11,12 @@ The executable can introduce itself. It does not load models. `inferedge_onnx` l
 
 ## Project status
 
-The command-line executable still only answers `--help` and `--version`.
+The executable runs one fixed rank-1 float32 model and still answers `--help` and `--version`.
 
 | Present | Not present yet |
 | --- | --- |
 | CMake + Ninja build | Scheduler, request queue, or dynamic batching |
-| `inferedge` with `--help` and `--version` | HTTP API, database, frontend, Python bindings |
+| `inferedge --model` and `--input` | HTTP API, database, frontend, Python bindings |
 | GoogleTest unit tests | CUDA, TensorRT, or CoreML provider setup |
 | Synchronous float32 `InferenceEngine` | Concurrent `run()` calls |
 | clang-format 23.1.3 and Linux GitHub Actions | A production inference API |
@@ -29,7 +29,7 @@ Each phase should stay reviewable on its own. Later phases are intentionally not
 
 1. **Phase 0 — Foundation.** Compiler settings, layout, CLI, tests, and CI.
 2. **Phase 1 — Core types.** Ownership, status/error reporting, and the data types later phases will share.
-3. **Phase 2 — Model loading.** Phase 2.0 links the pinned ONNX Runtime CPU library. Phase 2.1 runs one committed float32 Add graph. Phase 2.2 moves that execution into `InferenceEngine`. Scheduling comes later.
+3. **Phase 2 — Model loading.** Phase 2.0 links the pinned ONNX Runtime CPU library. Phase 2.1 runs one committed float32 Add graph. Phase 2.2 moves that execution into `InferenceEngine`. Phase 2.3 calls that engine from `inferedge`. Scheduling comes later.
 4. **Phase 3 — Execution.** Run one inference and return outputs.
 5. **Phase 4 — Scheduling.** Threads and dynamic batching, measured against a real executor.
 6. **Phase 5 — Service boundary.** A process API only after the runtime has a stable in-process interface.
@@ -69,9 +69,9 @@ CMake downloads the one archive that matches the host, checks its SHA-256, and e
 
 Set `INFEREDGE_ONNXRUNTIME_ROOT` to an already extracted package when configure should not download. That directory must contain `include/onnxruntime_cxx_api.h`, the shared library, its runtime soname, and a `VERSION_NUMBER` file that reads `1.31.0`.
 
-The smoke-test binary records the extracted `lib` directory as its build RPATH. macOS loads `@rpath/libonnxruntime.1.dylib`. Linux loads `libonnxruntime.so.1`. The `inferedge` executable does not link ONNX Runtime.
+`inferedge` and the smoke-test binary record the extracted `lib` directory as their build RPATH. macOS loads `@rpath/libonnxruntime.1.dylib`. Linux loads `libonnxruntime.so.1`.
 
-Official macOS and Linux builds include telemetry. Tests and CI set `ORT_DISABLE_TELEMETRY=1` before the library is initialized. Export the same variable before running `inferedge_onnx_smoke` outside CTest. This does not rebuild ONNX Runtime with telemetry compiled out.
+Official macOS and Linux builds include telemetry. Tests and CI set `ORT_DISABLE_TELEMETRY=1` before the library is initialized. Export the same variable before running `inferedge` or `inferedge_onnx_smoke` outside CTest. This does not rebuild ONNX Runtime with telemetry compiled out.
 
 ONNX Runtime is MIT licensed, copyright Microsoft Corporation. Each archive includes `LICENSE` and `ThirdPartyNotices.txt`. Those notices stay with the extracted package in the build tree.
 
@@ -120,9 +120,11 @@ Copy the printed digest into `INFEREDGE_ADD_MODEL_SHA256` in `CMakeLists.txt`. T
 
 `models/int64_echo.onnx` is a second untrained fixture. It is an Identity of `int64[1]` from `X` to `Y`, IR 10, opset 13, 201 bytes, SHA-256 `4bae136df39291cfccfb7a1b9b0f03186598326f441f755095459ab03805b145`. The engine rejects it because only `float32` tensors are supported. Regenerate it with `models/generate_int64_echo_model.py` and update `INFEREDGE_INT64_MODEL_SHA256`.
 
+`models/rank2_f32.onnx` is an Identity of `float32[1, 2]` from `M` to `N`, IR 10, opset 13, 212 bytes, SHA-256 `193fc307deda81dee0e3b0f5999809a80d92ec46070c66c187b4578daefb5bc2`. The CLI rejects it because the input is not a fixed rank-1 tensor. Regenerate it with `models/generate_rank2_f32_model.py` and update `INFEREDGE_RANK2_MODEL_SHA256`.
+
 ## Inference engine
 
-`inferedge_onnx` is a static library. The `inferedge` executable does not link it. Public declarations live in `include/inferedge/inference_engine.hpp` and do not include ONNX Runtime headers. `src/inference_engine.cpp` owns the runtime types behind `std::unique_ptr`.
+`inferedge_onnx` is a static library. The `inferedge` executable links it. `inferedge_core` does not. Public declarations live in `include/inferedge/inference_engine.hpp` and do not include ONNX Runtime headers. `src/inference_engine.cpp` owns the runtime types behind `std::unique_ptr`.
 
 `load_inference_engine` checks that the path is a file, then creates one `Ort::Env` and one `Ort::Session`. Session options stay alive through construction, select the CPU provider, set one intra-op thread, and disable graph optimizations. The environment is destroyed after the session. A missing file returns `kModelNotFound`. A file ONNX Runtime cannot load returns `kModelInvalid`. A model input or output that is not a `float32` tensor returns `kUnsupportedType`. On success the returned engine is non-null and `run` reuses that session.
 
@@ -134,9 +136,44 @@ Copy the printed digest into `INFEREDGE_ADD_MODEL_SHA256` in `CMakeLists.txt`. T
 
 The engine is not thread-safe. One thread should call a given engine. Per-call input spans and returned vectors are distinct objects, and they share one `Ort::Session`. Concurrent `run` calls have not been tested.
 
+## Command line
+
+```bash
+export ORT_DISABLE_TELEMETRY=1
+./build/inferedge --model models/add_f32.onnx --input A=1,2 --input B=3,4
+```
+
+```text
+Model: models/add_f32.onnx
+Backend: ONNX Runtime CPU
+
+Output C:
+[4, 6]
+```
+
+`--model <path>` and `--model=<path>` select the file. `--input <name>=<values>` and `--input=<name>=<values>` supply one named tensor, and the flag can be repeated. Values are comma-separated finite `float32` numbers in decimal or scientific form. A negative number stays inside that argument, as in `--input A=-1.5,0`. A separate argument that starts with `-` is an option.
+
+`--help`, `-h`, `--version`, and `-V` print to stdout and exit 0. With no arguments, the program prints the same help text and exits 0. Those two requests cannot be combined with any other argument.
+
+This command runs a model only when every input is a fixed rank-1 `float32` tensor. The shape is the dimension stored in the model. A different rank, or a dynamic dimension, is rejected before `run`. The engine checks the element count and reports a missing or unexpected name. Printed numbers are the floats `InferenceEngine::run` returned. `std::to_chars` writes them in general format, so a whole number has no trailing decimal.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Help, version, or a successful run |
+| 2 | Invalid command line |
+| 3 | The model file is missing, invalid, or not a float32 tensor |
+| 4 | An input does not match the model, or an input shape is not fixed rank-1 |
+| 5 | Inference failed while the session was running |
+
+Successful text goes to stdout. Errors go to stderr as `error: ...`. A usage error also reprints the help text. The `Model:` line repeats the path argument as it was typed.
+
+One command accepts at most 64 named inputs and 1,048,576 floats in total, with that same cap on each input. A numeric token is at most 64 characters. The values text of one `--input` is at most 1,048,576 × 65 characters, which is one maximum-length token plus a comma for every allowed value. An input name is at most 1024 characters. `std::from_chars` must consume each token. Overflow and underflow reported by that parser are usage errors. `inf` and `nan` are usage errors.
+
+`parse_cli` does not load a model. `execute_inference` loads it once and calls `run` once. The parsed `vector<float>` stays alive for that call.
+
 ## Current limitations
 
-- `inferedge` still answers only `--help` and `--version`.
+- The CLI runs fixed rank-1 float32 inputs only. It does not accept a dynamic dimension or a rank other than 1.
 - There is no scheduler, request queue, thread pool, or batching API.
 - The engine runs one synchronous `float32` model on CPU, with one intra-op thread and graph optimizations disabled.
 - Each `run` copies input floats and output floats. This is not zero-copy execution.
@@ -172,7 +209,7 @@ Project targets compile as C++20 with extensions off (`-std=c++20`, not `gnu++20
 ctest --test-dir build --output-on-failure
 ```
 
-`ctest` runs the project tests, the ONNX Runtime tests (version check, direct Add execution, and `InferenceEngine`), and two executable checks: `inferedge --help` and `inferedge --version`.
+`ctest` runs the project tests, the ONNX Runtime tests (version check, direct Add execution, and `InferenceEngine`), process tests that spawn `inferedge`, and two direct checks: `inferedge --help` and `inferedge --version`.
 
 To run the binaries directly:
 
@@ -202,7 +239,7 @@ tests/               GoogleTest sources
 .github/workflows/   Linux CI
 ```
 
-`inferedge_core` is a static library. The `inferedge` executable links that library and does not contain the parsing logic. `inferedge_onnx` is a separate static library and is the only production target that links ONNX Runtime.
+`inferedge_core` is a static library. It contains `parse_cli` and does not link ONNX Runtime. The `inferedge` executable links `inferedge_core` and `inferedge_onnx`. `src/run_command.cpp` is compiled into the executable, and `main` only parses arguments, runs a model when asked, and prints the result.
 
 ## How a C++ build works
 

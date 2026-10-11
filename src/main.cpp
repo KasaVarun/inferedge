@@ -1,4 +1,5 @@
 #include "inferedge/cli.hpp"
+#include "inferedge/run_command.hpp"
 
 #include <iostream>
 #include <string_view>
@@ -21,8 +22,10 @@ std::vector<std::string_view> arguments_after_program_name(int argc, char* argv[
 } // namespace
 
 int main(int argc, char* argv[]) {
-    const inferedge::CliResult result =
-        inferedge::parse_cli(arguments_after_program_name(argc, argv));
+    inferedge::CliResult result = inferedge::parse_cli(arguments_after_program_name(argc, argv));
+    if (result.action == inferedge::CliAction::kRun) {
+        result = inferedge::execute_inference(result);
+    }
     if (result.action == inferedge::CliAction::kError) {
         std::cerr << result.message;
     } else {
