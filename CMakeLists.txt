@@ -79,13 +79,39 @@ target_link_libraries(inferedge_tests PRIVATE inferedge_core GTest::gtest_main)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/onnxruntime.cmake")
 
-add_executable(inferedge_onnx_smoke tests/onnx_runtime_smoke_test.cpp)
+# The Add fixture is committed. Configuration checks its bytes and does not regenerate it.
+set(INFEREDGE_ADD_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/models/add_f32.onnx")
+set(INFEREDGE_ADD_MODEL_SHA256 "37eb1b1b1adee439d2d14b91a0b217bd15ab809610d1271ea821d56e6400a447")
+if(NOT EXISTS "${INFEREDGE_ADD_MODEL}")
+    message(FATAL_ERROR "ONNX Add fixture is missing: ${INFEREDGE_ADD_MODEL}")
+endif()
+file(SHA256 "${INFEREDGE_ADD_MODEL}" inferedge_add_model_sha256)
+if(NOT inferedge_add_model_sha256 STREQUAL INFEREDGE_ADD_MODEL_SHA256)
+    message(FATAL_ERROR
+        "ONNX Add fixture SHA-256 mismatch.\n"
+        "  expected: ${INFEREDGE_ADD_MODEL_SHA256}\n"
+        "  actual:   ${inferedge_add_model_sha256}\n"
+        "Regenerate models/add_f32.onnx with models/generate_add_model.py, then update the expected hash."
+    )
+endif()
+
+add_executable(
+    inferedge_onnx_smoke
+    tests/onnx_runtime_smoke_test.cpp
+    tests/onnx_add_inference_test.cpp
+)
 target_link_libraries(
     inferedge_onnx_smoke
     PRIVATE
         inferedge_warnings
         onnxruntime::onnxruntime
         GTest::gtest_main
+)
+target_compile_definitions(
+    inferedge_onnx_smoke
+    PRIVATE
+        "INFEREDGE_ADD_MODEL_PATH=\"${INFEREDGE_ADD_MODEL}\""
+        "INFEREDGE_INVALID_MODEL_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/data/not_a_model.bin\""
 )
 set_target_properties(inferedge_onnx_smoke PROPERTIES
     BUILD_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"

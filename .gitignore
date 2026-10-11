@@ -25,6 +25,11 @@ compile_commands.json
 *.dylib
 *.exe
 
+# Local ONNX generator. CMake does not install or run it.
+/.venv/
+__pycache__/
+*.pyc
+
 # Editors and operating systems
 .DS_Store
 .idea/

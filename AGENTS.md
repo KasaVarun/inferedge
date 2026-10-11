@@ -4,16 +4,18 @@ InferEdge is a C++20 inference runtime. ONNX Runtime 1.31.0 CPU is a pinned conf
 
 ## Current scope
 
-Build the `inferedge` executable, its unit tests, the ONNX Runtime smoke test, and Linux CI.
+Build the `inferedge` executable, its unit tests, the ONNX Runtime smoke test, the committed `models/add_f32.onnx` Add fixture executed by that test, and Linux CI.
 
 ## Do not add yet
 
-- Model loading, tensor inference, or an inference engine
+- An inference engine, or model loading outside the committed Add fixture test
 - CUDA, TensorRT, or CoreML execution provider configuration
 - Scheduling, threading, or dynamic batching
 - HTTP APIs, databases, frontends, or Python bindings
 - Benchmarks that do not measure a real implementation
 - Dependencies beyond the C++ standard library, CMake, Ninja, GoogleTest fetched by CMake, the pinned ONNX Runtime 1.31.0 CPU archives, and clang-format
+
+`onnx==1.22.0` regenerates `models/add_f32.onnx`. It is not a CMake dependency. Do not install it during configuration.
 
 ## Build and test
 

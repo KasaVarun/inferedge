@@ -1,8 +1,8 @@
 # InferEdge
 
-InferEdge is a high-performance C++ inference runtime and scheduler. The repository has a C++20 build, a small command-line executable, unit tests, formatting, and Linux CI. Configure downloads the pinned ONNX Runtime 1.31.0 CPU library and links it into a smoke test.
+InferEdge is a high-performance C++ inference runtime and scheduler. The repository has a C++20 build, a small command-line executable, unit tests, formatting, and Linux CI. Configure downloads the pinned ONNX Runtime 1.31.0 CPU library and links it into an ONNX test executable.
 
-The executable can introduce itself. It does not load models or run inference yet.
+The executable can introduce itself. It does not load models. The ONNX test executable loads one committed Add graph and runs it.
 
 ```text
 ./inferedge --help
@@ -15,10 +15,10 @@ The command-line executable still only answers `--help` and `--version`.
 
 | Present | Not present yet |
 | --- | --- |
-| CMake + Ninja build | Model loading or tensor inference |
+| CMake + Ninja build | A general inference engine |
 | `inferedge` with `--help` and `--version` | Scheduler, threads, or dynamic batching |
 | GoogleTest unit tests | HTTP API, database, frontend, Python bindings |
-| ONNX Runtime 1.31.0 CPU, linked by the smoke test | CUDA, TensorRT, or CoreML provider setup |
+| ONNX Runtime 1.31.0 CPU and one committed Add graph | CUDA, TensorRT, or CoreML provider setup |
 | clang-format 23.1.3 and Linux GitHub Actions | A production inference API |
 
 Version: **0.1.0**
@@ -29,7 +29,7 @@ Each phase should stay reviewable on its own. Later phases are intentionally not
 
 1. **Phase 0 — Foundation.** Compiler settings, layout, CLI, tests, and CI.
 2. **Phase 1 — Core types.** Ownership, status/error reporting, and the data types later phases will share.
-3. **Phase 2 — Model loading.** Phase 2.0 links the pinned ONNX Runtime CPU library. Loading a model and running it come later.
+3. **Phase 2 — Model loading.** Phase 2.0 links the pinned ONNX Runtime CPU library. Phase 2.1 runs one committed float32 Add graph from the ONNX test executable. A general inference engine comes later.
 4. **Phase 3 — Execution.** Run one inference and return outputs.
 5. **Phase 4 — Scheduling.** Threads and dynamic batching, measured against a real executor.
 6. **Phase 5 — Service boundary.** A process API only after the runtime has a stable in-process interface.
@@ -75,7 +75,57 @@ Official macOS and Linux builds include telemetry. Tests and CI set `ORT_DISABLE
 
 ONNX Runtime is MIT licensed, copyright Microsoft Corporation. Each archive includes `LICENSE` and `ThirdPartyNotices.txt`. Those notices stay with the extracted package in the build tree.
 
-The smoke test constructs `Ort::Env` and checks that `Ort::GetVersionString()` is `1.31.0`. It does not load a model. The inspected macOS library requires macOS 14.0 or newer.
+The smoke test constructs `Ort::Env` and checks that `Ort::GetVersionString()` is `1.31.0`. A second test in the same executable loads `models/add_f32.onnx` and runs it. The inspected macOS library requires macOS 14.0 or newer.
+
+## Add fixture
+
+`models/add_f32.onnx` is a hand-written graph, not a trained model. It has no weights.
+
+| Item | Value |
+| --- | --- |
+| Graph | `add_f32` |
+| Inputs | `A` and `B`, `float32[2]` |
+| Output | `C`, `float32[2]` |
+| Operation | `C = Add(A, B)` |
+| ONNX IR | 10 |
+| Opset | 13 |
+| Producer | `inferedge` `0.1.0` |
+| Generator | `onnx==1.22.0` |
+| Size | 203 bytes |
+| SHA-256 | `37eb1b1b1adee439d2d14b91a0b217bd15ab809610d1271ea821d56e6400a447` |
+
+CMake checks that hash with `file(SHA256)` and stops if the file is missing or different. Configuration does not run Python.
+
+The C++ test creates `Ort::Env`, then `Ort::SessionOptions`, then `Ort::Session`. Options select the CPU execution provider, one intra-op thread, and `ORT_DISABLE_ALL`. The test checks the input and output names, `float32` types, and shapes `[2]`. Input tensors borrow `std::vector<float>` storage. `Ort::Session::Run` produces the output, and the test reads that tensor before destroying it.
+
+Two successful cases use exact `float32` values:
+
+| A | B | C |
+| --- | --- | --- |
+| `[1.0, 2.0]` | `[3.0, 4.0]` | `[4.0, 6.0]` |
+| `[-1.5, 0.0]` | `[2.5, -4.0]` | `[1.0, -4.0]` |
+
+The same test expects `Ort::Exception` for a missing file, `tests/data/not_a_model.bin`, a shape of `[3]`, and an `int64` input. Those failures do not stop the process.
+
+To regenerate the fixture on purpose:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r models/requirements.txt
+.venv/bin/python models/generate_add_model.py
+shasum -a 256 models/add_f32.onnx
+```
+
+Copy the printed digest into `INFEREDGE_ADD_MODEL_SHA256` in `CMakeLists.txt`. The generator refuses any `onnx` version other than `1.22.0`, passes IR 10 and opset 13 explicitly, and runs `onnx.checker.check_model` before saving. Metadata has no timestamp.
+
+## Current limitations
+
+- `inferedge` still answers only `--help` and `--version`.
+- There is no inference engine, scheduler, thread pool, or batching API.
+- The Add test is the only model execution. It is not a trained network.
+- The test forces CPU, one intra-op thread, and disabled graph optimizations.
+- CUDA, TensorRT, and CoreML providers are not configured.
+- Python is used only to regenerate the fixture. The C++ build does not install it.
 
 ## Build
 
@@ -104,7 +154,7 @@ Project targets compile as C++20 with extensions off (`-std=c++20`, not `gnu++20
 ctest --test-dir build --output-on-failure
 ```
 
-`ctest` runs the project tests, the ONNX Runtime smoke test, and two executable checks: `inferedge --help` and `inferedge --version`.
+`ctest` runs the project tests, the ONNX Runtime tests (version check and Add execution), and two executable checks: `inferedge --help` and `inferedge --version`.
 
 To run the binaries directly:
 
@@ -128,6 +178,7 @@ Apply the style with `--dry-run` removed and `-i` added. CI uses clang-format **
 ```text
 cmake/               pinned ONNX Runtime download
 include/inferedge/   public headers
+models/              committed Add fixture and its generator
 src/                 library and executable sources
 tests/               GoogleTest sources
 .github/workflows/   Linux CI
