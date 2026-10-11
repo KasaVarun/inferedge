@@ -1,6 +1,6 @@
 # InferEdge
 
-InferEdge is a high-performance C++ inference runtime and scheduler. The repository has a C++20 build, a command-line executable, unit tests, formatting, and Linux CI. Configure downloads the pinned ONNX Runtime 1.31.0 CPU library and links it into `inferedge` and the ONNX test executable.
+InferEdge is a high-performance C++ inference runtime and scheduler. The repository has a C++20 build, a command-line executable, a benchmark executable, unit tests, formatting, and Linux CI. Configure downloads the pinned ONNX Runtime 1.31.0 CPU library and links it into `inferedge`, `inferedge-bench`, and the ONNX test executables.
 
 `inferedge_onnx` loads one ONNX model into a reusable CPU session. The `inferedge` executable parses a command and calls that session. `inferedge_core` does not link ONNX Runtime.
 
@@ -20,7 +20,7 @@ The executable runs one fixed rank-1 float32 model and still answers `--help` an
 | GoogleTest unit tests | CUDA, TensorRT, or CoreML provider setup |
 | Synchronous float32 `InferenceEngine` | Concurrent `run()` calls |
 | clang-format 23.1.3 and Linux GitHub Actions | A production inference API |
-| Injected-duration statistics and synchronous `run_benchmark` | Published speed figures, a benchmark CLI, or concurrent runs |
+| Injected-duration statistics, `run_benchmark`, and `inferedge-bench` | Published speed figures or concurrent runs |
 
 Version: **0.1.0**
 
@@ -163,6 +163,47 @@ Every measured call must succeed. Every measured output is checked for count, na
 
 `call_summary` is `summarize_latencies` on the measured samples. Its active-call throughput is the sample count divided by the sum of those `run` durations. `observed_sequential_throughput_requests_per_second` is the measured iteration count divided by the outer loop duration in seconds. The outer duration includes the measured calls, validation, result destruction, and loop bookkeeping. It excludes warmup, loading, fixture parsing, the statistics call, and printing. Neither figure is server capacity. A zero outer duration is an error. With fewer than 100 samples, P99 is only the nearest-rank element and is often the maximum.
 
+## Benchmark command
+
+`inferedge-bench` is a separate executable. It links `inferedge_benchmark_cli`, which links `inferedge_benchmark`. The `inferedge` executable does not link that library. `inferedge-bench` parses arguments, prepares one workload, calls `load_inference_engine` once, checks the loaded metadata, and calls `run_benchmark`. It does not time `engine.run` itself.
+
+```bash
+export ORT_DISABLE_TELEMETRY=1
+./build/inferedge-bench --help
+./build/inferedge-bench \
+  --model models/add_f32.onnx \
+  --workload add \
+  --warmup 100 \
+  --iterations 1000
+./build/inferedge-bench \
+  --model models/mnist_mlp.onnx \
+  --workload mnist \
+  --fixture test_00003 \
+  --warmup 100 \
+  --iterations 1000
+```
+
+`--model` and `--workload` are required. `--workload` is `add` or `mnist`. `--warmup` defaults to 10 and may be 0. `--iterations` defaults to 100. `--check-interval` defaults to 1. Measured iterations and the check interval must be from 1 through 100000. `--help`, `-h`, `--version`, and `-V` are standalone and exit 0. With no arguments, the program prints help and exits 0. `--flag value` and `--flag=value` are both accepted. Duplicate flags, unknown flags, and non-numeric counts are usage errors. `std::from_chars` must consume each count. A value that does not fit in a 32-bit unsigned integer is an overflow. A separate argument that starts with `-` is an option, so a negative count has to be written as `--iterations=-1`, and that form is rejected.
+
+The Add workload uses `A = [1, 2]`, `B = [3, 4]`, and expected `C = [4, 6]`, with zero tolerance. `--fixture` and `--fixture-dir` are rejected for Add. The MNIST workload reads `inputs/<id>.f32` (784 little-endian float32 values) and `onnx/<id>.f32` (10 little-endian float32 logits) from the fixture directory. The default id is `test_00003`. The 14 ids and expected classes come from `models/fixtures/mnist/manifest.json`. The command does not parse that JSON file and does not recompute SHA-256. It rejects an unknown id, a path in the id, a missing file, a truncated or oversized file, a non-finite value, and a reference argmax that disagrees with the catalog. Comparison uses `rtol = 1e-4` and `atol = 1e-5`.
+
+The default fixture directory is the absolute `models/fixtures/mnist` path recorded when CMake configured the build. A copied `inferedge-bench` does not carry the fixtures with it. Pass `--fixture-dir` to point at that directory. Model compatibility uses `InferenceEngine` metadata, not the filename. Add requires float32 inputs `A[2]` and `B[2]` and float32 output `C[2]`. MNIST requires float32 input `image[784]` and float32 output `logits[10]`.
+
+Use a Release build for measurements you intend to compare. Debug and sanitizer builds are for tests. Record the git revision, ONNX Runtime 1.31.0 CPU, the model path, the fixture id, warmup, iterations, and the check interval. The session is the existing CPU session: one benchmark calling thread, one ONNX intra-op thread, and graph optimizations disabled. Active-call throughput divides completed calls by the sum of measured `run()` durations. Observed sequential throughput divides measured iterations by the outer loop, which includes validation and result destruction. Neither figure is server capacity or a GPU result. This page does not publish a speed number. With fewer than 100 samples, P99 is often the maximum.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Help, version, or a completed benchmark |
+| 2 | Invalid command line |
+| 3 | The model file is missing, invalid, or not a float32 tensor |
+| 4 | The fixture is missing, the wrong size, non-finite, or has the wrong reference class |
+| 5 | Inference failed during warmup or a measured call |
+| 6 | Loaded metadata does not match the workload |
+| 7 | An output failed the correctness check |
+| 8 | The benchmark report or latency statistics failed |
+
+Successful text goes to stdout. Errors go to stderr as `error: ...`. A usage error also reprints the help text. A failure does not print the benchmark report.
+
 ## Command line
 
 ```bash
@@ -202,7 +243,7 @@ One command accepts at most 64 named inputs and 1,048,576 floats in total, with 
 
 - The CLI runs fixed rank-1 float32 inputs only. It does not accept a dynamic dimension or a rank other than 1.
 - There is no scheduler, request queue, thread pool, or batching API.
-- `run_benchmark` does not publish a speed figure. P99 from a short sample is the nearest-rank element, often the maximum. There is no benchmark CLI.
+- `inferedge-bench` does not publish a speed figure. It runs the Add and MNIST workloads only. P99 from a short sample is the nearest-rank element, often the maximum. The default fixture directory is fixed at configure time.
 - The engine runs one synchronous `float32` model on CPU, with one intra-op thread and graph optimizations disabled.
 - Each `run` copies input floats and output floats. This is not zero-copy execution.
 - Concurrent `run()` calls are not supported.
@@ -218,6 +259,7 @@ From the repository root:
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ./build/inferedge --version
+./build/inferedge-bench --help
 ```
 
 Use `Release` for an optimized build. Ninja is a single-configuration generator, so the build type is chosen at configure time. Reconfigure into a separate directory if you want both trees at once:
@@ -267,7 +309,7 @@ tests/               GoogleTest sources
 .github/workflows/   Linux CI
 ```
 
-`inferedge_core` is a static library. It contains `parse_cli` and does not link ONNX Runtime. The `inferedge` executable links `inferedge_core` and `inferedge_onnx`. `src/run_command.cpp` is compiled into the executable, and `main` only parses arguments, runs a model when asked, and prints the result.
+`inferedge_core` is a static library. It contains `parse_cli` and does not link ONNX Runtime. The `inferedge` executable links `inferedge_core` and `inferedge_onnx`. `src/run_command.cpp` is compiled into that executable, and its `main` only parses arguments, runs a model when asked, and prints the result. `inferedge-bench` is a second executable. It links `inferedge_benchmark_cli` and does not add benchmark code to `inferedge`.
 
 ## How a C++ build works
 

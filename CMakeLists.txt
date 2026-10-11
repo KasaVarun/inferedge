@@ -139,6 +139,30 @@ set_target_properties(inferedge PROPERTIES
     INSTALL_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
 )
 
+add_library(
+    inferedge_benchmark_cli
+    src/benchmark_cli.cpp
+    src/benchmark_command.cpp
+)
+target_include_directories(inferedge_benchmark_cli PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(inferedge_benchmark_cli PUBLIC cxx_std_20)
+target_link_libraries(
+    inferedge_benchmark_cli
+    PUBLIC inferedge_benchmark
+    PRIVATE inferedge_warnings
+)
+target_compile_definitions(
+    inferedge_benchmark_cli
+    PRIVATE "INFEREDGE_MNIST_FIXTURE_DIR=\"${INFEREDGE_MNIST_FIXTURE_DIR}\""
+)
+
+add_executable(inferedge-bench src/benchmark_main.cpp)
+target_link_libraries(inferedge-bench PRIVATE inferedge_benchmark_cli)
+set_target_properties(inferedge-bench PROPERTIES
+    BUILD_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
+    INSTALL_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
+)
+
 add_executable(
     inferedge_onnx_smoke
     tests/onnx_runtime_smoke_test.cpp
@@ -189,7 +213,47 @@ gtest_discover_tests(
     PROPERTIES ENVIRONMENT "ORT_DISABLE_TELEMETRY=1"
 )
 
+add_executable(
+    inferedge_bench_tests
+    tests/benchmark_cli_test.cpp
+    tests/benchmark_command_test.cpp
+)
+target_link_libraries(
+    inferedge_bench_tests
+    PRIVATE
+        inferedge_warnings
+        inferedge_benchmark_cli
+        GTest::gtest_main
+)
+target_compile_definitions(
+    inferedge_bench_tests
+    PRIVATE
+        "INFEREDGE_BENCH_EXECUTABLE=\"$<TARGET_FILE:inferedge-bench>\""
+        "INFEREDGE_ADD_MODEL_PATH=\"${INFEREDGE_ADD_MODEL}\""
+        "INFEREDGE_MNIST_MODEL_PATH=\"${INFEREDGE_MNIST_MODEL}\""
+        "INFEREDGE_RANK2_MODEL_PATH=\"${INFEREDGE_RANK2_MODEL}\""
+        "INFEREDGE_INT64_MODEL_PATH=\"${INFEREDGE_INT64_MODEL}\""
+        "INFEREDGE_INVALID_MODEL_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/data/not_a_model.bin\""
+        "INFEREDGE_MNIST_FIXTURE_DIR=\"${INFEREDGE_MNIST_FIXTURE_DIR}\""
+)
+set_target_properties(inferedge_bench_tests PROPERTIES
+    BUILD_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
+    INSTALL_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
+)
+add_dependencies(inferedge_bench_tests inferedge-bench)
+gtest_discover_tests(
+    inferedge_bench_tests
+    PROPERTIES ENVIRONMENT "ORT_DISABLE_TELEMETRY=1"
+)
+
 add_test(NAME inferedge_cli_help COMMAND inferedge --help)
 add_test(NAME inferedge_cli_version COMMAND inferedge --version)
 set_tests_properties(inferedge_cli_help PROPERTIES PASS_REGULAR_EXPRESSION "Usage: inferedge")
 set_tests_properties(inferedge_cli_version PROPERTIES PASS_REGULAR_EXPRESSION "inferedge 0\\.1\\.0")
+add_test(NAME inferedge_bench_help COMMAND inferedge-bench --help)
+add_test(NAME inferedge_bench_version COMMAND inferedge-bench --version)
+set_tests_properties(inferedge_bench_help PROPERTIES PASS_REGULAR_EXPRESSION "Usage: inferedge-bench")
+set_tests_properties(
+    inferedge_bench_version
+    PROPERTIES PASS_REGULAR_EXPRESSION "inferedge-bench 0\\.1\\.0"
+)
