@@ -30,6 +30,10 @@ compile_commands.json
 __pycache__/
 *.pyc
 
+# MNIST training environment and downloaded dataset. CMake does not use them.
+/.venv-mnist/
+/models/mnist/.cache/
+
 # Editors and operating systems
 .DS_Store
 .idea/
