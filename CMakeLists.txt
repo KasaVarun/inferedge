@@ -35,7 +35,13 @@ else()
     )
 endif()
 
-add_library(inferedge_core src/cli.cpp src/request.cpp src/request_lifecycle.cpp)
+add_library(
+    inferedge_core
+    src/cli.cpp
+    src/request.cpp
+    src/request_lifecycle.cpp
+    src/float_buffer.cpp
+)
 target_include_directories(inferedge_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(inferedge_core PUBLIC cxx_std_20)
 target_compile_definitions(inferedge_core PUBLIC INFEREDGE_VERSION="${PROJECT_VERSION}")
@@ -63,6 +69,7 @@ add_executable(
     tests/version_test.cpp
     tests/request_test.cpp
     tests/request_lifecycle_test.cpp
+    tests/float_buffer_test.cpp
 )
 target_link_libraries(inferedge_tests PRIVATE inferedge_core GTest::gtest_main)
 
