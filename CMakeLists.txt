@@ -79,32 +79,50 @@ target_link_libraries(inferedge_tests PRIVATE inferedge_core GTest::gtest_main)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/onnxruntime.cmake")
 
-# The Add fixture is committed. Configuration checks its bytes and does not regenerate it.
+# Committed fixtures. Configuration checks their bytes and does not regenerate them.
 set(INFEREDGE_ADD_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/models/add_f32.onnx")
 set(INFEREDGE_ADD_MODEL_SHA256 "37eb1b1b1adee439d2d14b91a0b217bd15ab809610d1271ea821d56e6400a447")
-if(NOT EXISTS "${INFEREDGE_ADD_MODEL}")
-    message(FATAL_ERROR "ONNX Add fixture is missing: ${INFEREDGE_ADD_MODEL}")
-endif()
-file(SHA256 "${INFEREDGE_ADD_MODEL}" inferedge_add_model_sha256)
-if(NOT inferedge_add_model_sha256 STREQUAL INFEREDGE_ADD_MODEL_SHA256)
-    message(FATAL_ERROR
-        "ONNX Add fixture SHA-256 mismatch.\n"
-        "  expected: ${INFEREDGE_ADD_MODEL_SHA256}\n"
-        "  actual:   ${inferedge_add_model_sha256}\n"
-        "Regenerate models/add_f32.onnx with models/generate_add_model.py, then update the expected hash."
-    )
-endif()
+set(INFEREDGE_INT64_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/models/int64_echo.onnx")
+set(INFEREDGE_INT64_MODEL_SHA256 "4bae136df39291cfccfb7a1b9b0f03186598326f441f755095459ab03805b145")
+set(INFEREDGE_MODEL_PATHS "${INFEREDGE_ADD_MODEL}" "${INFEREDGE_INT64_MODEL}")
+set(INFEREDGE_MODEL_HASHES "${INFEREDGE_ADD_MODEL_SHA256}" "${INFEREDGE_INT64_MODEL_SHA256}")
+set(INFEREDGE_MODEL_LABELS "Add" "int64 Identity")
+foreach(model_path expected_hash model_label IN ZIP_LISTS
+        INFEREDGE_MODEL_PATHS INFEREDGE_MODEL_HASHES INFEREDGE_MODEL_LABELS)
+    if(NOT EXISTS "${model_path}")
+        message(FATAL_ERROR "ONNX ${model_label} fixture is missing: ${model_path}")
+    endif()
+    file(SHA256 "${model_path}" actual_hash)
+    if(NOT actual_hash STREQUAL expected_hash)
+        message(FATAL_ERROR
+            "ONNX ${model_label} fixture SHA-256 mismatch.\n"
+            "  expected: ${expected_hash}\n"
+            "  actual:   ${actual_hash}\n"
+            "Regenerate the model with its script in models/, then update the expected hash."
+        )
+    endif()
+endforeach()
+
+add_library(inferedge_onnx src/inference_engine.cpp)
+target_include_directories(inferedge_onnx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(inferedge_onnx PUBLIC cxx_std_20)
+target_link_libraries(
+    inferedge_onnx
+    PUBLIC onnxruntime::onnxruntime
+    PRIVATE inferedge_warnings
+)
 
 add_executable(
     inferedge_onnx_smoke
     tests/onnx_runtime_smoke_test.cpp
     tests/onnx_add_inference_test.cpp
+    tests/inference_engine_test.cpp
 )
 target_link_libraries(
     inferedge_onnx_smoke
     PRIVATE
         inferedge_warnings
-        onnxruntime::onnxruntime
+        inferedge_onnx
         GTest::gtest_main
 )
 target_compile_definitions(
@@ -112,6 +130,7 @@ target_compile_definitions(
     PRIVATE
         "INFEREDGE_ADD_MODEL_PATH=\"${INFEREDGE_ADD_MODEL}\""
         "INFEREDGE_INVALID_MODEL_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/data/not_a_model.bin\""
+        "INFEREDGE_INT64_MODEL_PATH=\"${INFEREDGE_INT64_MODEL}\""
 )
 set_target_properties(inferedge_onnx_smoke PROPERTIES
     BUILD_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
