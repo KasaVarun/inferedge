@@ -4,11 +4,11 @@ InferEdge is a C++20 inference runtime. ONNX Runtime 1.31.0 CPU is a pinned conf
 
 ## Current scope
 
-Build the `inferedge` executable, its unit tests, the ONNX Runtime tests, the `inferedge_onnx` library, the latency statistics calculator, the committed Add, int64 Identity, rank-2 float32, and MNIST MLP fixtures, and Linux CI.
+Build the `inferedge` executable, its unit tests, the ONNX Runtime tests, the `inferedge_onnx` library, the latency statistics calculator, the synchronous benchmark runner, the committed Add, int64 Identity, rank-2 float32, and MNIST MLP fixtures, and Linux CI.
 
 ## Do not add yet
 
-- Timing benchmarks, benchmark runners, and published speed figures. `summarize_latencies` reduces injected durations and does not call `InferenceEngine`
+- Published speed figures and a benchmark CLI. `run_benchmark` measures one loaded `InferenceEngine` on the calling thread. `summarize_latencies` still only reduces injected durations
 - Scheduling, request queues, threading, or dynamic batching
 - CUDA, TensorRT, or CoreML execution provider configuration
 - HTTP APIs, databases, frontends, or Python bindings

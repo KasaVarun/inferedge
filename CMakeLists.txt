@@ -124,6 +124,16 @@ target_link_libraries(
 )
 
 target_link_libraries(inferedge PRIVATE inferedge_onnx)
+
+add_library(inferedge_benchmark src/benchmark_runner.cpp)
+target_include_directories(inferedge_benchmark PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(inferedge_benchmark PUBLIC cxx_std_20)
+target_link_libraries(
+    inferedge_benchmark
+    PUBLIC inferedge_core inferedge_onnx
+    PRIVATE inferedge_warnings
+)
+
 set_target_properties(inferedge PROPERTIES
     BUILD_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
     INSTALL_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
@@ -135,12 +145,13 @@ add_executable(
     tests/onnx_add_inference_test.cpp
     tests/inference_engine_test.cpp
     tests/mnist_inference_test.cpp
+    tests/benchmark_runner_test.cpp
 )
 target_link_libraries(
     inferedge_onnx_smoke
     PRIVATE
         inferedge_warnings
-        inferedge_onnx
+        inferedge_benchmark
         GTest::gtest_main
 )
 target_compile_definitions(

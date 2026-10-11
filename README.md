@@ -20,7 +20,7 @@ The executable runs one fixed rank-1 float32 model and still answers `--help` an
 | GoogleTest unit tests | CUDA, TensorRT, or CoreML provider setup |
 | Synchronous float32 `InferenceEngine` | Concurrent `run()` calls |
 | clang-format 23.1.3 and Linux GitHub Actions | A production inference API |
-| Injected-duration latency statistics | Measured inference benchmarks or published speed figures |
+| Injected-duration statistics and synchronous `run_benchmark` | Published speed figures, a benchmark CLI, or concurrent runs |
 
 Version: **0.1.0**
 
@@ -149,6 +149,20 @@ Durations stay in nanoseconds for the minimum, maximum, and total. The mean, P50
 
 An empty span, a negative duration, a total of zero, or a sum that overflows the nanosecond integer returns `StatisticsError` and an empty summary. A zero sample is kept when other samples make the total positive. The input span is not reordered.
 
+## Synchronous benchmark runner
+
+`run_benchmark` lives in `inferedge_benchmark` (`include/inferedge/benchmark_runner.hpp`). The caller loads one `InferenceEngine` and passes prepared `NamedTensorView` inputs and `ExpectedTensor` references. The runner does not reload the model. It is not linked into the `inferedge` executable. This page does not publish latency or throughput numbers.
+
+The session under test is the existing CPU session: one intra-op thread and graph optimizations disabled. The runner is single-threaded. One call uses one loaded model.
+
+Warmup calls `run` and checks every output name, shape, finite value, and numeric tolerance. Those durations are discarded. Warmup may be zero. Warmup and measured counts above 100,000 are rejected, as is a measured count of zero or a check interval of zero. Expected outputs are validated before warmup: a missing list, an empty or duplicate name, a negative dimension, an overflowing shape product, an element count that disagrees with the shape, a non-finite reference, or a negative or non-finite tolerance returns an empty report.
+
+The outer `steady_clock` interval starts after warmup and stops after the last `InferenceResult` from a measured call has been destroyed. Inside that loop, each sample is the clock immediately before `engine.run` and immediately after it returns. That sample includes the validation, input copy, ONNX Runtime execution, and output copy inside `run`. It excludes model loading, fixture parsing, warmup, output checks, destruction of the returned result, `summarize_latencies`, and report formatting. The runner does not log inside the timed call.
+
+Every measured call must succeed. Every measured output is checked for count, name, shape, and finite values. Numeric comparison uses 1-based iteration numbers. It runs when the iteration is divisible by `correctness_check_interval`, and it always runs on the last iteration. The default interval is 1. The comparison is `abs(actual - expected) <= absolute_tolerance + relative_tolerance * abs(expected)`. A failed call or a failed check discards the samples.
+
+`call_summary` is `summarize_latencies` on the measured samples. Its active-call throughput is the sample count divided by the sum of those `run` durations. `observed_sequential_throughput_requests_per_second` is the measured iteration count divided by the outer loop duration in seconds. The outer duration includes the measured calls, validation, result destruction, and loop bookkeeping. It excludes warmup, loading, fixture parsing, the statistics call, and printing. Neither figure is server capacity. A zero outer duration is an error. With fewer than 100 samples, P99 is only the nearest-rank element and is often the maximum.
+
 ## Command line
 
 ```bash
@@ -188,7 +202,7 @@ One command accepts at most 64 named inputs and 1,048,576 floats in total, with 
 
 - The CLI runs fixed rank-1 float32 inputs only. It does not accept a dynamic dimension or a rank other than 1.
 - There is no scheduler, request queue, thread pool, or batching API.
-- There is no measured inference benchmark. `summarize_latencies` only summarizes injected durations.
+- `run_benchmark` does not publish a speed figure. P99 from a short sample is the nearest-rank element, often the maximum. There is no benchmark CLI.
 - The engine runs one synchronous `float32` model on CPU, with one intra-op thread and graph optimizations disabled.
 - Each `run` copies input floats and output floats. This is not zero-copy execution.
 - Concurrent `run()` calls are not supported.
