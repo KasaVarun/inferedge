@@ -39,6 +39,9 @@ jobs:
       - name: Run tests
         run: ctest --test-dir build --output-on-failure
 
+      - name: Run Python baseline tooling tests
+        run: python3 -m unittest benchmarks.test_collect_baseline benchmarks.test_analyze_baseline
+
       - name: Check formatting
         run: |
           clang-format --version

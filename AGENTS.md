@@ -8,7 +8,7 @@ Build the `inferedge` executable, `inferedge-bench`, their unit tests, the ONNX 
 
 ## Do not add yet
 
-- Published speed figures. `inferedge-bench` calls `run_benchmark` for one loaded `InferenceEngine` on the calling thread and can print that report as text or JSON. `summarize_latencies` still only reduces injected durations. JSON schema version 1 does not include raw samples, hardware, build type, or a model hash
+- Published speed figures. `inferedge-bench` calls `run_benchmark` for one loaded `InferenceEngine` on the calling thread and can print that report as text or JSON. `summarize_latencies` still only reduces injected durations. JSON schema version 1 does not include raw samples, hardware, build type, or a model hash. `benchmarks/collect_baseline.py` can launch that executable and validate the JSON. `benchmarks/analyze_baseline.py` reduces one completed run set to `aggregate.json`. Neither script infers, and `benchmarks/baselines/` stays untracked until a measured run set is reviewed
 - Scheduling, request queues, threading, or dynamic batching
 - CUDA, TensorRT, or CoreML execution provider configuration
 - HTTP APIs, databases, frontends, or Python bindings
