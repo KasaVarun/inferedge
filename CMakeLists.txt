@@ -37,6 +37,7 @@ endif()
 
 add_library(
     inferedge_core
+    src/benchmark_statistics.cpp
     src/cli.cpp
     src/request.cpp
     src/request_lifecycle.cpp
@@ -65,6 +66,7 @@ FetchContent_MakeAvailable(googletest)
 enable_testing()
 add_executable(
     inferedge_tests
+    tests/benchmark_statistics_test.cpp
     tests/cli_test.cpp
     tests/version_test.cpp
     tests/request_test.cpp

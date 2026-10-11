@@ -20,6 +20,7 @@ The executable runs one fixed rank-1 float32 model and still answers `--help` an
 | GoogleTest unit tests | CUDA, TensorRT, or CoreML provider setup |
 | Synchronous float32 `InferenceEngine` | Concurrent `run()` calls |
 | clang-format 23.1.3 and Linux GitHub Actions | A production inference API |
+| Injected-duration latency statistics | Measured inference benchmarks or published speed figures |
 
 Version: **0.1.0**
 
@@ -138,6 +139,16 @@ Copy the printed digest into `INFEREDGE_ADD_MODEL_SHA256` in `CMakeLists.txt`. T
 
 The engine is not thread-safe. One thread should call a given engine. Per-call input spans and returned vectors are distinct objects, and they share one `Ort::Session`. Concurrent `run` calls have not been tested.
 
+## Latency statistics
+
+`summarize_latencies` lives in `inferedge_core` (`include/inferedge/benchmark_statistics.hpp`). It reduces a span of `std::chrono::nanoseconds` supplied by the caller. It does not read a clock, load a model, or call `InferenceEngine::run`. The repository does not publish an inference latency or throughput measurement.
+
+Durations stay in nanoseconds for the minimum, maximum, and total. The mean, P50, P95, and P99 are microseconds as `nanoseconds / 1000.0`, so a fraction of a microsecond remains. Samples are sorted on a copy. The nearest-rank index is `ceil(p * n / 100) - 1`, computed with integer arithmetic. P50 is that element. It is not the average of the two middle samples. The standard deviation is the population deviation, `sqrt(sum((sample - mean)^2) / n)`. One sample has deviation 0. Equal samples have deviation 0.
+
+`active_call_throughput_requests_per_second` is the sample count divided by the sum of the sample durations in seconds. Each sample is one completed call interval. The figure excludes model loading, correctness checks, destruction of results outside those intervals, benchmark loop overhead, queueing, and network transport. It is not end-to-end service throughput.
+
+An empty span, a negative duration, a total of zero, or a sum that overflows the nanosecond integer returns `StatisticsError` and an empty summary. A zero sample is kept when other samples make the total positive. The input span is not reordered.
+
 ## Command line
 
 ```bash
@@ -177,6 +188,7 @@ One command accepts at most 64 named inputs and 1,048,576 floats in total, with 
 
 - The CLI runs fixed rank-1 float32 inputs only. It does not accept a dynamic dimension or a rank other than 1.
 - There is no scheduler, request queue, thread pool, or batching API.
+- There is no measured inference benchmark. `summarize_latencies` only summarizes injected durations.
 - The engine runs one synchronous `float32` model on CPU, with one intra-op thread and graph optimizations disabled.
 - Each `run` copies input floats and output floats. This is not zero-copy execution.
 - Concurrent `run()` calls are not supported.
