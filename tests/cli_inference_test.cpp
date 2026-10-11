@@ -233,10 +233,10 @@ std::string add_stdout(std::string_view values) {
 
 void expect_failure(const CapturedProcess& captured, int exit_code, std::string_view fragment) {
     EXPECT_EQ(captured.exit_code, exit_code);
-    EXPECT_TRUE(captured.standard_output.empty());
+    EXPECT_TRUE(captured.standard_output.empty()) << captured.standard_output;
     ASSERT_FALSE(captured.standard_error.empty());
-    EXPECT_EQ(captured.standard_error.compare(0, 7, "error: "), 0);
-    EXPECT_NE(captured.standard_error.find(fragment), std::string::npos);
+    EXPECT_EQ(captured.standard_error.compare(0, 7, "error: "), 0) << captured.standard_error;
+    EXPECT_NE(captured.standard_error.find(fragment), std::string::npos) << captured.standard_error;
 }
 
 } // namespace
@@ -268,7 +268,7 @@ TEST(CliProcess, AddInferencePrintsEngineOutput) {
     const CapturedProcess captured = run_inferedge(
         {"--model", INFEREDGE_ADD_MODEL_PATH, "--input", "A=1,2", "--input", "B=3,4"});
     EXPECT_EQ(captured.exit_code, 0);
-    EXPECT_TRUE(captured.standard_error.empty());
+    EXPECT_TRUE(captured.standard_error.empty()) << captured.standard_error;
     EXPECT_EQ(captured.standard_output, add_stdout("[4, 6]"));
 }
 
@@ -276,7 +276,7 @@ TEST(CliProcess, ReorderedInputsMatch) {
     const CapturedProcess captured = run_inferedge(
         {"--model", INFEREDGE_ADD_MODEL_PATH, "--input", "B=3,4", "--input", "A=1,2"});
     EXPECT_EQ(captured.exit_code, 0);
-    EXPECT_TRUE(captured.standard_error.empty());
+    EXPECT_TRUE(captured.standard_error.empty()) << captured.standard_error;
     EXPECT_EQ(captured.standard_output, add_stdout("[4, 6]"));
 }
 
@@ -285,7 +285,7 @@ TEST(CliProcess, NegativeAndZeroValues) {
         run_inferedge({"--model=" + std::string{INFEREDGE_ADD_MODEL_PATH}, "--input=A=-1.5,0",
                        "--input=B=2.5,-4"});
     EXPECT_EQ(captured.exit_code, 0);
-    EXPECT_TRUE(captured.standard_error.empty());
+    EXPECT_TRUE(captured.standard_error.empty()) << captured.standard_error;
     EXPECT_EQ(captured.standard_output, add_stdout("[1, -4]"));
 }
 

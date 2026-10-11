@@ -305,9 +305,13 @@ EngineLoad load_inference_engine(const std::filesystem::path& model_path) {
     }
 
     try {
-        Ort::Env environment{ORT_LOGGING_LEVEL_WARNING, "inferedge"};
+        // Error severity keeps routine runtime warnings off stderr. The Linux
+        // CPU build writes a colored warning while creating a session, and the
+        // CLI uses stderr only for its own error lines.
+        Ort::Env environment{ORT_LOGGING_LEVEL_ERROR, "inferedge"};
         Ort::SessionOptions options;
         options.SetIntraOpNumThreads(1);
+        options.SetLogSeverityLevel(ORT_LOGGING_LEVEL_ERROR);
         options.SetGraphOptimizationLevel(ORT_DISABLE_ALL);
         options.AppendExecutionProvider_CPU(1);
         const std::string path = model_path.string();
