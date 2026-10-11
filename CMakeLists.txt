@@ -77,8 +77,27 @@ add_executable(
 )
 target_link_libraries(inferedge_tests PRIVATE inferedge_core GTest::gtest_main)
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/onnxruntime.cmake")
+
+add_executable(inferedge_onnx_smoke tests/onnx_runtime_smoke_test.cpp)
+target_link_libraries(
+    inferedge_onnx_smoke
+    PRIVATE
+        inferedge_warnings
+        onnxruntime::onnxruntime
+        GTest::gtest_main
+)
+set_target_properties(inferedge_onnx_smoke PROPERTIES
+    BUILD_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
+    INSTALL_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
+)
+
 include(GoogleTest)
 gtest_discover_tests(inferedge_tests)
+gtest_discover_tests(
+    inferedge_onnx_smoke
+    PROPERTIES ENVIRONMENT "ORT_DISABLE_TELEMETRY=1"
+)
 
 add_test(NAME inferedge_cli_help COMMAND inferedge --help)
 add_test(NAME inferedge_cli_version COMMAND inferedge --version)

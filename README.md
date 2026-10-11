@@ -1,6 +1,6 @@
 # InferEdge
 
-InferEdge is a high-performance C++ inference runtime and scheduler. Phase 0 is the repository foundation: a C++20 build, a small command-line executable, unit tests, formatting, and Linux CI.
+InferEdge is a high-performance C++ inference runtime and scheduler. The repository has a C++20 build, a small command-line executable, unit tests, formatting, and Linux CI. Configure downloads the pinned ONNX Runtime 1.31.0 CPU library and links it into a smoke test.
 
 The executable can introduce itself. It does not load models or run inference yet.
 
@@ -11,15 +11,15 @@ The executable can introduce itself. It does not load models or run inference ye
 
 ## Project status
 
-Phase 0 is the local foundation.
+The command-line executable still only answers `--help` and `--version`.
 
 | Present | Not present yet |
 | --- | --- |
-| CMake + Ninja build | ONNX Runtime or any model loader |
-| `inferedge` with `--help` and `--version` | Inference execution |
-| GoogleTest unit tests | Scheduler, threads, or dynamic batching |
-| clang-format 23.1.3 | HTTP API, database, frontend, Python bindings |
-| Linux GitHub Actions workflow | A published GitHub repository |
+| CMake + Ninja build | Model loading or tensor inference |
+| `inferedge` with `--help` and `--version` | Scheduler, threads, or dynamic batching |
+| GoogleTest unit tests | HTTP API, database, frontend, Python bindings |
+| ONNX Runtime 1.31.0 CPU, linked by the smoke test | CUDA, TensorRT, or CoreML provider setup |
+| clang-format 23.1.3 and Linux GitHub Actions | A production inference API |
 
 Version: **0.1.0**
 
@@ -29,7 +29,7 @@ Each phase should stay reviewable on its own. Later phases are intentionally not
 
 1. **Phase 0 — Foundation.** Compiler settings, layout, CLI, tests, and CI.
 2. **Phase 1 — Core types.** Ownership, status/error reporting, and the data types later phases will share.
-3. **Phase 2 — Model loading.** A narrow interface for loading a model. ONNX Runtime belongs here, after the interface is justified.
+3. **Phase 2 — Model loading.** Phase 2.0 links the pinned ONNX Runtime CPU library. Loading a model and running it come later.
 4. **Phase 3 — Execution.** Run one inference and return outputs.
 5. **Phase 4 — Scheduling.** Threads and dynamic batching, measured against a real executor.
 6. **Phase 5 — Service boundary.** A process API only after the runtime has a stable in-process interface.
@@ -52,9 +52,30 @@ Install the formatter if it is missing:
 brew install clang-format
 ```
 
-Linux CI installs `g++`, `cmake`, `ninja-build`, and the same clang-format version.
+Linux CI installs `g++`, `cmake`, `ninja-build`, and the same clang-format version. The workflow runs on `ubuntu-24.04`.
 
-The first configure step downloads GoogleTest 1.18.0. That requires network access. No other third-party library is fetched.
+The first configure step downloads GoogleTest 1.18.0 and the ONNX Runtime 1.31.0 CPU archive for the host platform. Both downloads require network access. Neither archive is committed.
+
+## ONNX Runtime
+
+Version **1.31.0**, CPU packages only:
+
+| Host | Archive | SHA-256 |
+| --- | --- | --- |
+| macOS arm64 | `onnxruntime-osx-arm64-1.31.0.tgz` | `1031b36dd3bdaa8d976a6130d9cf2a05e9be320b93ae804f8427b91dc3432afc` |
+| Linux x86-64 | `onnxruntime-linux-x64-1.31.0.tgz` | `cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57` |
+
+CMake downloads the one archive that matches the host, checks its SHA-256, and extracts it under the build directory. A checksum mismatch or an unsupported operating system and processor stops configuration. The version does not float to a newer release. The CMake files shipped inside the archive point at directories the archive does not contain, so InferEdge defines the imported target `onnxruntime::onnxruntime` from `include/` and `lib/` itself.
+
+Set `INFEREDGE_ONNXRUNTIME_ROOT` to an already extracted package when configure should not download. That directory must contain `include/onnxruntime_cxx_api.h`, the shared library, its runtime soname, and a `VERSION_NUMBER` file that reads `1.31.0`.
+
+The smoke-test binary records the extracted `lib` directory as its build RPATH. macOS loads `@rpath/libonnxruntime.1.dylib`. Linux loads `libonnxruntime.so.1`. The `inferedge` executable does not link ONNX Runtime.
+
+Official macOS and Linux builds include telemetry. Tests and CI set `ORT_DISABLE_TELEMETRY=1` before the library is initialized. Export the same variable before running `inferedge_onnx_smoke` outside CTest. This does not rebuild ONNX Runtime with telemetry compiled out.
+
+ONNX Runtime is MIT licensed, copyright Microsoft Corporation. Each archive includes `LICENSE` and `ThirdPartyNotices.txt`. Those notices stay with the extracted package in the build tree.
+
+The smoke test constructs `Ort::Env` and checks that `Ort::GetVersionString()` is `1.31.0`. It does not load a model. The inspected macOS library requires macOS 14.0 or newer.
 
 ## Build
 
@@ -83,12 +104,14 @@ Project targets compile as C++20 with extensions off (`-std=c++20`, not `gnu++20
 ctest --test-dir build --output-on-failure
 ```
 
-`ctest` runs the GoogleTest binary and two executable checks: `inferedge --help` and `inferedge --version`.
+`ctest` runs the project tests, the ONNX Runtime smoke test, and two executable checks: `inferedge --help` and `inferedge --version`.
 
-To run the GoogleTest binary directly:
+To run the binaries directly:
 
 ```bash
+export ORT_DISABLE_TELEMETRY=1
 ./build/inferedge_tests
+./build/inferedge_onnx_smoke
 ```
 
 ## Formatting
@@ -103,6 +126,7 @@ Apply the style with `--dry-run` removed and `-i` added. CI uses clang-format **
 ## Layout
 
 ```text
+cmake/               pinned ONNX Runtime download
 include/inferedge/   public headers
 src/                 library and executable sources
 tests/               GoogleTest sources
@@ -131,7 +155,7 @@ The linker combines object files and libraries into an executable. It matches th
 
 CMake does not compile the project. It reads `CMakeLists.txt` and writes a Ninja build file under `build/`. Ninja then runs Clang, the linker, and the test discovery commands. Changing a source file and running `cmake --build build` recompiles only what is out of date.
 
-`FetchContent` downloads GoogleTest during configuration and adds its targets to this build. InferEdge does not vendor a copy of GoogleTest in the repository.
+`FetchContent` downloads GoogleTest during configuration and adds its targets to this build. InferEdge does not vendor a copy of GoogleTest or ONNX Runtime in the repository.
 
 ### Why C++20
 
