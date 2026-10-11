@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -205,6 +206,17 @@ class RunSetBuilder:
         return digest
 
 
+def baselines_digest() -> dict[str, str] | None:
+    root = REPO_ROOT / "benchmarks" / "baselines"
+    if not root.exists():
+        return None
+    digest = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            digest[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return digest
+
+
 def add_cross_run(run_set: pathlib.Path) -> dict:
     return build_aggregate(run_set)["workloads"]["add"]["cross_run"]
 
@@ -214,6 +226,46 @@ class AnalyzeBaselineTest(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         return RunSetBuilder(pathlib.Path(temporary.name))
+
+    def test_module_invocation_from_repository_root(self) -> None:
+        built = self.make()
+        before = baselines_digest()
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "benchmarks.analyze_baseline",
+                "--run-set",
+                str(built.run_set),
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue((built.run_set / "aggregate.json").is_file())
+        self.assertIn(str(built.run_set / "aggregate.json"), completed.stdout)
+        self.assertEqual(baselines_digest(), before)
+
+    def test_direct_script_invocation(self) -> None:
+        built = self.make()
+        before = baselines_digest()
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "benchmarks" / "analyze_baseline.py"),
+                "--run-set",
+                str(built.run_set),
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue((built.run_set / "aggregate.json").is_file())
+        self.assertEqual(baselines_digest(), before)
 
     def test_complete_valid_run_set(self) -> None:
         built = self.make()

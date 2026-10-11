@@ -92,12 +92,14 @@ Inspect a failure by reading `failure.json`, then that trial's `.stderr`, `.stdo
 
 ## Analysis
 
-After a run set has `status` `completed`, point the analyzer at that directory. It does not search for a latest run set.
+After a run set has `status` `completed`, point the analyzer at that directory. It does not search for a latest run set. Run the command from the repository root:
 
 ```bash
-python3 benchmarks/analyze_baseline.py \
+python3 -m benchmarks.analyze_baseline \
   --run-set benchmarks/baselines/<YYYYMMDDTHHMMSSZ-commit>
 ```
+
+`python3 benchmarks/analyze_baseline.py --run-set <directory>` is the same program. It adds the repository root to the module search path itself.
 
 The analyzer reads `environment.json` and these counted reports:
 

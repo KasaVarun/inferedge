@@ -17,6 +17,11 @@ import pathlib
 import statistics
 import sys
 
+# `python3 benchmarks/analyze_baseline.py` puts this directory on sys.path.
+# The package import needs the repository root. `python3 -m` already provides it.
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
 from benchmarks.collect_baseline import (
     ADD_MODEL_SHA256,
     BACKEND,
