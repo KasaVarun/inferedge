@@ -122,6 +122,8 @@ Copy the printed digest into `INFEREDGE_ADD_MODEL_SHA256` in `CMakeLists.txt`. T
 
 `models/rank2_f32.onnx` is an Identity of `float32[1, 2]` from `M` to `N`, IR 10, opset 13, 212 bytes, SHA-256 `193fc307deda81dee0e3b0f5999809a80d92ec46070c66c187b4578daefb5bc2`. The CLI rejects it because the input is not a fixed rank-1 tensor. Regenerate it with `models/generate_rank2_f32_model.py` and update `INFEREDGE_RANK2_MODEL_SHA256`.
 
+`models/mnist_mlp.onnx` is the trained MNIST MLP. CMake checks SHA-256 `3473a4b2673fe4353c2b3a04a7d432717a4dfcdc42fc217565c99743542d8cce` and does not regenerate it. The input is `image`, `float32[784]`. The output is `logits`, `float32[10]`. `tests/mnist_inference_test.cpp` runs that file through `InferenceEngine` and compares it with the ONNX reference fixtures in `models/fixtures/mnist/`.
+
 ## Inference engine
 
 `inferedge_onnx` is a static library. The `inferedge` executable links it. `inferedge_core` does not. Public declarations live in `include/inferedge/inference_engine.hpp` and do not include ONNX Runtime headers. `src/inference_engine.cpp` owns the runtime types behind `std::unique_ptr`.
@@ -209,7 +211,7 @@ Project targets compile as C++20 with extensions off (`-std=c++20`, not `gnu++20
 ctest --test-dir build --output-on-failure
 ```
 
-`ctest` runs the project tests, the ONNX Runtime tests (version check, direct Add execution, and `InferenceEngine`), process tests that spawn `inferedge`, and two direct checks: `inferedge --help` and `inferedge --version`.
+`ctest` runs the project tests, the ONNX Runtime tests (version check, direct Add execution, `InferenceEngine`, and the MNIST MLP fixtures), process tests that spawn `inferedge`, and two direct checks: `inferedge --help` and `inferedge --version`.
 
 To run the binaries directly:
 

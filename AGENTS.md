@@ -4,7 +4,7 @@ InferEdge is a C++20 inference runtime. ONNX Runtime 1.31.0 CPU is a pinned conf
 
 ## Current scope
 
-Build the `inferedge` executable, its unit tests, the ONNX Runtime tests, the `inferedge_onnx` library, the committed Add, int64 Identity, and rank-2 float32 fixtures, and Linux CI.
+Build the `inferedge` executable, its unit tests, the ONNX Runtime tests, the `inferedge_onnx` library, the committed Add, int64 Identity, rank-2 float32, and MNIST MLP fixtures, and Linux CI.
 
 ## Do not add yet
 

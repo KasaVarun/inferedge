@@ -1,0 +1,176 @@
+{
+  "checkpoint_sha256": "b53a41676adfa020e3808617539f7966776fdd20bd7a247f34656e230459f22a",
+  "onnx_sha256": "3473a4b2673fe4353c2b3a04a7d432717a4dfcdc42fc217565c99743542d8cce",
+  "versions": {
+    "python": "3.12.14",
+    "numpy": "2.5.4",
+    "torch": "2.14.1",
+    "onnxruntime": "1.31.0"
+  },
+  "preprocessing": "uint8 pixels divided by 255, row-major float32[784], no mean or std",
+  "tolerances": {
+    "rtol": 0.0001,
+    "atol": 1e-05
+  },
+  "input_count": 14,
+  "samples": [
+    {
+      "name": "test_00003",
+      "kind": "official_test_class_example",
+      "test_index": 3,
+      "true_class": 0,
+      "pytorch_predicted_class": 0,
+      "onnx_predicted_class": 0,
+      "predictions_agree": true,
+      "maximum_absolute_error": 5.7220458984375e-06,
+      "mean_absolute_error": 1.7881393432617188e-06
+    },
+    {
+      "name": "test_00002",
+      "kind": "official_test_class_example",
+      "test_index": 2,
+      "true_class": 1,
+      "pytorch_predicted_class": 1,
+      "onnx_predicted_class": 1,
+      "predictions_agree": true,
+      "maximum_absolute_error": 1.430511474609375e-06,
+      "mean_absolute_error": 4.470348358154297e-07
+    },
+    {
+      "name": "test_00001",
+      "kind": "official_test_class_example",
+      "test_index": 1,
+      "true_class": 2,
+      "pytorch_predicted_class": 2,
+      "onnx_predicted_class": 2,
+      "predictions_agree": true,
+      "maximum_absolute_error": 5.7220458984375e-06,
+      "mean_absolute_error": 2.002716064453125e-06
+    },
+    {
+      "name": "test_00018",
+      "kind": "official_test_class_example",
+      "test_index": 18,
+      "true_class": 3,
+      "pytorch_predicted_class": 3,
+      "onnx_predicted_class": 3,
+      "predictions_agree": true,
+      "maximum_absolute_error": 3.5762786865234375e-06,
+      "mean_absolute_error": 1.0728836059570312e-06
+    },
+    {
+      "name": "test_00004",
+      "kind": "official_test_class_example",
+      "test_index": 4,
+      "true_class": 4,
+      "pytorch_predicted_class": 4,
+      "onnx_predicted_class": 4,
+      "predictions_agree": true,
+      "maximum_absolute_error": 3.814697265625e-06,
+      "mean_absolute_error": 1.2636184692382812e-06
+    },
+    {
+      "name": "test_00008",
+      "kind": "official_test_class_example",
+      "test_index": 8,
+      "true_class": 5,
+      "pytorch_predicted_class": 5,
+      "onnx_predicted_class": 5,
+      "predictions_agree": true,
+      "maximum_absolute_error": 3.814697265625e-06,
+      "mean_absolute_error": 2.002716064453125e-06
+    },
+    {
+      "name": "test_00011",
+      "kind": "official_test_class_example",
+      "test_index": 11,
+      "true_class": 6,
+      "pytorch_predicted_class": 6,
+      "onnx_predicted_class": 6,
+      "predictions_agree": true,
+      "maximum_absolute_error": 3.0994415283203125e-06,
+      "mean_absolute_error": 1.704692840576172e-06
+    },
+    {
+      "name": "test_00000",
+      "kind": "official_test_class_example",
+      "test_index": 0,
+      "true_class": 7,
+      "pytorch_predicted_class": 7,
+      "onnx_predicted_class": 7,
+      "predictions_agree": true,
+      "maximum_absolute_error": 1.9073486328125e-06,
+      "mean_absolute_error": 1.0728836059570312e-06
+    },
+    {
+      "name": "test_00061",
+      "kind": "official_test_class_example",
+      "test_index": 61,
+      "true_class": 8,
+      "pytorch_predicted_class": 8,
+      "onnx_predicted_class": 8,
+      "predictions_agree": true,
+      "maximum_absolute_error": 2.86102294921875e-06,
+      "mean_absolute_error": 1.442432403564453e-06
+    },
+    {
+      "name": "test_00007",
+      "kind": "official_test_class_example",
+      "test_index": 7,
+      "true_class": 9,
+      "pytorch_predicted_class": 9,
+      "onnx_predicted_class": 9,
+      "predictions_agree": true,
+      "maximum_absolute_error": 3.5762786865234375e-06,
+      "mean_absolute_error": 9.298324584960937e-07
+    },
+    {
+      "name": "test_00151",
+      "kind": "official_test_misclassification",
+      "test_index": 151,
+      "true_class": 9,
+      "pytorch_predicted_class": 8,
+      "onnx_predicted_class": 8,
+      "predictions_agree": true,
+      "maximum_absolute_error": 6.67572021484375e-06,
+      "mean_absolute_error": 2.1278858184814455e-06
+    },
+    {
+      "name": "test_00217",
+      "kind": "official_test_misclassification",
+      "test_index": 217,
+      "true_class": 6,
+      "pytorch_predicted_class": 5,
+      "onnx_predicted_class": 5,
+      "predictions_agree": true,
+      "maximum_absolute_error": 3.814697265625e-06,
+      "mean_absolute_error": 1.6391277313232422e-06
+    },
+    {
+      "name": "test_00241",
+      "kind": "official_test_misclassification",
+      "test_index": 241,
+      "true_class": 9,
+      "pytorch_predicted_class": 8,
+      "onnx_predicted_class": 8,
+      "predictions_agree": true,
+      "maximum_absolute_error": 4.76837158203125e-06,
+      "mean_absolute_error": 2.0384788513183595e-06
+    },
+    {
+      "name": "synthetic",
+      "kind": "synthetic",
+      "test_index": null,
+      "true_class": null,
+      "pytorch_predicted_class": 5,
+      "onnx_predicted_class": 5,
+      "predictions_agree": true,
+      "maximum_absolute_error": 7.62939453125e-06,
+      "mean_absolute_error": 4.0531158447265625e-06
+    }
+  ],
+  "maximum_absolute_error": 7.62939453125e-06,
+  "mean_absolute_error": 1.684682709830148e-06,
+  "predicted_class_agreement": 14,
+  "passed": true
+}

@@ -1,0 +1,246 @@
+{
+  "architecture": "Linear(784, 128), ReLU, Linear(128, 64), ReLU, Linear(64, 10)",
+  "parameter_count": 109386,
+  "selected_checkpoint_epoch": 10,
+  "checkpoint": "models/mnist_mlp.pt",
+  "checkpoint_sha256": "b53a41676adfa020e3808617539f7966776fdd20bd7a247f34656e230459f22a",
+  "python": "3.12.14",
+  "torch": "2.14.1",
+  "dataset_split": "Official MNIST test set, 10000 images in IDX order. These images were not used for training or checkpoint selection.",
+  "preprocessing": "uint8 pixels divided by 255, row-major float32[784], no mean or std",
+  "logits": "10 float32 values. The predicted class is argmax. Softmax is not applied.",
+  "test_sample_count": 10000,
+  "correct_predictions": 9790,
+  "incorrect_predictions": 210,
+  "test_accuracy": 0.979,
+  "test_loss": 0.08261763916015626,
+  "per_class_accuracy": [
+    0.9928571428571429,
+    0.9911894273127754,
+    0.9748062015503876,
+    0.9851485148514851,
+    0.9826883910386965,
+    0.9809417040358744,
+    0.9739039665970772,
+    0.9737354085603113,
+    0.971252566735113,
+    0.9623389494549058
+  ],
+  "per_class_sample_counts": [
+    980,
+    1135,
+    1032,
+    1010,
+    982,
+    892,
+    958,
+    1028,
+    974,
+    1009
+  ],
+  "confusion_matrix_orientation": "rows are true labels, columns are predicted labels",
+  "confusion_matrix": [
+    [
+      973,
+      0,
+      0,
+      1,
+      0,
+      0,
+      2,
+      0,
+      3,
+      1
+    ],
+    [
+      0,
+      1125,
+      3,
+      0,
+      0,
+      1,
+      2,
+      1,
+      3,
+      0
+    ],
+    [
+      2,
+      1,
+      1006,
+      6,
+      2,
+      2,
+      1,
+      4,
+      8,
+      0
+    ],
+    [
+      0,
+      0,
+      1,
+      995,
+      0,
+      4,
+      0,
+      3,
+      6,
+      1
+    ],
+    [
+      0,
+      0,
+      6,
+      1,
+      965,
+      0,
+      1,
+      2,
+      0,
+      7
+    ],
+    [
+      2,
+      0,
+      0,
+      7,
+      1,
+      875,
+      3,
+      1,
+      2,
+      1
+    ],
+    [
+      6,
+      2,
+      2,
+      1,
+      6,
+      8,
+      933,
+      0,
+      0,
+      0
+    ],
+    [
+      1,
+      3,
+      7,
+      8,
+      0,
+      0,
+      0,
+      1001,
+      3,
+      5
+    ],
+    [
+      3,
+      1,
+      2,
+      4,
+      3,
+      8,
+      1,
+      2,
+      946,
+      4
+    ],
+    [
+      2,
+      3,
+      0,
+      6,
+      10,
+      6,
+      1,
+      5,
+      5,
+      971
+    ]
+  ],
+  "evaluation_device": "cpu",
+  "example_selection": "Official test index order. First image of each true label 0 through 9, then up to 3 incorrect predictions whose indices were not already selected.",
+  "examples": [
+    {
+      "test_index": 3,
+      "true_label": 0,
+      "predicted_label": 0,
+      "correct": true
+    },
+    {
+      "test_index": 2,
+      "true_label": 1,
+      "predicted_label": 1,
+      "correct": true
+    },
+    {
+      "test_index": 1,
+      "true_label": 2,
+      "predicted_label": 2,
+      "correct": true
+    },
+    {
+      "test_index": 18,
+      "true_label": 3,
+      "predicted_label": 3,
+      "correct": true
+    },
+    {
+      "test_index": 4,
+      "true_label": 4,
+      "predicted_label": 4,
+      "correct": true
+    },
+    {
+      "test_index": 8,
+      "true_label": 5,
+      "predicted_label": 5,
+      "correct": true
+    },
+    {
+      "test_index": 11,
+      "true_label": 6,
+      "predicted_label": 6,
+      "correct": true
+    },
+    {
+      "test_index": 0,
+      "true_label": 7,
+      "predicted_label": 7,
+      "correct": true
+    },
+    {
+      "test_index": 61,
+      "true_label": 8,
+      "predicted_label": 8,
+      "correct": true
+    },
+    {
+      "test_index": 7,
+      "true_label": 9,
+      "predicted_label": 9,
+      "correct": true
+    },
+    {
+      "test_index": 151,
+      "true_label": 9,
+      "predicted_label": 8,
+      "correct": false
+    },
+    {
+      "test_index": 217,
+      "true_label": 6,
+      "predicted_label": 5,
+      "correct": false
+    },
+    {
+      "test_index": 241,
+      "true_label": 9,
+      "predicted_label": 8,
+      "correct": false
+    }
+  ]
+}

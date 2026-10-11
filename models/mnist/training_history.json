@@ -1,0 +1,107 @@
+{
+  "seed": 0,
+  "device": "cpu",
+  "epochs": 10,
+  "final_epoch": 10,
+  "batch_size": 64,
+  "optimizer": "Adam",
+  "learning_rate": 0.001,
+  "loss": "CrossEntropyLoss",
+  "data_loader_workers": 0,
+  "architecture": "Linear(784, 128), ReLU, Linear(128, 64), ReLU, Linear(64, 10)",
+  "parameter_count": 109386,
+  "initialization": "seed 0 before model construction; the five-epoch checkpoint was not loaded",
+  "best_epoch": 10,
+  "best_validation_accuracy": 0.9773333333333334,
+  "best_validation_loss": 0.0824415915440768,
+  "training_seconds": 4.195001333981054,
+  "preprocessing": "uint8 pixels divided by 255, row-major float32[784], no mean or std",
+  "split": "NumPy PCG64 seed 0 permutation of the official 60000 training images; first 54000 train and last 6000 validate. The official test set is not scored.",
+  "versions": {
+    "python": "3.12.14",
+    "numpy": "2.5.4",
+    "torch": "2.14.1",
+    "torchvision": "0.29.1"
+  },
+  "checkpoint": "models/mnist_mlp.pt",
+  "epochs_log": [
+    {
+      "epoch": 1,
+      "training_loss": 0.3698754745589362,
+      "validation_loss": 0.195081164141496,
+      "validation_accuracy": 0.943,
+      "best_checkpoint_epoch": 1
+    },
+    {
+      "epoch": 2,
+      "training_loss": 0.15674865345160166,
+      "validation_loss": 0.1322354004929463,
+      "validation_accuracy": 0.9583333333333334,
+      "best_checkpoint_epoch": 2
+    },
+    {
+      "epoch": 3,
+      "training_loss": 0.10776955124625454,
+      "validation_loss": 0.0990866556763649,
+      "validation_accuracy": 0.971,
+      "best_checkpoint_epoch": 3
+    },
+    {
+      "epoch": 4,
+      "training_loss": 0.08032225470410453,
+      "validation_loss": 0.09592437406380971,
+      "validation_accuracy": 0.9708333333333333,
+      "best_checkpoint_epoch": 3
+    },
+    {
+      "epoch": 5,
+      "training_loss": 0.06313352881316786,
+      "validation_loss": 0.08963846884543697,
+      "validation_accuracy": 0.9706666666666667,
+      "best_checkpoint_epoch": 3
+    },
+    {
+      "epoch": 6,
+      "training_loss": 0.051197892666966824,
+      "validation_loss": 0.0801516821719706,
+      "validation_accuracy": 0.9753333333333334,
+      "best_checkpoint_epoch": 6
+    },
+    {
+      "epoch": 7,
+      "training_loss": 0.040458842747879246,
+      "validation_loss": 0.09374462544918061,
+      "validation_accuracy": 0.9725,
+      "best_checkpoint_epoch": 6
+    },
+    {
+      "epoch": 8,
+      "training_loss": 0.0329355177026656,
+      "validation_loss": 0.09116874649127324,
+      "validation_accuracy": 0.9725,
+      "best_checkpoint_epoch": 6
+    },
+    {
+      "epoch": 9,
+      "training_loss": 0.029295933312977907,
+      "validation_loss": 0.08758099531009793,
+      "validation_accuracy": 0.976,
+      "best_checkpoint_epoch": 9
+    },
+    {
+      "epoch": 10,
+      "training_loss": 0.023609076292262655,
+      "validation_loss": 0.0824415915440768,
+      "validation_accuracy": 0.9773333333333334,
+      "best_checkpoint_epoch": 10
+    }
+  ],
+  "checkpoint_sha256": "b53a41676adfa020e3808617539f7966776fdd20bd7a247f34656e230459f22a",
+  "source_experiment_checkpoint": "models/experiments/mnist_mlp_10epochs.pt",
+  "source_experiment_history": "models/experiments/mnist_mlp_10epochs_history.json",
+  "promotion": "Epoch 10 of the ten-epoch CPU run had the highest validation accuracy. Those state_dict bytes were copied to models/mnist_mlp.pt. The model was not retrained.",
+  "five_epoch_baseline_checkpoint": "models/experiments/mnist_mlp_5epochs.pt",
+  "five_epoch_baseline_sha256": "1717f76de3d223ccf6e219c8d9a476af41cd7f8cf3097f701ee5c5e1d1a0cd79",
+  "five_epoch_baseline_history": "models/experiments/mnist_mlp_5epochs_history.json",
+  "test_set_role": "The official test set was not used to train or select this checkpoint. A later single evaluation is stored in models/mnist/evaluation_report.json."
+}
