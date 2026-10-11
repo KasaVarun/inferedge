@@ -15,6 +15,12 @@ enum class BenchmarkCliAction {
     kRun,
 };
 
+// text is the human report. json is one schema-version-1 document.
+enum class BenchmarkOutputFormat {
+    kText,
+    kJson,
+};
+
 // Owned parsed request. execute_benchmark builds input buffers and views after
 // this result exists. Views are not stored here.
 struct BenchmarkCliResult {
@@ -30,6 +36,7 @@ struct BenchmarkCliResult {
     bool fixture_specified{false};
     std::string fixture_directory;
     bool fixture_directory_specified{false};
+    BenchmarkOutputFormat output_format{BenchmarkOutputFormat::kText};
 };
 
 // Ids and expected classes copied from models/fixtures/mnist/manifest.json.

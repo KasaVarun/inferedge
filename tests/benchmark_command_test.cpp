@@ -2,6 +2,8 @@
 
 #include <bit>
 #include <cerrno>
+#include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <sys/wait.h>
+#include <system_error>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -361,6 +364,208 @@ CapturedProcess run_bench(const std::vector<std::string>& args) {
     return captured;
 }
 
+struct PythonResult {
+    bool found{false};
+    int exit_code{-1};
+    std::string standard_output;
+    std::string standard_error;
+};
+
+PythonResult run_python(const std::vector<std::string>& args, const std::string& input) {
+    PythonResult captured;
+    PipeEnds input_pipe;
+    PipeEnds output;
+    PipeEnds error;
+    if (!input_pipe.valid() || !output.valid() || !error.valid()) {
+        ADD_FAILURE() << "pipe failed: " << std::strerror(errno);
+        return captured;
+    }
+
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        ADD_FAILURE() << "posix_spawn_file_actions_init failed";
+        return captured;
+    }
+    posix_spawn_file_actions_adddup2(&actions, input_pipe.read_end(), STDIN_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, output.write_end(), STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, error.write_end(), STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&actions, input_pipe.read_end());
+    posix_spawn_file_actions_addclose(&actions, input_pipe.write_end());
+    posix_spawn_file_actions_addclose(&actions, output.read_end());
+    posix_spawn_file_actions_addclose(&actions, output.write_end());
+    posix_spawn_file_actions_addclose(&actions, error.read_end());
+    posix_spawn_file_actions_addclose(&actions, error.write_end());
+
+    std::vector<std::string> arguments;
+    arguments.emplace_back("python3");
+    arguments.insert(arguments.end(), args.begin(), args.end());
+    std::vector<char*> argv;
+    argv.reserve(arguments.size() + 1);
+    for (std::string& argument : arguments) {
+        argv.push_back(argument.data());
+    }
+    argv.push_back(nullptr);
+
+    pid_t pid = 0;
+    const int spawned = ::posix_spawnp(&pid, "python3", &actions, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    input_pipe.close_read();
+    output.close_write();
+    error.close_write();
+    if (spawned == ENOENT) {
+        return captured;
+    }
+    if (spawned != 0) {
+        ADD_FAILURE() << "posix_spawnp failed: " << std::strerror(spawned);
+        return captured;
+    }
+    captured.found = true;
+
+    std::size_t offset = 0;
+    while (offset < input.size()) {
+        const ssize_t wrote =
+            ::write(input_pipe.write_end(), input.data() + offset, input.size() - offset);
+        if (wrote > 0) {
+            offset += static_cast<std::size_t>(wrote);
+            continue;
+        }
+        if (wrote < 0 && errno == EINTR) {
+            continue;
+        }
+        ADD_FAILURE() << "writing python stdin failed: " << std::strerror(errno);
+        break;
+    }
+    input_pipe.close_write();
+
+    ::fcntl(output.read_end(), F_SETFL, O_NONBLOCK);
+    ::fcntl(error.read_end(), F_SETFL, O_NONBLOCK);
+    bool output_open = true;
+    bool error_open = true;
+    while (output_open || error_open) {
+        pollfd ready[2]{};
+        nfds_t count = 0;
+        pollfd* output_ready = nullptr;
+        pollfd* error_ready = nullptr;
+        if (output_open) {
+            ready[count].fd = output.read_end();
+            ready[count].events = POLLIN;
+            output_ready = &ready[count];
+            ++count;
+        }
+        if (error_open) {
+            ready[count].fd = error.read_end();
+            ready[count].events = POLLIN;
+            error_ready = &ready[count];
+            ++count;
+        }
+        const int polled = ::poll(ready, count, -1);
+        if (polled < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            ADD_FAILURE() << "poll failed: " << std::strerror(errno);
+            break;
+        }
+        if (output_ready != nullptr &&
+            !finish_pipe(*output_ready, output.read_end(), captured.standard_output, output_open)) {
+            ADD_FAILURE() << "reading python stdout failed";
+            break;
+        }
+        if (error_ready != nullptr &&
+            !finish_pipe(*error_ready, error.read_end(), captured.standard_error, error_open)) {
+            ADD_FAILURE() << "reading python stderr failed";
+            break;
+        }
+    }
+    output.close_read();
+    error.close_read();
+
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            ADD_FAILURE() << "waitpid failed: " << std::strerror(errno);
+            return captured;
+        }
+    }
+    if (WIFEXITED(status)) {
+        captured.exit_code = WEXITSTATUS(status);
+    } else {
+        ADD_FAILURE() << "python3 did not exit normally";
+    }
+    return captured;
+}
+
+bool python3_available() {
+    const PythonResult result = run_python({"-c", "import json"}, {});
+    return result.found && result.exit_code == 0;
+}
+
+std::string json_token(const std::string& text, std::string_view key) {
+    const std::string pattern = "\"" + std::string{key} + "\": ";
+    const std::size_t at = text.find(pattern);
+    EXPECT_NE(at, std::string::npos) << key << "\n" << text;
+    if (at == std::string::npos) {
+        return {};
+    }
+    const std::size_t start = at + pattern.size();
+    std::size_t end = start;
+    while (end < text.size() && text[end] != ',' && text[end] != '\n') {
+        ++end;
+    }
+    return text.substr(start, end - start);
+}
+
+void expect_finite_metric(const std::string& text, std::string_view key, bool positive) {
+    const std::string token = json_token(text, key);
+    ASSERT_FALSE(token.empty()) << key;
+    double value = 0.0;
+    const char* begin = token.data();
+    const std::from_chars_result result = std::from_chars(begin, begin + token.size(), value);
+    EXPECT_EQ(result.ec, std::errc{}) << token;
+    EXPECT_EQ(result.ptr, begin + token.size()) << token;
+    EXPECT_TRUE(std::isfinite(value)) << token;
+    EXPECT_FALSE(std::signbit(value)) << token;
+    EXPECT_NE(token.front(), '-');
+    if (positive) {
+        EXPECT_GT(value, 0.0) << token;
+    }
+}
+
+void expect_json_report(const std::string& text, std::string_view workload, std::string_view model,
+                        std::string_view fixture, std::uint32_t warmup, std::uint32_t measured) {
+    ASSERT_FALSE(text.empty());
+    EXPECT_EQ(text.front(), '{');
+    EXPECT_EQ(text.back(), '\n');
+    EXPECT_EQ(text.find("InferEdge benchmark"), std::string::npos) << text;
+    EXPECT_EQ(text.find("server capacity"), std::string::npos) << text;
+    EXPECT_EQ(text.find("requests/second"), std::string::npos) << text;
+    EXPECT_EQ(text.find("Correctness: passed"), std::string::npos) << text;
+    EXPECT_EQ(text.find("GPU"), std::string::npos) << text;
+    EXPECT_EQ(text.find("NaN"), std::string::npos) << text;
+    EXPECT_EQ(text.find("Infinity"), std::string::npos) << text;
+    EXPECT_NE(text.find("\"schema_version\": 1,\n"), std::string::npos) << text;
+    EXPECT_NE(text.find("\"name\": \"inferedge-bench\""), std::string::npos) << text;
+    EXPECT_NE(text.find("\"version\": \"0.1.0\""), std::string::npos) << text;
+    EXPECT_NE(text.find("\"workload\": \"" + std::string{workload} + "\""), std::string::npos);
+    EXPECT_NE(text.find("\"model\": \"" + std::string{model} + "\""), std::string::npos) << text;
+    EXPECT_NE(text.find("\"backend\": \"ONNX Runtime CPU\""), std::string::npos) << text;
+    EXPECT_NE(text.find("\"correctness\": \"passed\""), std::string::npos) << text;
+    EXPECT_NE(text.find("\"calling_threads\": 1"), std::string::npos) << text;
+    EXPECT_NE(text.find("\"onnx_intra_op_threads\": 1"), std::string::npos) << text;
+    EXPECT_NE(text.find("\"graph_optimizations\": \"disabled\""), std::string::npos) << text;
+    EXPECT_EQ(json_token(text, "fixture"), fixture);
+    EXPECT_EQ(json_token(text, "warmup_iterations"), std::to_string(warmup));
+    EXPECT_EQ(json_token(text, "measured_iterations"), std::to_string(measured));
+    EXPECT_EQ(json_token(text, "sample_count"), std::to_string(measured));
+    for (const char* key :
+         {"minimum", "mean", "p50", "p95", "p99", "maximum", "population_standard_deviation"}) {
+        expect_finite_metric(text, key, false);
+    }
+    expect_finite_metric(text, "measurement_loop_microseconds", true);
+    expect_finite_metric(text, "active_call", true);
+    expect_finite_metric(text, "observed_sequential", true);
+}
+
 void expect_process_failure(const CapturedProcess& captured, int exit_code,
                             std::string_view fragment) {
     EXPECT_EQ(captured.exit_code, exit_code);
@@ -519,4 +724,149 @@ TEST(BenchmarkProcess, AddAndMnistSucceedOnStdout) {
     EXPECT_NE(mnist.standard_output.find("Fixture: test_00003\n"), std::string::npos);
     EXPECT_NE(mnist.standard_output.find("Correctness: passed\n"), std::string::npos);
     EXPECT_EQ(mnist.standard_output.find("GPU"), std::string::npos);
+}
+
+TEST_F(BenchmarkCommandTest, ExplicitTextFormatKeepsTheReport) {
+    const BenchmarkCliResult result =
+        run_words({"--model", INFEREDGE_ADD_MODEL_PATH, "--workload", "add", "--format", "text",
+                   "--warmup", "0", "--iterations", "2"});
+    expect_labels(result, "add", INFEREDGE_ADD_MODEL_PATH, 0, 2, "");
+    EXPECT_EQ(result.message.find("schema_version"), std::string::npos);
+}
+
+TEST_F(BenchmarkCommandTest, WritesAddJson) {
+    const BenchmarkCliResult result =
+        run_words({"--model", INFEREDGE_ADD_MODEL_PATH, "--workload", "add", "--format", "json",
+                   "--warmup", "0", "--iterations", "2", "--check-interval", "2"});
+    ASSERT_EQ(result.exit_code, 0) << result.message;
+    ASSERT_EQ(result.action, BenchmarkCliAction::kRun);
+    expect_json_report(result.message, "add", INFEREDGE_ADD_MODEL_PATH, "null", 0, 2);
+    EXPECT_EQ(json_token(result.message, "correctness_check_interval"), "2");
+}
+
+TEST_F(BenchmarkCommandTest, WritesMnistJson) {
+    const BenchmarkCliResult equals =
+        run_words({"--model", INFEREDGE_MNIST_MODEL_PATH, "--workload", "mnist", "--format=json",
+                   "--fixture", "test_00003", "--warmup", "1", "--iterations", "2"});
+    ASSERT_EQ(equals.exit_code, 0) << equals.message;
+    expect_json_report(equals.message, "mnist", INFEREDGE_MNIST_MODEL_PATH, "\"test_00003\"", 1, 2);
+}
+
+TEST_F(BenchmarkCommandTest, PythonJsonModuleParsesReports) {
+    if (!python3_available()) {
+        GTEST_SKIP() << "python3 is not available";
+    }
+    const char* script = R"PY(
+import json, math, sys
+def reject_constant(token):
+    raise json.JSONDecodeError(token, token, 0)
+expected = sys.argv[1]
+document = json.loads(sys.stdin.read(), parse_constant=reject_constant)
+keys = [
+    "schema_version", "tool", "model", "workload", "fixture", "backend",
+    "configuration", "latency_microseconds", "measurement_loop_microseconds",
+    "throughput_requests_per_second", "correctness",
+]
+if list(document) != keys:
+    sys.exit("unexpected keys")
+if type(document["schema_version"]) is not int or document["schema_version"] != 1:
+    sys.exit("schema_version")
+if document["tool"]["name"] != "inferedge-bench" or type(document["tool"]["version"]) is not str:
+    sys.exit("tool")
+if document["correctness"] != "passed" or document["backend"] != "ONNX Runtime CPU":
+    sys.exit("identity")
+config = document["configuration"]
+if config["calling_threads"] != 1 or config["onnx_intra_op_threads"] != 1:
+    sys.exit("threads")
+if config["graph_optimizations"] != "disabled":
+    sys.exit("optimizations")
+if type(config["measured_iterations"]) is not int or config["measured_iterations"] < 1:
+    sys.exit("iterations")
+latency = document["latency_microseconds"]
+if type(latency["sample_count"]) is not int:
+    sys.exit("sample_count type")
+if latency["sample_count"] != config["measured_iterations"]:
+    sys.exit("sample_count")
+for key in ("minimum", "mean", "p50", "p95", "p99", "maximum", "population_standard_deviation"):
+    value = latency[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        sys.exit(key)
+    if value < 0 or math.copysign(1.0, float(value)) < 0:
+        sys.exit("negative " + key)
+loop = document["measurement_loop_microseconds"]
+if isinstance(loop, bool) or not isinstance(loop, (int, float)) or not math.isfinite(loop) or loop <= 0:
+    sys.exit("loop")
+throughput = document["throughput_requests_per_second"]
+for key in ("active_call", "observed_sequential"):
+    value = throughput[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        sys.exit(key)
+    if not math.isfinite(value) or value <= 0:
+        sys.exit(key)
+if expected == "null":
+    if document["fixture"] is not None:
+        sys.exit("fixture")
+elif document["fixture"] != expected:
+    sys.exit("fixture")
+print("ok")
+)PY";
+    const BenchmarkCliResult add =
+        run_words({"--model", INFEREDGE_ADD_MODEL_PATH, "--workload", "add", "--format", "json",
+                   "--warmup", "0", "--iterations", "2"});
+    const BenchmarkCliResult mnist =
+        run_words({"--model", INFEREDGE_MNIST_MODEL_PATH, "--workload", "mnist", "--format=json",
+                   "--fixture", "test_00003", "--warmup", "0", "--iterations", "2"});
+    ASSERT_EQ(add.exit_code, 0) << add.message;
+    ASSERT_EQ(mnist.exit_code, 0) << mnist.message;
+    const PythonResult add_parsed = run_python({"-c", script, "null"}, add.message);
+    const PythonResult mnist_parsed = run_python({"-c", script, "test_00003"}, mnist.message);
+    EXPECT_EQ(add_parsed.exit_code, 0) << add_parsed.standard_error << add.message;
+    EXPECT_EQ(add_parsed.standard_output, "ok\n") << add_parsed.standard_error;
+    EXPECT_EQ(mnist_parsed.exit_code, 0) << mnist_parsed.standard_error << mnist.message;
+    EXPECT_EQ(mnist_parsed.standard_output, "ok\n") << mnist_parsed.standard_error;
+
+    const char* reject_nonfinite = R"PY(
+import json, sys
+def reject_constant(token):
+    raise json.JSONDecodeError(token, token, 0)
+for token in ("NaN", "Infinity", "-Infinity"):
+    try:
+        json.loads('{"a": %s}' % token, parse_constant=reject_constant)
+    except json.JSONDecodeError:
+        continue
+    sys.exit("accepted " + token)
+print("rejected")
+)PY";
+    const PythonResult rejected = run_python({"-c", reject_nonfinite}, {});
+    EXPECT_EQ(rejected.exit_code, 0) << rejected.standard_error;
+    EXPECT_EQ(rejected.standard_output, "rejected\n") << rejected.standard_output;
+}
+
+TEST(BenchmarkProcess, JsonReportsAreTheOnlyStdout) {
+    const CapturedProcess add =
+        run_bench({"--model", INFEREDGE_ADD_MODEL_PATH, "--workload", "add", "--format", "json",
+                   "--warmup", "0", "--iterations", "2"});
+    const CapturedProcess mnist =
+        run_bench({"--model", INFEREDGE_MNIST_MODEL_PATH, "--workload", "mnist", "--format=json",
+                   "--fixture", "test_00003", "--warmup", "0", "--iterations", "2"});
+    EXPECT_EQ(add.exit_code, 0);
+    EXPECT_TRUE(add.standard_error.empty()) << add.standard_error;
+    expect_json_report(add.standard_output, "add", INFEREDGE_ADD_MODEL_PATH, "null", 0, 2);
+    EXPECT_EQ(mnist.exit_code, 0);
+    EXPECT_TRUE(mnist.standard_error.empty()) << mnist.standard_error;
+    expect_json_report(mnist.standard_output, "mnist", INFEREDGE_MNIST_MODEL_PATH, "\"test_00003\"",
+                       0, 2);
+}
+
+TEST(BenchmarkProcess, JsonErrorsLeaveStdoutEmpty) {
+    const CapturedProcess unknown = run_bench({"--format", "yaml"});
+    const CapturedProcess missing =
+        run_bench({"--model", std::string{INFEREDGE_ADD_MODEL_PATH} + ".missing", "--workload",
+                   "add", "--format", "json", "--iterations", "1"});
+    expect_process_failure(unknown, 2, "unknown format 'yaml'");
+    EXPECT_NE(unknown.standard_error.find("Usage: inferedge-bench"), std::string::npos);
+    EXPECT_EQ(unknown.standard_output.find('{'), std::string::npos);
+    expect_process_failure(missing, 3, "model file is missing");
+    EXPECT_EQ(missing.standard_output.find('{'), std::string::npos);
+    EXPECT_EQ(missing.standard_error.find("schema_version"), std::string::npos);
 }

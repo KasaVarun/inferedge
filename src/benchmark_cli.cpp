@@ -224,13 +224,15 @@ std::string benchmark_help_message() {
     message += "  --check-interval <count>   Numeric check interval (default 1)\n";
     message += "  --fixture <id>             MNIST fixture id (default test_00003)\n";
     message += "  --fixture-dir <path>       MNIST fixture directory\n";
+    message += "  --format <name>            text or json (default text)\n";
     message += "\n";
     message += "With no arguments, this help is shown. --help and --version cannot be\n";
     message += "combined with other arguments. --fixture and --fixture-dir apply only to\n";
     message += "the mnist workload. The default fixture directory is the source-tree path\n";
     message += "chosen when CMake configured the build. A copied executable may need\n";
     message += "--fixture-dir. Warmup may be 0. Measured iterations and the check interval\n";
-    message += "must be from 1 through 100000.\n";
+    message += "must be from 1 through 100000. The default format is text. --format json\n";
+    message += "writes one JSON document and a newline to stdout.\n";
     return message;
 }
 
@@ -263,6 +265,7 @@ BenchmarkCliResult parse_benchmark_cli(const std::vector<std::string_view>& args
     bool saw_warmup = false;
     bool saw_iterations = false;
     bool saw_interval = false;
+    bool saw_format = false;
 
     for (std::size_t index = 0; index < args.size(); ++index) {
         const std::string_view argument = args[index];
@@ -359,6 +362,32 @@ BenchmarkCliResult parse_benchmark_cli(const std::vector<std::string_view>& args
                 return error_result(duplicate);
             }
             parsed.fixture_id.assign(text);
+            continue;
+        }
+
+        const std::string format_error =
+            take_value(args, index, "--format", "--format=", text, present);
+        if (!format_error.empty()) {
+            return error_result(format_error);
+        }
+        if (present) {
+            const std::string duplicate = assign_once(saw_format, "--format");
+            if (!duplicate.empty()) {
+                return error_result(duplicate);
+            }
+            if (text.empty()) {
+                return error_result("error: empty format\n");
+            }
+            if (text == "text") {
+                parsed.output_format = BenchmarkOutputFormat::kText;
+            } else if (text == "json") {
+                parsed.output_format = BenchmarkOutputFormat::kJson;
+            } else {
+                std::string message = "error: unknown format '";
+                message += text;
+                message += "'\n";
+                return error_result(std::move(message));
+            }
             continue;
         }
 

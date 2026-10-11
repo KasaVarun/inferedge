@@ -219,9 +219,55 @@ TEST(BenchmarkCliTest, CatalogMatchesTheManifest) {
         EXPECT_EQ(found->second, fixture.expected_class) << fixture.id;
         EXPECT_EQ(find_mnist_fixture(fixture.id), &fixture);
     }
+    EXPECT_NE(inferedge::benchmark_help_message().find("--format <name>"), std::string::npos);
     for (const auto& item : cases) {
         const inferedge::MnistFixture* fixture = find_mnist_fixture(item.first);
         ASSERT_NE(fixture, nullptr) << item.first;
         EXPECT_EQ(fixture->expected_class, item.second) << item.first;
     }
+}
+
+TEST(BenchmarkCliTest, DefaultsToTextAndAcceptsFormatFlags) {
+    const BenchmarkCliResult defaults = parse({"--model", "m", "--workload", "add"});
+    EXPECT_EQ(defaults.action, BenchmarkCliAction::kRun);
+    EXPECT_EQ(defaults.output_format, inferedge::BenchmarkOutputFormat::kText);
+
+    const BenchmarkCliResult text =
+        parse({"--model", "m", "--workload", "add", "--format", "text"});
+    EXPECT_EQ(text.action, BenchmarkCliAction::kRun);
+    EXPECT_EQ(text.output_format, inferedge::BenchmarkOutputFormat::kText);
+    EXPECT_TRUE(text.message.empty());
+
+    const BenchmarkCliResult json =
+        parse({"--model", "m", "--workload", "add", "--format", "json"});
+    EXPECT_EQ(json.action, BenchmarkCliAction::kRun);
+    EXPECT_EQ(json.output_format, inferedge::BenchmarkOutputFormat::kJson);
+
+    const BenchmarkCliResult attached =
+        parse({"--model", "m", "--workload", "add", "--format=json"});
+    EXPECT_EQ(attached.output_format, inferedge::BenchmarkOutputFormat::kJson);
+    const BenchmarkCliResult attached_text =
+        parse({"--model", "m", "--workload", "mnist", "--format=text"});
+    EXPECT_EQ(attached_text.output_format, inferedge::BenchmarkOutputFormat::kText);
+    EXPECT_EQ(attached_text.fixture_id, "test_00003");
+}
+
+TEST(BenchmarkCliTest, RejectsInvalidFormatFlags) {
+    expect_usage(parse({"--format", "yaml"}), "unknown format 'yaml'");
+    expect_usage(parse({"--format", "JSON", "--model", "m", "--workload", "add"}),
+                 "unknown format 'JSON'");
+    expect_usage(parse({"--model", "m", "--workload", "add", "--format"}),
+                 "missing value for --format");
+    expect_usage(parse({"--format", "--model", "m", "--workload", "add"}),
+                 "missing value for --format");
+    expect_usage(parse({"--model", "m", "--workload", "add", "--format="}), "empty format");
+    expect_usage(parse({"--model", "m", "--workload", "add", "--format", ""}), "empty format");
+    expect_usage(
+        parse({"--model", "m", "--workload", "add", "--format", "json", "--format", "text"}),
+        "--format specified more than once");
+    expect_usage(parse({"--format=json", "--model", "m", "--workload", "add", "--format=text"}),
+                 "--format specified more than once");
+    expect_usage(parse({"--help", "--format", "json"}), "unexpected argument");
+    expect_usage(parse({"--format", "json", "--version"}), "unexpected argument");
+    expect_usage(parse({"--version", "--format=text"}), "unexpected argument");
 }

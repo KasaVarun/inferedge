@@ -143,6 +143,7 @@ add_library(
     inferedge_benchmark_cli
     src/benchmark_cli.cpp
     src/benchmark_command.cpp
+    src/benchmark_json.cpp
 )
 target_include_directories(inferedge_benchmark_cli PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(inferedge_benchmark_cli PUBLIC cxx_std_20)
@@ -217,6 +218,7 @@ add_executable(
     inferedge_bench_tests
     tests/benchmark_cli_test.cpp
     tests/benchmark_command_test.cpp
+    tests/benchmark_json_test.cpp
 )
 target_link_libraries(
     inferedge_bench_tests

@@ -1,6 +1,8 @@
 #include "inferedge/benchmark_cli.hpp"
+#include "inferedge/benchmark_json.hpp"
 #include "inferedge/benchmark_runner.hpp"
 #include "inferedge/inference_engine.hpp"
+#include "inferedge/version.hpp"
 
 #include <bit>
 #include <charconv>
@@ -340,7 +342,15 @@ BenchmarkCliResult execute_benchmark(const BenchmarkCliResult& parsed) {
         parsed.workload == "mnist" ? std::string_view{parsed.fixture_id} : std::string_view{};
     success.action = BenchmarkCliAction::kRun;
     success.exit_code = 0;
-    success.message = format_benchmark_report(run.report, fixture_id);
+    if (parsed.output_format == BenchmarkOutputFormat::kJson) {
+        const BenchmarkJsonResult written = write_benchmark_json(run.report, fixture_id, version());
+        if (!written.error.empty()) {
+            return fail(kExitReport, written.error);
+        }
+        success.message = written.text;
+    } else {
+        success.message = format_benchmark_report(run.report, fixture_id);
+    }
     return success;
 }
 

@@ -1,6 +1,6 @@
 # Agent guide
 
-InferEdge is a C++20 inference runtime. ONNX Runtime 1.31.0 CPU is a pinned configure-time dependency. The `inferedge` executable supports `--help`, `--version`, and one fixed rank-1 float32 model through `InferenceEngine`. `inferedge-bench` measures one loaded engine through `run_benchmark`.
+InferEdge is a C++20 inference runtime. ONNX Runtime 1.31.0 CPU is a pinned configure-time dependency. The `inferedge` executable supports `--help`, `--version`, and one fixed rank-1 float32 model through `InferenceEngine`. `inferedge-bench` measures one loaded engine through `run_benchmark`. Its default report is text. `--format json` writes schema version 1 from that report with `std::to_chars`. Do not add a JSON library.
 
 ## Current scope
 
@@ -8,7 +8,7 @@ Build the `inferedge` executable, `inferedge-bench`, their unit tests, the ONNX 
 
 ## Do not add yet
 
-- Published speed figures. `inferedge-bench` calls `run_benchmark` for one loaded `InferenceEngine` on the calling thread. `summarize_latencies` still only reduces injected durations
+- Published speed figures. `inferedge-bench` calls `run_benchmark` for one loaded `InferenceEngine` on the calling thread and can print that report as text or JSON. `summarize_latencies` still only reduces injected durations. JSON schema version 1 does not include raw samples, hardware, build type, or a model hash
 - Scheduling, request queues, threading, or dynamic batching
 - CUDA, TensorRT, or CoreML execution provider configuration
 - HTTP APIs, databases, frontends, or Python bindings

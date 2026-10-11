@@ -20,7 +20,7 @@ The executable runs one fixed rank-1 float32 model and still answers `--help` an
 | GoogleTest unit tests | CUDA, TensorRT, or CoreML provider setup |
 | Synchronous float32 `InferenceEngine` | Concurrent `run()` calls |
 | clang-format 23.1.3 and Linux GitHub Actions | A production inference API |
-| Injected-duration statistics, `run_benchmark`, and `inferedge-bench` | Published speed figures or concurrent runs |
+| Injected-duration statistics, `run_benchmark`, and `inferedge-bench` text or JSON reports | Published speed figures or concurrent runs |
 
 Version: **0.1.0**
 
@@ -165,7 +165,7 @@ Every measured call must succeed. Every measured output is checked for count, na
 
 ## Benchmark command
 
-`inferedge-bench` is a separate executable. It links `inferedge_benchmark_cli`, which links `inferedge_benchmark`. The `inferedge` executable does not link that library. `inferedge-bench` parses arguments, prepares one workload, calls `load_inference_engine` once, checks the loaded metadata, and calls `run_benchmark`. It does not time `engine.run` itself.
+`inferedge-bench` is a separate executable. It links `inferedge_benchmark_cli`, which links `inferedge_benchmark`. The `inferedge` executable does not link that library. `inferedge-bench` parses arguments, prepares one workload, calls `load_inference_engine` once, checks the loaded metadata, and calls `run_benchmark`. It does not time `engine.run` itself. The default report is text. `--format json` writes the same completed report as one JSON document.
 
 ```bash
 export ORT_DISABLE_TELEMETRY=1
@@ -181,9 +181,14 @@ export ORT_DISABLE_TELEMETRY=1
   --fixture test_00003 \
   --warmup 100 \
   --iterations 1000
+./build/inferedge-bench \
+  --model models/add_f32.onnx \
+  --workload add \
+  --format json \
+  > add.json
 ```
 
-`--model` and `--workload` are required. `--workload` is `add` or `mnist`. `--warmup` defaults to 10 and may be 0. `--iterations` defaults to 100. `--check-interval` defaults to 1. Measured iterations and the check interval must be from 1 through 100000. `--help`, `-h`, `--version`, and `-V` are standalone and exit 0. With no arguments, the program prints help and exits 0. `--flag value` and `--flag=value` are both accepted. Duplicate flags, unknown flags, and non-numeric counts are usage errors. `std::from_chars` must consume each count. A value that does not fit in a 32-bit unsigned integer is an overflow. A separate argument that starts with `-` is an option, so a negative count has to be written as `--iterations=-1`, and that form is rejected.
+`--model` and `--workload` are required. `--workload` is `add` or `mnist`. `--warmup` defaults to 10 and may be 0. `--iterations` defaults to 100. `--check-interval` defaults to 1. Measured iterations and the check interval must be from 1 through 100000. `--format` is `text` or `json`. Omitting it selects text, which is the report printed today. `--format text` selects that same report. `--format json` and `--format=json` select JSON. An unknown format, an empty format, a missing format value, and a repeated `--format` are usage errors. `--help`, `-h`, `--version`, and `-V` are standalone and exit 0. With no arguments, the program prints help and exits 0. `--flag value` and `--flag=value` are both accepted. Duplicate flags, unknown flags, and non-numeric counts are usage errors. `std::from_chars` must consume each count. A value that does not fit in a 32-bit unsigned integer is an overflow. A separate argument that starts with `-` is an option, so a negative count has to be written as `--iterations=-1`, and that form is rejected.
 
 The Add workload uses `A = [1, 2]`, `B = [3, 4]`, and expected `C = [4, 6]`, with zero tolerance. `--fixture` and `--fixture-dir` are rejected for Add. The MNIST workload reads `inputs/<id>.f32` (784 little-endian float32 values) and `onnx/<id>.f32` (10 little-endian float32 logits) from the fixture directory. The default id is `test_00003`. The 14 ids and expected classes come from `models/fixtures/mnist/manifest.json`. The command does not parse that JSON file and does not recompute SHA-256. It rejects an unknown id, a path in the id, a missing file, a truncated or oversized file, a non-finite value, and a reference argmax that disagrees with the catalog. Comparison uses `rtol = 1e-4` and `atol = 1e-5`.
 
@@ -200,9 +205,57 @@ Use a Release build for measurements you intend to compare. Debug and sanitizer 
 | 5 | Inference failed during warmup or a measured call |
 | 6 | Loaded metadata does not match the workload |
 | 7 | An output failed the correctness check |
-| 8 | The benchmark report or latency statistics failed |
+| 8 | The benchmark report, latency statistics, or JSON serialization failed |
 
-Successful text goes to stdout. Errors go to stderr as `error: ...`. A usage error also reprints the help text. A failure does not print the benchmark report.
+Successful text goes to stdout. Errors go to stderr as `error: ...`. A usage error also reprints the help text. A failure does not print the benchmark report. A JSON failure exits 8, writes the reason to stderr, and leaves stdout empty.
+
+### JSON report
+
+`--format json` prints one JSON object and a newline. Stdout has no banner, timing note, or other prose. Shell redirection saves it:
+
+```bash
+./build/inferedge-bench \
+  --model models/add_f32.onnx \
+  --workload add \
+  --format json \
+  > add.json
+```
+
+Schema version 1 has these fields, in this order:
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | Integer `1` |
+| `tool.name` | `inferedge-bench` |
+| `tool.version` | The `inferedge` version string |
+| `model` | Model path as typed |
+| `workload` | `add` or `mnist` |
+| `fixture` | JSON `null` for Add. For MNIST, the selected fixture id |
+| `backend` | `ONNX Runtime CPU` |
+| `configuration.warmup_iterations` | Unmeasured calls |
+| `configuration.measured_iterations` | Measured calls |
+| `configuration.correctness_check_interval` | Numeric check interval |
+| `configuration.calling_threads` | `1`. `run_benchmark` uses the calling thread |
+| `configuration.onnx_intra_op_threads` | `1`. The current `InferenceEngine` session calls `SetIntraOpNumThreads(1)` |
+| `configuration.graph_optimizations` | `disabled`. That session calls `SetGraphOptimizationLevel(ORT_DISABLE_ALL)` |
+| `latency_microseconds.sample_count` | Measured samples. It equals `measured_iterations` |
+| `latency_microseconds.minimum` | Shortest measured `run`, converted from nanoseconds to microseconds |
+| `latency_microseconds.mean` | Mean from `LatencySummary`, in microseconds |
+| `latency_microseconds.p50`, `p95`, `p99` | Nearest-rank percentiles already stored on the summary, in microseconds |
+| `latency_microseconds.maximum` | Longest measured `run`, converted from nanoseconds to microseconds |
+| `latency_microseconds.population_standard_deviation` | Population standard deviation from the summary, in microseconds |
+| `measurement_loop_microseconds` | Outer measured loop, converted from nanoseconds to microseconds |
+| `throughput_requests_per_second.active_call` | Sample count divided by the sum of measured `run` durations |
+| `throughput_requests_per_second.observed_sequential` | Measured iterations divided by the outer loop duration |
+| `correctness` | `passed`. JSON is written only after a successful run |
+
+Counts are JSON integers. Latency, loop duration, and both throughput rates are JSON numbers. The conversion from nanoseconds to microseconds keeps fractional microseconds. Mean, percentiles, standard deviation, and both throughput values are copied from `BenchmarkReport` and `LatencySummary`. The serializer does not run the model, read a clock, or recompute percentiles.
+
+`active_call` excludes validation and loop overhead. `observed_sequential` includes validation and result destruction inside the measured loop. Neither number is server capacity. With a short sample, P99 is often the maximum and can move from run to run.
+
+The fixed thread and optimization fields describe the current engine configuration. They are not a probe of the machine. Schema version 1 does not include CPU frequency, CPU utilization, memory utilization, the git commit, the build type, a model hash, model initialization time, or the raw `call_durations` samples. The summary is the stable contract. A later schema can add samples without changing version 1.
+
+The writer rejects a non-finite metric, a sample count that is zero or different from the measured iteration count, a negative minimum, a maximum below the minimum, percentiles that are out of order, a negative standard deviation (including a tiny negative value or negative zero), a non-positive loop duration, a non-positive throughput, and a string that is not valid UTF-8. A rejected standard deviation is left unchanged and is not rewritten as zero. Quotes, backslashes, and ASCII controls are escaped. Valid non-ASCII UTF-8 is preserved. Invalid UTF-8 is an error, not a replacement character. There is no JSON library dependency.
 
 ## Command line
 
@@ -243,13 +296,13 @@ One command accepts at most 64 named inputs and 1,048,576 floats in total, with 
 
 - The CLI runs fixed rank-1 float32 inputs only. It does not accept a dynamic dimension or a rank other than 1.
 - There is no scheduler, request queue, thread pool, or batching API.
-- `inferedge-bench` does not publish a speed figure. It runs the Add and MNIST workloads only. P99 from a short sample is the nearest-rank element, often the maximum. The default fixture directory is fixed at configure time.
+- `inferedge-bench` does not publish a speed figure. It runs the Add and MNIST workloads only. P99 from a short sample is the nearest-rank element, often the maximum. The default fixture directory is fixed at configure time. JSON schema version 1 omits hardware, build configuration, the model hash, and raw latency samples.
 - The engine runs one synchronous `float32` model on CPU, with one intra-op thread and graph optimizations disabled.
 - Each `run` copies input floats and output floats. This is not zero-copy execution.
 - Concurrent `run()` calls are not supported.
 - The committed graphs are hand-written. They are not trained models.
 - CUDA, TensorRT, and CoreML providers are not configured.
-- Python is used only to regenerate fixtures. The C++ build does not install it.
+- Python is used to regenerate fixtures. The C++ build does not install it and does not link a JSON library. An optional test parses a benchmark document with `python3`'s standard-library `json` module and skips that check when `python3` is absent.
 
 ## Build
 
