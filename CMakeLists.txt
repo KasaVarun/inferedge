@@ -71,6 +71,7 @@ add_executable(
     tests/request_lifecycle_test.cpp
     tests/float_buffer_test.cpp
     tests/ownership_test.cpp
+    tests/native_resource_test.cpp
 )
 target_link_libraries(inferedge_tests PRIVATE inferedge_core GTest::gtest_main)
 
