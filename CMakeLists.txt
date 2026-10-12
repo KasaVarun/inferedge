@@ -135,6 +135,15 @@ target_link_libraries(
     PRIVATE inferedge_warnings
 )
 
+add_library(inferedge_scheduler src/inference_scheduler.cpp)
+target_include_directories(inferedge_scheduler PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(inferedge_scheduler PUBLIC cxx_std_20)
+target_link_libraries(
+    inferedge_scheduler
+    PUBLIC inferedge_onnx Threads::Threads
+    PRIVATE inferedge_warnings
+)
+
 add_library(inferedge_concurrent_benchmark src/concurrent_benchmark.cpp)
 target_include_directories(inferedge_concurrent_benchmark PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(inferedge_concurrent_benchmark PUBLIC cxx_std_20)
@@ -368,6 +377,35 @@ target_link_libraries(
 gtest_discover_tests(
     inferedge_queue_tests
     PROPERTIES TIMEOUT 30
+)
+
+add_executable(inferedge_scheduler_tests tests/inference_scheduler_test.cpp)
+target_link_libraries(
+    inferedge_scheduler_tests
+    PRIVATE
+        inferedge_warnings
+        inferedge_scheduler
+        GTest::gtest_main
+)
+target_compile_definitions(
+    inferedge_scheduler_tests
+    PRIVATE
+        "INFEREDGE_ADD_MODEL_PATH=\"${INFEREDGE_ADD_MODEL}\""
+        "INFEREDGE_INVALID_MODEL_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/data/not_a_model.bin\""
+        "INFEREDGE_MNIST_MODEL_PATH=\"${INFEREDGE_MNIST_MODEL}\""
+        "INFEREDGE_MNIST_FIXTURE_DIR=\"${INFEREDGE_MNIST_FIXTURE_DIR}\""
+)
+set_target_properties(
+    inferedge_scheduler_tests
+    PROPERTIES
+        BUILD_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
+        INSTALL_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
+)
+gtest_discover_tests(
+    inferedge_scheduler_tests
+    PROPERTIES
+        ENVIRONMENT "ORT_DISABLE_TELEMETRY=1"
+        TIMEOUT 60
 )
 
 # Local bounded stress. Default CI does not build or discover this executable.
