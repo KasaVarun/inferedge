@@ -117,7 +117,11 @@ foreach(model_path expected_hash model_label IN ZIP_LISTS
     endif()
 endforeach()
 
-add_library(inferedge_onnx src/inference_engine.cpp)
+add_library(
+    inferedge_onnx
+    src/inference_engine.cpp
+    src/tensor_batch.cpp
+)
 target_include_directories(inferedge_onnx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(inferedge_onnx PUBLIC cxx_std_20)
 target_link_libraries(
@@ -225,6 +229,7 @@ add_executable(
     tests/onnx_runtime_smoke_test.cpp
     tests/onnx_add_inference_test.cpp
     tests/inference_engine_test.cpp
+    tests/tensor_batch_test.cpp
     tests/mnist_inference_test.cpp
     tests/benchmark_runner_test.cpp
     tests/concurrent_inference_test.cpp
