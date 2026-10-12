@@ -143,15 +143,16 @@ The synthetic tests do not execute the model:
 
 ```bash
 python3 -m unittest benchmarks.test_collect_baseline benchmarks.test_analyze_baseline \
-  benchmarks.test_collect_concurrent
+  benchmarks.test_collect_concurrent benchmarks.test_analyze_concurrent
 python3 -m py_compile benchmarks/collect_baseline.py benchmarks/analyze_baseline.py \
-  benchmarks/collect_concurrent.py benchmarks/test_collect_baseline.py \
-  benchmarks/test_analyze_baseline.py benchmarks/test_collect_concurrent.py
+  benchmarks/collect_concurrent.py benchmarks/analyze_concurrent.py \
+  benchmarks/test_collect_baseline.py benchmarks/test_analyze_baseline.py \
+  benchmarks/test_collect_concurrent.py benchmarks/test_analyze_concurrent.py
 ```
 
 ## Concurrent scaling collection
 
-`benchmarks/collect_concurrent.py` launches `inferedge-bench-concurrent` and stores one schema-version-2 JSON report per process. It does not launch `inferedge-bench`, does not write `aggregate.json`, and does not run a campaign by being imported. No concurrent analyzer is included. No concurrent scaling run set has been collected, and this repository has no measured concurrent scaling results. The measurement commit is whatever full SHA the operator passes. This file does not name one.
+`benchmarks/collect_concurrent.py` launches `inferedge-bench-concurrent` and stores one schema-version-2 JSON report per process. It does not launch `inferedge-bench`, does not write `aggregate.json`, and does not run a campaign by being imported. `benchmarks/analyze_concurrent.py` reads one completed run set and writes `aggregate.json`. It does not launch a benchmark. No concurrent scaling run set has been collected, and this repository has no measured concurrent scaling results. The measurement commit is whatever full SHA the operator passes. This file does not name one.
 
 ### Matrix
 
@@ -301,14 +302,49 @@ benchmarks/concurrent_runs/<YYYYMMDDTHHMMSSZ-commit>/
   runs/<trial>.meta.json
   runs/<trial>.json          # accepted stdout, unchanged
   failure.json               # only when a trial stops the set
+  aggregate.json             # written by analyze_concurrent after a completed set is accepted
 ```
 
-`environment.json` is `running` while processes are in flight, `completed` only after all 48 trials are accepted, and `failed` when a trial stops the set. `aggregate` in that file stays null.
+`environment.json` is `running` while processes are in flight, `completed` only after all 48 trials are accepted, and `failed` when a trial stops the set. `aggregate` in that file stays null. The collector does not create `aggregate.json`.
 
 ### Failure
 
 A preflight failure exits nonzero, starts no trial, and creates no run-set directory. A trial failure keeps `.stdout`, `.stderr`, and `.meta.json` for that trial, writes `failure.json`, marks the manifest `failed`, and keeps earlier accepted `.json` files, including pilots. Later trials are not started. An exception while launching a process is recorded the same way. The collector does not create `aggregate.json`.
 
+### Analysis
+
+After a run set has actually completed, reduce it from the repository root:
+
+```bash
+python3 -m benchmarks.analyze_concurrent \
+  --run-set benchmarks/concurrent_runs/<run-set-id>
+```
+
+`python3 benchmarks/analyze_concurrent.py --run-set <directory>` is the same program. `--help` describes the arguments. The analyzer does not start `inferedge-bench-concurrent`, does not infer, and does not fill in a missing trial.
+
+The run set must already be complete. `environment.json` must exist with `status` `completed` and a null `aggregate` field. `failure.json` must be absent. The manifest protocol must be the collector protocol: workloads `add` and `mnist`, worker counts 1, 2, 4, and 8, 100 warmup iterations per worker, 1000 measured iterations per worker, correctness checks every iteration, 8 pilots, 40 counted trials, and 5 counted runs in each workload and worker-count cell. Trial identifiers and `trial_order` come from `collect_concurrent.py`. Filename order is not execution order. A missing, duplicate, or unexpected trial rejects the set.
+
+Every pilot and every counted trial needs `runs/<trial>.stdout`, `runs/<trial>.stderr`, `runs/<trial>.meta.json`, and `runs/<trial>.json`. Metadata must name that trial, record acceptance, exit 0, and an empty problem list. Stderr must be empty. Stdout must be one schema-version-2 JSON object plus a newline, and the accepted `.json` bytes must be those stdout bytes. Reports are checked with the concurrent validator. Schema version 1 is rejected. Workload, worker count, model path, fixture, execution configuration, completed counts, sample count, finite metrics, and `correctness: passed` must match the trial and the manifest.
+
+Pilots are validated with those same checks and remain on disk. Their measurements are excluded from latency reductions, throughput reductions, scaling ratios, scaling efficiency, and run-to-run variation.
+
+Each cell uses its five counted runs. Latency reductions are the mean of the five run means, the median of the run means, the median of the run P50, P95, and P99 values, the minimum and maximum run means, and the relative run-mean range `(maximum - minimum) / median run mean`. `median_of_run_p99_microseconds` is the median of five per-process P99 values. It is not a pooled percentile across those processes. Schema version 2 has no raw samples, so a pooled P99 is not computed.
+
+Throughput reductions use `aggregate_completed_requests_per_second`: the median, minimum, maximum, and relative range `(maximum - minimum) / median`. `median_active_call_requests_per_second` is stored beside them. Scaling does not use it. The control for each workload is that workload's worker count 1. For worker count N:
+
+```text
+throughput_ratio(N) = median aggregate throughput(N) / median aggregate throughput(1)
+scaling_efficiency(N) = throughput_ratio(N) / N
+latency_mean_ratio(N) = median of run means(N) / median of run means(1)
+latency_p99_ratio(N) = median of run P99(N) / median of run P99(1)
+```
+
+At worker count 1 each of those four values is 1. A zero or non-finite denominator, a negative measurement, `NaN`, or infinity rejects the set. Linear scaling is not assumed. Five runs do not establish statistical significance, and no confidence interval is computed. Concurrent aggregate throughput is not compared with the sequential active-call throughput.
+
+`aggregate.json` uses aggregate schema version 2 and records source benchmark schema version 2. It contains the run-set id, the measurement commit, the experiment configuration, both model identities, the full trial order, the pilot ids, the counted ids, and one result per workload and worker count. Each cell lists the five counted trial ids that contributed, the per-run values, the cross-run reductions, and the scaling ratios. `median_of_run_p99_is_pooled_p99` and `confidence_interval_computed` are false. No estimated measurement is inserted.
+
+An existing `aggregate.json` is left untouched and the command returns an error. The full document is built and checked in memory first. It is published by writing a temporary file in the run set, flushing and closing it, then linking it into place without replacing an existing file. A failed publish removes only that temporary file. Source reports, stdout, stderr, metadata, `environment.json`, and any aggregate that was already present are not modified. No measured concurrent `aggregate.json` is in this repository.
+
 ### Private artifacts
 
-`benchmarks/concurrent_runs/` stays untracked until a later review. The manifest contains absolute paths for the binary, compiler, models, fixture directory, and resolved ONNX Runtime library. Those raw files are not a published result. A later sanitization pass would have to write a separate derivative and leave this directory unchanged. The synthetic tests hash and parse reports. They do not execute a model.
+`benchmarks/concurrent_runs/` stays untracked until a later review. The manifest contains absolute paths for the binary, compiler, models, fixture directory, and resolved ONNX Runtime library. `aggregate.json` repeats the model paths from that manifest and is part of the same private run set. Those raw files are not a published result. A later sanitization pass would have to write a separate derivative and leave this directory unchanged. The synthetic tests hash and parse reports. They do not execute a model.
