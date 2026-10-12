@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -45,6 +46,34 @@ template <typename T> struct QueuePop {
     std::optional<T> value;
 };
 
+// Result of one nonblocking removal.
+enum class QueueTakeResult {
+    kReady,
+    kEmpty,
+    kClosed,
+};
+
+// Result of one deadline-based removal. The deadline uses steady_clock.
+enum class QueueWaitResult {
+    kReady,
+    kTimeout,
+    kClosed,
+};
+
+// On kReady, value owns the removed front item. On kEmpty and kClosed, value
+// is empty. kEmpty means the queue is open and has nothing waiting.
+template <typename T> struct QueueTake {
+    QueueTakeResult result{QueueTakeResult::kClosed};
+    std::optional<T> value;
+};
+
+// On kReady, value owns the removed front item. On kTimeout and kClosed, value
+// is empty. kTimeout means the queue is open, empty, and the deadline passed.
+template <typename T> struct QueueWait {
+    QueueWaitResult result{QueueWaitResult::kClosed};
+    std::optional<T> value;
+};
+
 // changed is true only for the call that performs the open-to-closed transition.
 //
 // canceled is null unless this call won close_cancel. A winning close_cancel
@@ -72,16 +101,31 @@ template <typename T> struct QueueClose {
 // kFull and a closed queue returns kClosed.
 //
 // T must be move-constructible and destructible. It does not need to be
-// copyable or move-assignable. try_push and wait_pop move-construct T while
-// the queue holds its mutex, and those moves must not call back into the
-// same queue.
+// copyable or move-assignable. try_push, wait_pop, try_pop, and
+// wait_pop_until move-construct T while the queue holds its mutex, and those
+// moves must not call back into the same queue.
 //
-// try_push and wait_pop provide the basic exception guarantee when T's move
-// constructor can throw. They are not strongly exception-safe for every
-// movable T, and they are not noexcept. If inserting into the deque throws,
-// try_push leaves the queue unchanged, but its by-value argument may already
-// be moved-from. If extracting the front element throws, wait_pop leaves that
-// moved-from element at the front and does not pop it.
+// try_push, wait_pop, try_pop, and wait_pop_until provide the basic exception
+// guarantee when T's move constructor can throw. They are not strongly
+// exception-safe for every movable T, and they are not noexcept. If inserting
+// into the deque throws, try_push leaves the queue unchanged, but its by-value
+// argument may already be moved-from. If extracting the front element throws,
+// wait_pop, try_pop, and wait_pop_until leave that moved-from element at the
+// front and do not pop it. A nothrow move makes that transfer strong: the
+// caller owns the item, or the queue still does.
+//
+// try_pop does not wait. An open empty queue returns kEmpty. A closed empty
+// queue returns kClosed. A waiting item returns kReady, including after
+// close_drain. kEmpty and kClosed do not move T and do not allocate.
+//
+// wait_pop_until waits on the same condition variable as wait_pop, using
+// steady_clock. Spurious wakeups recheck the queue while the mutex is held.
+// The mutex-held decision is: a waiting item is kReady, then a closed empty
+// queue is kClosed, then an open empty queue whose deadline has passed is
+// kTimeout. A queued item is not discarded because the deadline expired. A
+// closed empty queue is not reported as a timeout, and the wait does not
+// continue until the deadline after closure. kTimeout and kClosed do not move
+// T and do not allocate. The mutex is not held after the function returns.
 //
 // close_drain does not move or destroy T. If the mutex lock throws, admission
 // stays open. Otherwise the queue closes in drain mode and the waiting items
@@ -109,9 +153,9 @@ template <typename T> struct QueueClose {
 // close_drain and close_cancel are not noexcept. Locking the mutex can throw,
 // and the winning close_cancel can throw std::bad_alloc before it commits.
 //
-// The return moves of try_push and wait_pop are separate. When the returned
-// optional owns a T, that return move-constructs T and provides only the basic
-// guarantee above.
+// The return moves of try_push, wait_pop, try_pop, and wait_pop_until are
+// separate. When the returned optional owns a T, that return move-constructs T
+// and provides only the basic guarantee above.
 //
 // capacity() only reads the fixed capacity and is noexcept. size(),
 // is_closed(), and close_mode() lock the mutex and are not noexcept.
@@ -133,6 +177,10 @@ public:
 
     [[nodiscard]] QueuePush<T> try_push(T item);
     [[nodiscard]] QueuePop<T> wait_pop();
+    // Nonblocking removal of the front item. Does not notify producers.
+    [[nodiscard]] QueueTake<T> try_pop();
+    // Deadline removal of the front item. deadline is a steady_clock time point.
+    [[nodiscard]] QueueWait<T> wait_pop_until(std::chrono::steady_clock::time_point deadline);
     [[nodiscard]] QueueClose<T> close_drain();
     [[nodiscard]] QueueClose<T> close_cancel();
 
@@ -189,6 +237,38 @@ template <typename T> QueuePop<T> BoundedFifoQueue<T>::wait_pop() {
     outcome.result = QueuePopResult::kReady;
     outcome.value.emplace(std::move(items_.front()));
     items_.pop_front();
+    return outcome;
+}
+
+template <typename T> QueueTake<T> BoundedFifoQueue<T>::try_pop() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    QueueTake<T> outcome;
+    if (items_.empty()) {
+        outcome.result = mode_.has_value() ? QueueTakeResult::kClosed : QueueTakeResult::kEmpty;
+        return outcome;
+    }
+    outcome.result = QueueTakeResult::kReady;
+    outcome.value.emplace(std::move(items_.front()));
+    items_.pop_front();
+    return outcome;
+}
+
+template <typename T>
+QueueWait<T> BoundedFifoQueue<T>::wait_pop_until(std::chrono::steady_clock::time_point deadline) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait_until(lock, deadline, [this] { return !items_.empty() || mode_.has_value(); });
+    QueueWait<T> outcome;
+    if (!items_.empty()) {
+        outcome.result = QueueWaitResult::kReady;
+        outcome.value.emplace(std::move(items_.front()));
+        items_.pop_front();
+        return outcome;
+    }
+    if (mode_.has_value()) {
+        outcome.result = QueueWaitResult::kClosed;
+        return outcome;
+    }
+    outcome.result = QueueWaitResult::kTimeout;
     return outcome;
 }
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <future>
 #include <gtest/gtest.h>
 #include <iterator>
@@ -101,6 +102,29 @@ template <typename T> T take_ready(inferedge::QueuePop<T> popped) {
         throw std::logic_error("popped value is empty");
     }
     return std::move(*popped.value);
+}
+
+std::chrono::steady_clock::time_point expired_deadline() {
+    return std::chrono::steady_clock::now() - std::chrono::seconds(1);
+}
+
+std::chrono::steady_clock::time_point future_deadline() {
+    return std::chrono::steady_clock::now() + std::chrono::seconds(10);
+}
+
+// Unblocks a consumer that is still inside the queue, then returns its result.
+// The five-second bound is a deadlock guard. A successful wake returns sooner.
+template <typename T, typename Queue> T finish_consumer(std::future<T>& future, Queue& queue) {
+    if (future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        try {
+            if (!queue.is_closed()) {
+                static_cast<void>(queue.close_drain());
+            }
+        } catch (...) {
+        }
+        ADD_FAILURE() << "consumer did not finish";
+    }
+    return future.get();
 }
 
 } // namespace
@@ -815,4 +839,503 @@ TEST(BoundedFifoQueueTest, DrainWakesEveryBlockedConsumer) {
     EXPECT_TRUE(std::all_of(results.begin(), results.end(), [](inferedge::QueuePopResult result) {
         return result == inferedge::QueuePopResult::kClosed;
     }));
+}
+
+TEST(BoundedFifoQueueTest, TryPopOnEmptyQueueReturnsEmpty) {
+    inferedge::BoundedFifoQueue<int> queue(2);
+    const auto started = std::chrono::steady_clock::now();
+    const inferedge::QueueTake<int> taken = queue.try_pop();
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_LT(elapsed, std::chrono::seconds(1));
+    EXPECT_EQ(taken.result, inferedge::QueueTakeResult::kEmpty);
+    EXPECT_FALSE(taken.value.has_value());
+    EXPECT_FALSE(queue.is_closed());
+    EXPECT_EQ(queue.size(), 0U);
+    EXPECT_EQ(queue.capacity(), 2U);
+}
+
+TEST(BoundedFifoQueueTest, TryPopRemovesMoveOnlyValuesInFifoOrder) {
+    inferedge::BoundedFifoQueue<std::unique_ptr<int>> queue(3);
+    EXPECT_EQ(queue.try_push(std::make_unique<int>(1)).result,
+              inferedge::QueuePushResult::kAccepted);
+    EXPECT_EQ(queue.try_push(std::make_unique<int>(2)).result,
+              inferedge::QueuePushResult::kAccepted);
+    EXPECT_EQ(queue.try_push(std::make_unique<int>(3)).result,
+              inferedge::QueuePushResult::kAccepted);
+
+    const inferedge::QueueTake<std::unique_ptr<int>> first = queue.try_pop();
+    EXPECT_EQ(first.result, inferedge::QueueTakeResult::kReady);
+    ASSERT_TRUE(first.value.has_value());
+    ASSERT_NE(*first.value, nullptr);
+    EXPECT_EQ(**first.value, 1);
+    EXPECT_EQ(queue.size(), 2U);
+
+    const inferedge::QueueTake<std::unique_ptr<int>> second = queue.try_pop();
+    EXPECT_EQ(second.result, inferedge::QueueTakeResult::kReady);
+    ASSERT_TRUE(second.value.has_value());
+    ASSERT_NE(*second.value, nullptr);
+    EXPECT_EQ(**second.value, 2);
+    EXPECT_EQ(queue.size(), 1U);
+
+    const inferedge::QueueTake<std::unique_ptr<int>> third = queue.try_pop();
+    EXPECT_EQ(third.result, inferedge::QueueTakeResult::kReady);
+    ASSERT_TRUE(third.value.has_value());
+    ASSERT_NE(*third.value, nullptr);
+    EXPECT_EQ(**third.value, 3);
+    EXPECT_EQ(queue.size(), 0U);
+
+    const inferedge::QueueTake<std::unique_ptr<int>> empty = queue.try_pop();
+    EXPECT_EQ(empty.result, inferedge::QueueTakeResult::kEmpty);
+    EXPECT_FALSE(empty.value.has_value());
+    EXPECT_EQ(queue.capacity(), 3U);
+    EXPECT_FALSE(queue.is_closed());
+}
+
+TEST(BoundedFifoQueueTest, TryPopAfterDrainReturnsReadyUntilEmpty) {
+    inferedge::BoundedFifoQueue<int> queue(3);
+    EXPECT_EQ(queue.try_push(1).result, inferedge::QueuePushResult::kAccepted);
+    EXPECT_EQ(queue.try_push(2).result, inferedge::QueuePushResult::kAccepted);
+    EXPECT_EQ(queue.try_push(3).result, inferedge::QueuePushResult::kAccepted);
+
+    const inferedge::QueueClose<int> closed = queue.close_drain();
+    EXPECT_TRUE(closed.changed);
+    EXPECT_EQ(closed.mode, inferedge::QueueCloseMode::kDrain);
+    EXPECT_EQ(closed.canceled, nullptr);
+    EXPECT_EQ(queue.size(), 3U);
+
+    const inferedge::QueueTake<int> first = queue.try_pop();
+    EXPECT_EQ(first.result, inferedge::QueueTakeResult::kReady);
+    ASSERT_TRUE(first.value.has_value());
+    EXPECT_EQ(*first.value, 1);
+    const inferedge::QueueTake<int> second = queue.try_pop();
+    EXPECT_EQ(second.result, inferedge::QueueTakeResult::kReady);
+    ASSERT_TRUE(second.value.has_value());
+    EXPECT_EQ(*second.value, 2);
+    const inferedge::QueueTake<int> third = queue.try_pop();
+    EXPECT_EQ(third.result, inferedge::QueueTakeResult::kReady);
+    ASSERT_TRUE(third.value.has_value());
+    EXPECT_EQ(*third.value, 3);
+
+    const inferedge::QueueTake<int> done = queue.try_pop();
+    EXPECT_EQ(done.result, inferedge::QueueTakeResult::kClosed);
+    EXPECT_FALSE(done.value.has_value());
+    EXPECT_EQ(queue.size(), 0U);
+}
+
+TEST(BoundedFifoQueueTest, TryPopAfterCancelReturnsClosed) {
+    inferedge::BoundedFifoQueue<std::unique_ptr<int>> queue(3);
+    EXPECT_EQ(queue.try_push(std::make_unique<int>(1)).result,
+              inferedge::QueuePushResult::kAccepted);
+    EXPECT_EQ(queue.try_push(std::make_unique<int>(2)).result,
+              inferedge::QueuePushResult::kAccepted);
+    EXPECT_EQ(queue.try_push(std::make_unique<int>(3)).result,
+              inferedge::QueuePushResult::kAccepted);
+
+    inferedge::QueueClose<std::unique_ptr<int>> closed = queue.close_cancel();
+    EXPECT_TRUE(closed.changed);
+    ASSERT_NE(closed.canceled, nullptr);
+    ASSERT_EQ(closed.canceled->size(), 3U);
+    ASSERT_NE((*closed.canceled)[0], nullptr);
+    ASSERT_NE((*closed.canceled)[1], nullptr);
+    ASSERT_NE((*closed.canceled)[2], nullptr);
+    EXPECT_EQ(*(*closed.canceled)[0], 1);
+    EXPECT_EQ(*(*closed.canceled)[1], 2);
+    EXPECT_EQ(*(*closed.canceled)[2], 3);
+
+    const inferedge::QueueTake<std::unique_ptr<int>> taken = queue.try_pop();
+    EXPECT_EQ(taken.result, inferedge::QueueTakeResult::kClosed);
+    EXPECT_FALSE(taken.value.has_value());
+    EXPECT_EQ(queue.size(), 0U);
+    EXPECT_EQ(closed.canceled->size(), 3U);
+}
+
+TEST(BoundedFifoQueueTest, WaitPopUntilReturnsQueuedItemBeforeDeadline) {
+    inferedge::BoundedFifoQueue<int> queue(1);
+    EXPECT_EQ(queue.try_push(7).result, inferedge::QueuePushResult::kAccepted);
+    const inferedge::QueueWait<int> waited = queue.wait_pop_until(future_deadline());
+    EXPECT_EQ(waited.result, inferedge::QueueWaitResult::kReady);
+    ASSERT_TRUE(waited.value.has_value());
+    EXPECT_EQ(*waited.value, 7);
+    EXPECT_EQ(queue.size(), 0U);
+    EXPECT_FALSE(queue.is_closed());
+}
+
+TEST(BoundedFifoQueueTest, WaitPopUntilPrefersQueuedItemOverExpiredDeadline) {
+    inferedge::BoundedFifoQueue<int> queue(1);
+    EXPECT_EQ(queue.try_push(7).result, inferedge::QueuePushResult::kAccepted);
+    const auto started = std::chrono::steady_clock::now();
+    const inferedge::QueueWait<int> waited = queue.wait_pop_until(expired_deadline());
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_LT(elapsed, std::chrono::seconds(1));
+    EXPECT_EQ(waited.result, inferedge::QueueWaitResult::kReady);
+    ASSERT_TRUE(waited.value.has_value());
+    EXPECT_EQ(*waited.value, 7);
+    EXPECT_EQ(queue.size(), 0U);
+}
+
+TEST(BoundedFifoQueueTest, WaitPopUntilTimesOutWhenOpenAndEmpty) {
+    inferedge::BoundedFifoQueue<int> queue(1);
+    const auto started = std::chrono::steady_clock::now();
+    const inferedge::QueueWait<int> waited = queue.wait_pop_until(expired_deadline());
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_LT(elapsed, std::chrono::seconds(1));
+    EXPECT_EQ(waited.result, inferedge::QueueWaitResult::kTimeout);
+    EXPECT_FALSE(waited.value.has_value());
+    EXPECT_FALSE(queue.is_closed());
+    EXPECT_EQ(queue.size(), 0U);
+    EXPECT_EQ(queue.capacity(), 1U);
+}
+
+TEST(BoundedFifoQueueTest, WaitPopUntilAfterDrainReturnsReadyThenClosed) {
+    inferedge::BoundedFifoQueue<int> queue(3);
+    EXPECT_EQ(queue.try_push(1).result, inferedge::QueuePushResult::kAccepted);
+    EXPECT_EQ(queue.try_push(2).result, inferedge::QueuePushResult::kAccepted);
+    EXPECT_EQ(queue.try_push(3).result, inferedge::QueuePushResult::kAccepted);
+    EXPECT_TRUE(queue.close_drain().changed);
+
+    const inferedge::QueueWait<int> first = queue.wait_pop_until(future_deadline());
+    EXPECT_EQ(first.result, inferedge::QueueWaitResult::kReady);
+    ASSERT_TRUE(first.value.has_value());
+    EXPECT_EQ(*first.value, 1);
+
+    const inferedge::QueueWait<int> second = queue.wait_pop_until(expired_deadline());
+    EXPECT_EQ(second.result, inferedge::QueueWaitResult::kReady);
+    ASSERT_TRUE(second.value.has_value());
+    EXPECT_EQ(*second.value, 2);
+
+    const inferedge::QueueWait<int> third = queue.wait_pop_until(future_deadline());
+    EXPECT_EQ(third.result, inferedge::QueueWaitResult::kReady);
+    ASSERT_TRUE(third.value.has_value());
+    EXPECT_EQ(*third.value, 3);
+
+    const inferedge::QueueWait<int> closed_future = queue.wait_pop_until(future_deadline());
+    EXPECT_EQ(closed_future.result, inferedge::QueueWaitResult::kClosed);
+    EXPECT_FALSE(closed_future.value.has_value());
+    const auto started = std::chrono::steady_clock::now();
+    const inferedge::QueueWait<int> closed_expired = queue.wait_pop_until(expired_deadline());
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(1));
+    EXPECT_EQ(closed_expired.result, inferedge::QueueWaitResult::kClosed);
+    EXPECT_FALSE(closed_expired.value.has_value());
+}
+
+TEST(BoundedFifoQueueTest, WaitPopUntilAfterCancelReturnsClosed) {
+    inferedge::BoundedFifoQueue<int> queue(3);
+    EXPECT_EQ(queue.try_push(1).result, inferedge::QueuePushResult::kAccepted);
+    EXPECT_EQ(queue.try_push(2).result, inferedge::QueuePushResult::kAccepted);
+    EXPECT_EQ(queue.try_push(3).result, inferedge::QueuePushResult::kAccepted);
+
+    inferedge::QueueClose<int> closed = queue.close_cancel();
+    ASSERT_NE(closed.canceled, nullptr);
+    ASSERT_EQ(closed.canceled->size(), 3U);
+
+    const inferedge::QueueWait<int> future = queue.wait_pop_until(future_deadline());
+    EXPECT_EQ(future.result, inferedge::QueueWaitResult::kClosed);
+    EXPECT_FALSE(future.value.has_value());
+    const inferedge::QueueWait<int> expired = queue.wait_pop_until(expired_deadline());
+    EXPECT_EQ(expired.result, inferedge::QueueWaitResult::kClosed);
+    EXPECT_FALSE(expired.value.has_value());
+    EXPECT_EQ((*closed.canceled)[0], 1);
+    EXPECT_EQ((*closed.canceled)[1], 2);
+    EXPECT_EQ((*closed.canceled)[2], 3);
+    EXPECT_EQ(queue.size(), 0U);
+}
+
+TEST(BoundedFifoQueueTest, WaitingTimedConsumerWakesOnPush) {
+    inferedge::BoundedFifoQueue<int> queue(1);
+    std::promise<void> started;
+    std::promise<inferedge::QueueWait<int>> finished;
+    JoinThread consumer([&] {
+        started.set_value();
+        finished.set_value(queue.wait_pop_until(future_deadline()));
+    });
+    started.get_future().wait();
+
+    EXPECT_EQ(queue.try_push(7).result, inferedge::QueuePushResult::kAccepted);
+    std::future<inferedge::QueueWait<int>> future = finished.get_future();
+    const inferedge::QueueWait<int> waited = finish_consumer(future, queue);
+    EXPECT_EQ(waited.result, inferedge::QueueWaitResult::kReady);
+    ASSERT_TRUE(waited.value.has_value());
+    EXPECT_EQ(*waited.value, 7);
+    EXPECT_EQ(queue.size(), 0U);
+}
+
+TEST(BoundedFifoQueueTest, WaitingTimedConsumerWakesOnDrain) {
+    inferedge::BoundedFifoQueue<int> queue(1);
+    std::promise<void> started;
+    std::promise<inferedge::QueueWait<int>> finished;
+    JoinThread consumer([&] {
+        started.set_value();
+        finished.set_value(queue.wait_pop_until(future_deadline()));
+    });
+    started.get_future().wait();
+
+    const inferedge::QueueClose<int> closed = queue.close_drain();
+    EXPECT_TRUE(closed.changed);
+    EXPECT_EQ(closed.canceled, nullptr);
+    std::future<inferedge::QueueWait<int>> future = finished.get_future();
+    const inferedge::QueueWait<int> waited = finish_consumer(future, queue);
+    EXPECT_EQ(waited.result, inferedge::QueueWaitResult::kClosed);
+    EXPECT_FALSE(waited.value.has_value());
+}
+
+TEST(BoundedFifoQueueTest, WaitingTimedConsumerWakesOnCancel) {
+    inferedge::BoundedFifoQueue<int> queue(1);
+    std::promise<void> started;
+    std::promise<inferedge::QueueWait<int>> finished;
+    JoinThread consumer([&] {
+        started.set_value();
+        finished.set_value(queue.wait_pop_until(future_deadline()));
+    });
+    started.get_future().wait();
+
+    inferedge::QueueClose<int> closed = queue.close_cancel();
+    EXPECT_TRUE(closed.changed);
+    ASSERT_NE(closed.canceled, nullptr);
+    EXPECT_TRUE(closed.canceled->empty());
+    std::future<inferedge::QueueWait<int>> future = finished.get_future();
+    const inferedge::QueueWait<int> waited = finish_consumer(future, queue);
+    EXPECT_EQ(waited.result, inferedge::QueueWaitResult::kClosed);
+    EXPECT_FALSE(waited.value.has_value());
+    EXPECT_TRUE(closed.canceled->empty());
+}
+
+TEST(BoundedFifoQueueTest, TimeoutVersusPushKeepsSingleOwnership) {
+    inferedge::BoundedFifoQueue<int> queue(1);
+    std::atomic<int> outcome{0};
+    {
+        JoinThread consumer([&] {
+            const inferedge::QueueWait<int> waited =
+                queue.wait_pop_until(std::chrono::steady_clock::now());
+            if (waited.result == inferedge::QueueWaitResult::kReady && waited.value.has_value() &&
+                *waited.value == 7) {
+                outcome.store(1, std::memory_order_relaxed);
+            } else if (waited.result == inferedge::QueueWaitResult::kTimeout &&
+                       !waited.value.has_value()) {
+                outcome.store(2, std::memory_order_relaxed);
+            } else {
+                outcome.store(3, std::memory_order_relaxed);
+            }
+        });
+        JoinThread producer(
+            [&] { EXPECT_EQ(queue.try_push(7).result, inferedge::QueuePushResult::kAccepted); });
+    }
+
+    const inferedge::QueueTake<int> leftover = queue.try_pop();
+    const int observed = outcome.load(std::memory_order_relaxed);
+    if (observed == 1) {
+        EXPECT_EQ(leftover.result, inferedge::QueueTakeResult::kEmpty);
+        EXPECT_FALSE(leftover.value.has_value());
+    } else if (observed == 2) {
+        EXPECT_EQ(leftover.result, inferedge::QueueTakeResult::kReady);
+        ASSERT_TRUE(leftover.value.has_value());
+        EXPECT_EQ(*leftover.value, 7);
+    } else {
+        ADD_FAILURE() << "timed pop returned an unexpected result";
+    }
+    EXPECT_EQ(queue.try_pop().result, inferedge::QueueTakeResult::kEmpty);
+    EXPECT_FALSE(queue.is_closed());
+    EXPECT_EQ(queue.size(), 0U);
+}
+
+TEST(BoundedFifoQueueTest, MixedConsumersTakeEachValueOnce) {
+    constexpr int kItems = 40;
+    inferedge::BoundedFifoQueue<int> queue(static_cast<std::size_t>(kItems));
+    for (int value = 0; value < kItems; ++value) {
+        EXPECT_EQ(queue.try_push(value).result, inferedge::QueuePushResult::kAccepted);
+    }
+
+    std::vector<int> taken;
+    taken.reserve(static_cast<std::size_t>(kItems));
+    for (int expected = 0; expected < 5; ++expected) {
+        const inferedge::QueueTake<int> item = queue.try_pop();
+        EXPECT_EQ(item.result, inferedge::QueueTakeResult::kReady);
+        ASSERT_TRUE(item.value.has_value());
+        EXPECT_EQ(*item.value, expected);
+        taken.push_back(*item.value);
+    }
+
+    std::mutex popped_mutex;
+    std::vector<int> popped;
+    std::vector<JoinThread> consumers;
+    consumers.reserve(4);
+    for (int consumer = 0; consumer < 2; ++consumer) {
+        consumers.emplace_back([&] {
+            for (;;) {
+                inferedge::QueuePop<int> item = queue.wait_pop();
+                if (item.result == inferedge::QueuePopResult::kClosed) {
+                    return;
+                }
+                if (!item.value.has_value()) {
+                    ADD_FAILURE() << "ready pop has no value";
+                    return;
+                }
+                std::lock_guard<std::mutex> lock(popped_mutex);
+                popped.push_back(*item.value);
+            }
+        });
+    }
+    for (int consumer = 0; consumer < 2; ++consumer) {
+        consumers.emplace_back([&] {
+            for (;;) {
+                const inferedge::QueueWait<int> item = queue.wait_pop_until(future_deadline());
+                if (item.result == inferedge::QueueWaitResult::kClosed) {
+                    return;
+                }
+                if (item.result == inferedge::QueueWaitResult::kTimeout) {
+                    continue;
+                }
+                if (!item.value.has_value()) {
+                    ADD_FAILURE() << "ready timed pop has no value";
+                    return;
+                }
+                std::lock_guard<std::mutex> lock(popped_mutex);
+                popped.push_back(*item.value);
+            }
+        });
+    }
+
+    EXPECT_TRUE(queue.close_drain().changed);
+    consumers.clear();
+    taken.insert(taken.end(), popped.begin(), popped.end());
+    std::sort(taken.begin(), taken.end());
+    EXPECT_EQ(taken.size(), static_cast<std::size_t>(kItems));
+    EXPECT_EQ(std::unique(taken.begin(), taken.end()), taken.end());
+    EXPECT_EQ(taken.front(), 0);
+    EXPECT_EQ(taken.back(), kItems - 1);
+}
+
+TEST(BoundedFifoQueueTest, TryPopLeavesFrontWhenMoveThrows) {
+    reset_throwing_move();
+    inferedge::BoundedFifoQueue<ThrowingMove> queue(2);
+    {
+        ThrowingMove first{1};
+        ThrowingMove second{2};
+        EXPECT_EQ(queue.try_push(std::move(first)).result, inferedge::QueuePushResult::kAccepted);
+        EXPECT_EQ(queue.try_push(std::move(second)).result, inferedge::QueuePushResult::kAccepted);
+    }
+
+    ThrowingMove::throw_after = ThrowingMove::moves;
+    EXPECT_THROW(static_cast<void>(queue.try_pop()), std::runtime_error);
+    EXPECT_EQ(queue.size(), 2U);
+    EXPECT_FALSE(queue.is_closed());
+
+    ThrowingMove::throw_after = -1;
+    const inferedge::QueueTake<ThrowingMove> first = queue.try_pop();
+    EXPECT_EQ(first.result, inferedge::QueueTakeResult::kReady);
+    ASSERT_TRUE(first.value.has_value());
+    EXPECT_EQ(first.value->id, 1);
+    const inferedge::QueueTake<ThrowingMove> second = queue.try_pop();
+    EXPECT_EQ(second.result, inferedge::QueueTakeResult::kReady);
+    ASSERT_TRUE(second.value.has_value());
+    EXPECT_EQ(second.value->id, 2);
+    EXPECT_EQ(queue.try_pop().result, inferedge::QueueTakeResult::kEmpty);
+    EXPECT_EQ(queue.size(), 0U);
+}
+
+TEST(BoundedFifoQueueTest, WaitPopUntilLeavesFrontWhenMoveThrows) {
+    reset_throwing_move();
+    inferedge::BoundedFifoQueue<ThrowingMove> queue(2);
+    {
+        ThrowingMove first{4};
+        ThrowingMove second{5};
+        EXPECT_EQ(queue.try_push(std::move(first)).result, inferedge::QueuePushResult::kAccepted);
+        EXPECT_EQ(queue.try_push(std::move(second)).result, inferedge::QueuePushResult::kAccepted);
+    }
+
+    ThrowingMove::throw_after = ThrowingMove::moves;
+    EXPECT_THROW(static_cast<void>(queue.wait_pop_until(expired_deadline())), std::runtime_error);
+    EXPECT_EQ(queue.size(), 2U);
+    EXPECT_FALSE(queue.is_closed());
+
+    ThrowingMove::throw_after = -1;
+    const inferedge::QueueWait<ThrowingMove> first = queue.wait_pop_until(expired_deadline());
+    EXPECT_EQ(first.result, inferedge::QueueWaitResult::kReady);
+    ASSERT_TRUE(first.value.has_value());
+    EXPECT_EQ(first.value->id, 4);
+    const inferedge::QueueWait<ThrowingMove> second = queue.wait_pop_until(future_deadline());
+    EXPECT_EQ(second.result, inferedge::QueueWaitResult::kReady);
+    ASSERT_TRUE(second.value.has_value());
+    EXPECT_EQ(second.value->id, 5);
+    EXPECT_EQ(queue.size(), 0U);
+}
+
+TEST(BoundedFifoQueueTest, NewPopsObserveDrainThatWonOverCancel) {
+    inferedge::BoundedFifoQueue<int> queue(2);
+    EXPECT_EQ(queue.try_push(1).result, inferedge::QueuePushResult::kAccepted);
+    EXPECT_EQ(queue.try_push(2).result, inferedge::QueuePushResult::kAccepted);
+    EXPECT_EQ(queue.close_drain().mode, inferedge::QueueCloseMode::kDrain);
+
+    const inferedge::QueueClose<int> later = queue.close_cancel();
+    EXPECT_FALSE(later.changed);
+    EXPECT_EQ(later.mode, inferedge::QueueCloseMode::kDrain);
+    EXPECT_EQ(later.canceled, nullptr);
+    EXPECT_EQ(queue.close_mode(), inferedge::QueueCloseMode::kDrain);
+
+    const inferedge::QueueTake<int> first = queue.try_pop();
+    EXPECT_EQ(first.result, inferedge::QueueTakeResult::kReady);
+    ASSERT_TRUE(first.value.has_value());
+    EXPECT_EQ(*first.value, 1);
+    const inferedge::QueueWait<int> second = queue.wait_pop_until(expired_deadline());
+    EXPECT_EQ(second.result, inferedge::QueueWaitResult::kReady);
+    ASSERT_TRUE(second.value.has_value());
+    EXPECT_EQ(*second.value, 2);
+    EXPECT_EQ(queue.try_pop().result, inferedge::QueueTakeResult::kClosed);
+    const inferedge::QueueWait<int> closed = queue.wait_pop_until(future_deadline());
+    EXPECT_EQ(closed.result, inferedge::QueueWaitResult::kClosed);
+    EXPECT_FALSE(closed.value.has_value());
+}
+
+TEST(BoundedFifoQueueTest, NewPopsObserveCancelThatWonOverDrain) {
+    inferedge::BoundedFifoQueue<int> queue(2);
+    EXPECT_EQ(queue.try_push(1).result, inferedge::QueuePushResult::kAccepted);
+    EXPECT_EQ(queue.try_push(2).result, inferedge::QueuePushResult::kAccepted);
+    inferedge::QueueClose<int> canceled = queue.close_cancel();
+    const inferedge::QueueClose<int> later = queue.close_drain();
+    EXPECT_FALSE(later.changed);
+    EXPECT_EQ(later.mode, inferedge::QueueCloseMode::kCancel);
+    EXPECT_EQ(later.canceled, nullptr);
+    EXPECT_EQ(queue.close_mode(), inferedge::QueueCloseMode::kCancel);
+    ASSERT_NE(canceled.canceled, nullptr);
+    ASSERT_EQ(canceled.canceled->size(), 2U);
+
+    const inferedge::QueueTake<int> taken = queue.try_pop();
+    EXPECT_EQ(taken.result, inferedge::QueueTakeResult::kClosed);
+    EXPECT_FALSE(taken.value.has_value());
+    const inferedge::QueueWait<int> waited = queue.wait_pop_until(future_deadline());
+    EXPECT_EQ(waited.result, inferedge::QueueWaitResult::kClosed);
+    EXPECT_FALSE(waited.value.has_value());
+    const inferedge::QueueWait<int> expired = queue.wait_pop_until(expired_deadline());
+    EXPECT_EQ(expired.result, inferedge::QueueWaitResult::kClosed);
+    EXPECT_FALSE(expired.value.has_value());
+    EXPECT_EQ((*canceled.canceled)[0], 1);
+    EXPECT_EQ((*canceled.canceled)[1], 2);
+}
+
+TEST(BoundedFifoQueueTest, NewPopsTransferMoveOnlyCompletion) {
+    inferedge::BoundedFifoQueue<CompletionItem> queue(2);
+    CompletionItem first{11};
+    CompletionItem second{22};
+    std::future<int> first_future = first.completion.get_future();
+    std::future<int> second_future = second.completion.get_future();
+    EXPECT_EQ(queue.try_push(std::move(first)).result, inferedge::QueuePushResult::kAccepted);
+    EXPECT_EQ(queue.try_push(std::move(second)).result, inferedge::QueuePushResult::kAccepted);
+
+    inferedge::QueueTake<CompletionItem> taken = queue.try_pop();
+    EXPECT_EQ(taken.result, inferedge::QueueTakeResult::kReady);
+    ASSERT_TRUE(taken.value.has_value());
+    EXPECT_EQ(taken.value->id, 11);
+    taken.value->completion.set_value(11);
+
+    inferedge::QueueWait<CompletionItem> waited = queue.wait_pop_until(expired_deadline());
+    EXPECT_EQ(waited.result, inferedge::QueueWaitResult::kReady);
+    ASSERT_TRUE(waited.value.has_value());
+    EXPECT_EQ(waited.value->id, 22);
+    waited.value->completion.set_value(22);
+
+    EXPECT_EQ(first_future.get(), 11);
+    EXPECT_EQ(second_future.get(), 22);
+    EXPECT_THROW(taken.value->completion.set_value(11), std::future_error);
+    EXPECT_THROW(waited.value->completion.set_value(22), std::future_error);
+    EXPECT_EQ(queue.size(), 0U);
+    EXPECT_EQ(queue.try_pop().result, inferedge::QueueTakeResult::kEmpty);
 }
