@@ -439,4 +439,30 @@ if(INFEREDGE_ENABLE_LONG_STRESS)
             ENVIRONMENT "ORT_DISABLE_TELEMETRY=1"
             TIMEOUT 300
     )
+
+    add_executable(inferedge_scheduler_stress tests/inference_scheduler_stress_test.cpp)
+    target_link_libraries(
+        inferedge_scheduler_stress
+        PRIVATE
+            inferedge_warnings
+            inferedge_scheduler
+            GTest::gtest_main
+    )
+    target_compile_definitions(
+        inferedge_scheduler_stress
+        PRIVATE
+            "INFEREDGE_ADD_MODEL_PATH=\"${INFEREDGE_ADD_MODEL}\""
+    )
+    set_target_properties(
+        inferedge_scheduler_stress
+        PROPERTIES
+            BUILD_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
+            INSTALL_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
+    )
+    gtest_discover_tests(
+        inferedge_scheduler_stress
+        PROPERTIES
+            ENVIRONMENT "ORT_DISABLE_TELEMETRY=1"
+            TIMEOUT 300
+    )
 endif()

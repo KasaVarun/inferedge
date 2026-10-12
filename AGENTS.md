@@ -18,7 +18,7 @@ Build the `inferedge` executable, `inferedge-bench`, `inferedge-bench-concurrent
 
 ## Build and test
 
-Configure with Ninja. Keep project warnings as errors. Run `ctest` before considering a change done. Format C++ with the repository `.clang-format` using clang-format 23.1.3.
+Configure with Ninja. Keep project warnings as errors. Run `ctest` before considering a change done. Format C++ with the repository `.clang-format` using clang-format 23.1.3. `INFEREDGE_ENABLE_LONG_STRESS` defaults to OFF. When it is ON, `inferedge_concurrent_stress` and `inferedge_scheduler_stress` register with a 300-second timeout. Default Linux CI leaves the option OFF. Those tests check completion and accounting. They do not publish speed figures.
 
 ## Code shape
 
