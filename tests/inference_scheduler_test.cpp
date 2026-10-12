@@ -3,6 +3,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -10,6 +11,7 @@
 #include <gtest/gtest.h>
 #include <latch>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -116,16 +118,49 @@ void ExpectSum(const SchedulerCompletion& completion, float c0, float c1) {
 
 void ExpectQuiescent(const InferenceScheduler& scheduler, std::uint64_t succeeded,
                      std::uint64_t failed_inference, std::uint64_t failed_worker,
-                     std::uint64_t failed_scheduler) {
+                     std::uint64_t failed_scheduler, std::uint64_t canceled = 0) {
     const SchedulerStats stats = scheduler.stats();
     EXPECT_EQ(stats.succeeded, succeeded);
     EXPECT_EQ(stats.failed_inference, failed_inference);
     EXPECT_EQ(stats.failed_worker, failed_worker);
     EXPECT_EQ(stats.failed_scheduler, failed_scheduler);
-    EXPECT_EQ(stats.accepted, succeeded + failed_inference + failed_worker + failed_scheduler);
+    EXPECT_EQ(stats.canceled, canceled);
+    EXPECT_EQ(stats.accepted,
+              succeeded + failed_inference + failed_worker + failed_scheduler + canceled);
     EXPECT_EQ(stats.queue_depth, 0U);
     EXPECT_EQ(stats.executing, 0U);
     EXPECT_EQ(stats.live_workers, 0U);
+}
+
+void ExpectWinner(const ShutdownResult& result, ShutdownPolicy policy, bool changed) {
+    EXPECT_EQ(result.error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(result.established, true);
+    EXPECT_EQ(result.changed, changed);
+    EXPECT_EQ(result.policy, policy);
+}
+
+void ExpectCanceled(const SchedulerCompletion& completion, std::uint64_t sequence) {
+    EXPECT_EQ(completion.status, CompletionStatus::kCanceled);
+    EXPECT_EQ(completion.sequence, sequence);
+    EXPECT_EQ(completion.request_id, sequence);
+    EXPECT_TRUE(completion.outputs.empty());
+    EXPECT_EQ(completion.inference_error.kind, InferenceErrorKind::kNone);
+    EXPECT_TRUE(completion.inference_error.message.empty());
+}
+
+// Close must commit while the worker is still held, then the hold is released
+// so shutdown can join.
+ShutdownResult CancelWhileBlocked(InferenceScheduler& scheduler, LatchRelease& release) {
+    auto closed = std::make_shared<std::latch>(1);
+    SchedulerTestAccess::SetAfterDrainClosed(scheduler, closed);
+    JoinThread stopper;
+    ShutdownResult shutdown;
+    stopper.thread =
+        std::thread([&] { shutdown = scheduler.shutdown(ShutdownPolicy::kCancelPending); });
+    closed->wait();
+    release.release();
+    stopper.thread.join();
+    return shutdown;
 }
 
 std::vector<float> ReadFloats(const std::filesystem::path& path, std::size_t count) {
@@ -675,7 +710,582 @@ TEST_F(InferenceSchedulerTest, LastWorkerCloseCancelAllocationUsesDrain) {
 
     const ShutdownResult shutdown = scheduler->shutdown(ShutdownPolicy::kDrain);
     EXPECT_EQ(shutdown.error.kind, SchedulerErrorKind::kNone);
+    EXPECT_FALSE(shutdown.established);
     ExpectQuiescent(*scheduler, 0, 0, 1, 1);
+}
+
+TEST_F(InferenceSchedulerTest, CancelEmptyQueue) {
+    const auto scheduler = MakeAdd(1, 1);
+    RequireStart(*scheduler);
+    const ShutdownResult shutdown = scheduler->shutdown(ShutdownPolicy::kCancelPending);
+    ExpectWinner(shutdown, ShutdownPolicy::kCancelPending, true);
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+    EXPECT_TRUE(SchedulerTestAccess::ClosedForCancel(*scheduler));
+    ExpectQuiescent(*scheduler, 0, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, CancelSeveralWaitingRequests) {
+    auto scheduler = MakeAdd(1, 4);
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    RequireStart(*scheduler);
+
+    Admission first = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission second = scheduler->submit(AddInputs(0.F, 1.F, 1.F, 1.F));
+    Admission third = scheduler->submit(AddInputs(2.F, 0.F, 2.F, 0.F));
+    EXPECT_EQ(scheduler->stats().queue_depth, 3U);
+
+    const ShutdownResult shutdown = CancelWhileBlocked(*scheduler, release);
+    ExpectWinner(shutdown, ShutdownPolicy::kCancelPending, true);
+    ExpectCanceled(Take(std::move(first)), 1);
+    ExpectCanceled(Take(std::move(second)), 2);
+    ExpectCanceled(Take(std::move(third)), 3);
+    ExpectQuiescent(*scheduler, 0, 0, 0, 0, 3);
+}
+
+TEST_F(InferenceSchedulerTest, PoppedRequestSurvivesCancel) {
+    auto scheduler = MakeAdd(1, 2);
+    auto reached = std::make_shared<std::latch>(1);
+    auto release_run = std::make_shared<std::latch>(1);
+    auto closed = std::make_shared<std::latch>(1);
+    JoinThread stopper;
+    LatchRelease release{release_run};
+    SchedulerTestAccess::SetReachedRun(*scheduler, reached);
+    SchedulerTestAccess::SetBeforeRun(*scheduler, release_run);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    RequireStart(*scheduler);
+
+    Admission popped = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    reached->wait();
+    Admission waiting = scheduler->submit(AddInputs(1.F, 0.F, 1.F, 0.F));
+
+    ShutdownResult shutdown;
+    stopper.thread =
+        std::thread([&] { shutdown = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    closed->wait();
+    release.release();
+    stopper.thread.join();
+
+    ExpectWinner(shutdown, ShutdownPolicy::kCancelPending, true);
+    ExpectSum(Take(std::move(popped)), 4.F, 6.F);
+    ExpectCanceled(Take(std::move(waiting)), 2);
+    ExpectQuiescent(*scheduler, 1, 0, 0, 0, 1);
+}
+
+TEST_F(InferenceSchedulerTest, InFlightInferenceSurvivesCancel) {
+    auto scheduler = MakeAdd(1, 1);
+    auto reached = std::make_shared<std::latch>(1);
+    auto release_run = std::make_shared<std::latch>(1);
+    auto closed = std::make_shared<std::latch>(1);
+    JoinThread stopper;
+    LatchRelease release{release_run};
+    SchedulerTestAccess::SetReachedRun(*scheduler, reached);
+    SchedulerTestAccess::SetBeforeRun(*scheduler, release_run);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    RequireStart(*scheduler);
+
+    Admission admission = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    reached->wait();
+    ShutdownResult shutdown;
+    stopper.thread =
+        std::thread([&] { shutdown = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    closed->wait();
+    release.release();
+    stopper.thread.join();
+
+    ExpectWinner(shutdown, ShutdownPolicy::kCancelPending, true);
+    ExpectSum(Take(std::move(admission)), 4.F, 6.F);
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+    ExpectQuiescent(*scheduler, 1, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, FutureReturnsCanceled) {
+    auto scheduler = MakeAdd(1, 1);
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    RequireStart(*scheduler);
+    Admission admission = scheduler->submit(AddInputs(1.F, 1.F, 1.F, 1.F));
+    const ShutdownResult shutdown = CancelWhileBlocked(*scheduler, release);
+    ExpectWinner(shutdown, ShutdownPolicy::kCancelPending, true);
+    const SchedulerCompletion completion = Take(std::move(admission));
+    EXPECT_EQ(completion.status, CompletionStatus::kCanceled);
+}
+
+TEST_F(InferenceSchedulerTest, CanceledResultHasNoOutputs) {
+    auto scheduler = MakeAdd(1, 1);
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    RequireStart(*scheduler);
+    Admission admission = scheduler->submit(AddInputs(1.F, 1.F, 1.F, 1.F));
+    EXPECT_EQ(CancelWhileBlocked(*scheduler, release).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_TRUE(Take(std::move(admission)).outputs.empty());
+}
+
+TEST_F(InferenceSchedulerTest, CanceledInferenceErrorIsNone) {
+    auto scheduler = MakeAdd(1, 1);
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    RequireStart(*scheduler);
+    Admission admission = scheduler->submit(AddInputs(1.F, 1.F, 1.F, 1.F));
+    EXPECT_EQ(CancelWhileBlocked(*scheduler, release).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(Take(std::move(admission)).inference_error.kind, InferenceErrorKind::kNone);
+}
+
+TEST_F(InferenceSchedulerTest, SubmissionAfterCancelIsRejected) {
+    const auto scheduler = MakeAdd(1, 1);
+    RequireStart(*scheduler);
+    ExpectWinner(scheduler->shutdown(ShutdownPolicy::kCancelPending),
+                 ShutdownPolicy::kCancelPending, true);
+    const Admission rejected = scheduler->submit(AddInputs(1.F, 1.F, 1.F, 1.F));
+    EXPECT_EQ(rejected.status, AdmissionStatus::kRejectedClosed);
+    EXPECT_FALSE(rejected.completion.has_value());
+    EXPECT_EQ(scheduler->stats().rejected_closed, 1U);
+}
+
+TEST_F(InferenceSchedulerTest, RejectedSubmissionAfterCancelReturnsInputs) {
+    const auto scheduler = MakeAdd(1, 1);
+    RequireStart(*scheduler);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kCancelPending).error.kind,
+              SchedulerErrorKind::kNone);
+    const Admission rejected = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    EXPECT_EQ(rejected.status, AdmissionStatus::kRejectedClosed);
+    EXPECT_FALSE(rejected.completion.has_value());
+    ASSERT_TRUE(rejected.inputs.has_value());
+    ASSERT_EQ(rejected.inputs->size(), 2U);
+    EXPECT_EQ(rejected.inputs->front().name, "A");
+    EXPECT_FLOAT_EQ(rejected.inputs->front().values[0], 1.F);
+}
+
+TEST_F(InferenceSchedulerTest, DrainThenCancelDrainWins) {
+    auto scheduler = MakeAdd(1, 2);
+    auto blocked = std::make_shared<std::latch>(1);
+    auto closed = std::make_shared<std::latch>(1);
+    auto follower = std::make_shared<std::latch>(1);
+    JoinThread drain_call;
+    JoinThread cancel_call;
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    SchedulerTestAccess::SetShutdownFollowerEntered(*scheduler, follower);
+    RequireStart(*scheduler);
+    Admission first = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission second = scheduler->submit(AddInputs(1.F, 0.F, 1.F, 0.F));
+
+    ShutdownResult drain;
+    ShutdownResult cancel;
+    drain_call.thread = std::thread([&] { drain = scheduler->shutdown(ShutdownPolicy::kDrain); });
+    closed->wait();
+    cancel_call.thread =
+        std::thread([&] { cancel = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    follower->wait();
+    release.release();
+    drain_call.thread.join();
+    cancel_call.thread.join();
+
+    ExpectWinner(drain, ShutdownPolicy::kDrain, true);
+    ExpectWinner(cancel, ShutdownPolicy::kDrain, false);
+    EXPECT_TRUE(SchedulerTestAccess::ClosedForDrain(*scheduler));
+    ExpectSum(Take(std::move(first)), 4.F, 6.F);
+    ExpectSum(Take(std::move(second)), 2.F, 0.F);
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+}
+
+TEST_F(InferenceSchedulerTest, CancelThenDrainCancelWins) {
+    auto scheduler = MakeAdd(1, 2);
+    auto blocked = std::make_shared<std::latch>(1);
+    auto closed = std::make_shared<std::latch>(1);
+    auto follower = std::make_shared<std::latch>(1);
+    JoinThread cancel_call;
+    JoinThread drain_call;
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    SchedulerTestAccess::SetShutdownFollowerEntered(*scheduler, follower);
+    RequireStart(*scheduler);
+    Admission first = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission second = scheduler->submit(AddInputs(4.F, 0.F, 1.F, 0.F));
+
+    ShutdownResult cancel;
+    ShutdownResult drain;
+    cancel_call.thread =
+        std::thread([&] { cancel = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    closed->wait();
+    drain_call.thread = std::thread([&] { drain = scheduler->shutdown(ShutdownPolicy::kDrain); });
+    follower->wait();
+    release.release();
+    cancel_call.thread.join();
+    drain_call.thread.join();
+
+    ExpectWinner(cancel, ShutdownPolicy::kCancelPending, true);
+    ExpectWinner(drain, ShutdownPolicy::kCancelPending, false);
+    EXPECT_TRUE(SchedulerTestAccess::ClosedForCancel(*scheduler));
+    ExpectCanceled(Take(std::move(first)), 1);
+    ExpectCanceled(Take(std::move(second)), 2);
+}
+
+TEST_F(InferenceSchedulerTest, ConcurrentMixedPolicyShutdownAgrees) {
+    auto scheduler = MakeAdd(2, 1);
+    JoinThread drain_call;
+    JoinThread cancel_call;
+    RequireStart(*scheduler);
+    ShutdownResult drain;
+    ShutdownResult cancel;
+    drain_call.thread = std::thread([&] { drain = scheduler->shutdown(ShutdownPolicy::kDrain); });
+    cancel_call.thread =
+        std::thread([&] { cancel = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    drain_call.thread.join();
+    cancel_call.thread.join();
+
+    EXPECT_EQ(drain.error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(cancel.error.kind, SchedulerErrorKind::kNone);
+    EXPECT_TRUE(drain.established);
+    EXPECT_TRUE(cancel.established);
+    EXPECT_EQ(drain.policy, cancel.policy);
+    EXPECT_NE(drain.changed, cancel.changed);
+    if (drain.policy == ShutdownPolicy::kDrain) {
+        EXPECT_TRUE(SchedulerTestAccess::ClosedForDrain(*scheduler));
+    } else {
+        EXPECT_TRUE(SchedulerTestAccess::ClosedForCancel(*scheduler));
+    }
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+}
+
+TEST_F(InferenceSchedulerTest, RepeatedCancelShutdownIsIdempotent) {
+    const auto scheduler = MakeAdd(1, 1);
+    RequireStart(*scheduler);
+    const ShutdownResult first = scheduler->shutdown(ShutdownPolicy::kCancelPending);
+    const ShutdownResult second = scheduler->shutdown(ShutdownPolicy::kCancelPending);
+    ExpectWinner(first, ShutdownPolicy::kCancelPending, true);
+    ExpectWinner(second, ShutdownPolicy::kCancelPending, false);
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+}
+
+TEST_F(InferenceSchedulerTest, ShutdownFollowersObserveWinner) {
+    auto scheduler = MakeAdd(1, 1);
+    auto blocked = std::make_shared<std::latch>(1);
+    auto closed = std::make_shared<std::latch>(1);
+    auto followers = std::make_shared<std::latch>(3);
+    JoinThread leader;
+    JoinThread follower_a;
+    JoinThread follower_b;
+    JoinThread follower_c;
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    SchedulerTestAccess::SetShutdownFollowerEntered(*scheduler, followers);
+    RequireStart(*scheduler);
+
+    ShutdownResult lead;
+    ShutdownResult first;
+    ShutdownResult second;
+    ShutdownResult third;
+    leader.thread =
+        std::thread([&] { lead = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    closed->wait();
+    follower_a.thread = std::thread([&] { first = scheduler->shutdown(ShutdownPolicy::kDrain); });
+    follower_b.thread =
+        std::thread([&] { second = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    follower_c.thread = std::thread([&] { third = scheduler->shutdown(ShutdownPolicy::kDrain); });
+    followers->wait();
+    release.release();
+    leader.thread.join();
+    follower_a.thread.join();
+    follower_b.thread.join();
+    follower_c.thread.join();
+
+    ExpectWinner(lead, ShutdownPolicy::kCancelPending, true);
+    ExpectWinner(first, ShutdownPolicy::kCancelPending, false);
+    ExpectWinner(second, ShutdownPolicy::kCancelPending, false);
+    ExpectWinner(third, ShutdownPolicy::kCancelPending, false);
+}
+
+TEST_F(InferenceSchedulerTest, WorkerExceptionDuringCancel) {
+    auto scheduler = MakeAdd(1, 2);
+    auto reached = std::make_shared<std::latch>(1);
+    auto release_run = std::make_shared<std::latch>(1);
+    auto closed = std::make_shared<std::latch>(1);
+    JoinThread stopper;
+    LatchRelease release{release_run};
+    SchedulerTestAccess::SetThrowInWorker(*scheduler, 0);
+    SchedulerTestAccess::SetReachedRun(*scheduler, reached);
+    SchedulerTestAccess::SetBeforeRun(*scheduler, release_run);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    RequireStart(*scheduler);
+
+    Admission popped = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    reached->wait();
+    Admission waiting = scheduler->submit(AddInputs(1.F, 0.F, 1.F, 0.F));
+    ShutdownResult shutdown;
+    stopper.thread =
+        std::thread([&] { shutdown = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    closed->wait();
+    release.release();
+    stopper.thread.join();
+
+    ExpectWinner(shutdown, ShutdownPolicy::kCancelPending, true);
+    const SchedulerCompletion failed = Take(std::move(popped));
+    EXPECT_EQ(failed.status, CompletionStatus::kWorkerFailed);
+    EXPECT_EQ(failed.inference_error.message, "injected");
+    ExpectCanceled(Take(std::move(waiting)), 2);
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+    EXPECT_FALSE(SchedulerTestAccess::IsFailed(*scheduler));
+    ExpectQuiescent(*scheduler, 0, 0, 1, 0, 1);
+}
+
+TEST_F(InferenceSchedulerTest, LastWorkerRetiresAfterCancelCommits) {
+    auto scheduler = MakeAdd(1, 2);
+    auto blocked = std::make_shared<std::latch>(1);
+    auto closed = std::make_shared<std::latch>(1);
+    JoinThread stopper;
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    RequireStart(*scheduler);
+    Admission first = scheduler->submit(AddInputs(1.F, 0.F, 1.F, 0.F));
+    Admission second = scheduler->submit(AddInputs(2.F, 0.F, 2.F, 0.F));
+
+    ShutdownResult shutdown;
+    stopper.thread =
+        std::thread([&] { shutdown = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    closed->wait();
+    EXPECT_TRUE(SchedulerTestAccess::ClosedForCancel(*scheduler));
+    release.release();
+    stopper.thread.join();
+
+    ExpectWinner(shutdown, ShutdownPolicy::kCancelPending, true);
+    ExpectCanceled(Take(std::move(first)), 1);
+    ExpectCanceled(Take(std::move(second)), 2);
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+    EXPECT_FALSE(SchedulerTestAccess::IsFailed(*scheduler));
+    ExpectQuiescent(*scheduler, 0, 0, 0, 0, 2);
+}
+
+TEST_F(InferenceSchedulerTest, CompletedResultUnchangedByCancel) {
+    const auto scheduler = MakeAdd(1, 1);
+    RequireStart(*scheduler);
+    const SchedulerCompletion completed = Take(scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F)));
+    ExpectSum(completed, 4.F, 6.F);
+    ExpectWinner(scheduler->shutdown(ShutdownPolicy::kCancelPending),
+                 ShutdownPolicy::kCancelPending, true);
+    ExpectSum(completed, 4.F, 6.F);
+    ExpectQuiescent(*scheduler, 1, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, DestructorAfterCancelPreservesCompletion) {
+    std::optional<std::future<SchedulerCompletion>> kept;
+    {
+        auto scheduler = MakeAdd(1, 1);
+        auto blocked = std::make_shared<std::latch>(1);
+        LatchRelease release{blocked};
+        SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+        RequireStart(*scheduler);
+        Admission admission = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+        kept = std::move(admission.completion);
+        ExpectWinner(CancelWhileBlocked(*scheduler, release), ShutdownPolicy::kCancelPending, true);
+    }
+    ASSERT_TRUE(kept.has_value());
+    ExpectCanceled(kept->get(), 1);
+}
+
+TEST_F(InferenceSchedulerTest, FailedStartupShutdownEstablishesNoPolicy) {
+    const auto scheduler = MakeScheduler(SchedulerConfig{INFEREDGE_INVALID_MODEL_PATH, 1, 1});
+    EXPECT_EQ(scheduler->start().kind, SchedulerErrorKind::kModelLoad);
+    EXPECT_TRUE(SchedulerTestAccess::IsFailed(*scheduler));
+    const ShutdownResult cancel = scheduler->shutdown(ShutdownPolicy::kCancelPending);
+    EXPECT_EQ(cancel.error.kind, SchedulerErrorKind::kNone);
+    EXPECT_FALSE(cancel.established);
+    EXPECT_FALSE(cancel.changed);
+    const ShutdownResult drain = scheduler->shutdown(ShutdownPolicy::kDrain);
+    EXPECT_EQ(drain.error.kind, SchedulerErrorKind::kNone);
+    EXPECT_FALSE(drain.established);
+    EXPECT_FALSE(drain.changed);
+    EXPECT_EQ(scheduler->start().kind, SchedulerErrorKind::kInvalidState);
+    EXPECT_TRUE(SchedulerTestAccess::IsFailed(*scheduler));
+}
+
+TEST_F(InferenceSchedulerTest, QuiescentAccountingIncludesCanceled) {
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    int permits = 0;
+    bool release_all = false;
+    bool waiting = false;
+    auto scheduler = MakeAdd(1, 4);
+    struct ReleaseGate {
+        std::mutex& mu;
+        std::condition_variable& cv;
+        bool& release_all;
+        ~ReleaseGate() {
+            std::lock_guard<std::mutex> lock(mu);
+            release_all = true;
+            cv.notify_all();
+        }
+    } release_gate{gate_mu, gate_cv, release_all};
+    SchedulerTestAccess::SetBeforeLoop(*scheduler, [&] {
+        std::unique_lock<std::mutex> lock(gate_mu);
+        waiting = true;
+        gate_cv.notify_all();
+        gate_cv.wait(lock, [&] { return permits > 0 || release_all; });
+        waiting = false;
+        if (permits > 0) {
+            --permits;
+        }
+        gate_cv.notify_all();
+    });
+    RequireStart(*scheduler);
+    {
+        std::unique_lock<std::mutex> lock(gate_mu);
+        gate_cv.wait(lock, [&] { return waiting; });
+    }
+    Admission failed = scheduler->submit({NamedTensor{"A", {2}, {1.F, 2.F}}});
+    Admission success = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission canceled = scheduler->submit(AddInputs(1.F, 0.F, 1.F, 0.F));
+    EXPECT_EQ(scheduler->stats().queue_depth, 3U);
+
+    auto allow_one = [&] {
+        std::unique_lock<std::mutex> lock(gate_mu);
+        permits = 1;
+        waiting = false;
+        gate_cv.notify_all();
+        gate_cv.wait(lock, [&] { return waiting && permits == 0; });
+    };
+    allow_one();
+    EXPECT_EQ(Take(std::move(failed)).status, CompletionStatus::kInferenceFailed);
+    allow_one();
+    ExpectSum(Take(std::move(success)), 4.F, 6.F);
+
+    auto closed = std::make_shared<std::latch>(1);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    JoinThread stopper;
+    ShutdownResult shutdown;
+    stopper.thread =
+        std::thread([&] { shutdown = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    closed->wait();
+    {
+        std::lock_guard<std::mutex> lock(gate_mu);
+        release_all = true;
+    }
+    gate_cv.notify_all();
+    stopper.thread.join();
+    ExpectWinner(shutdown, ShutdownPolicy::kCancelPending, true);
+    ExpectCanceled(Take(std::move(canceled)), 3);
+    ExpectQuiescent(*scheduler, 1, 1, 0, 0, 1);
+}
+
+TEST_F(InferenceSchedulerTest, CanceledRequestCompletesOnce) {
+    auto scheduler = MakeAdd(1, 1);
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    RequireStart(*scheduler);
+    Admission admission = scheduler->submit(AddInputs(2.F, 0.F, 2.F, 0.F));
+    EXPECT_EQ(CancelWhileBlocked(*scheduler, release).error.kind, SchedulerErrorKind::kNone);
+    ExpectCanceled(Take(std::move(admission)), 1);
+    ExpectQuiescent(*scheduler, 0, 0, 0, 0, 1);
+    scheduler.reset();
+}
+
+TEST_F(InferenceSchedulerTest, OrdinaryCancelDoesNotBreakPromise) {
+    auto scheduler = MakeAdd(1, 1);
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    RequireStart(*scheduler);
+    Admission admission = scheduler->submit(AddInputs(1.F, 1.F, 1.F, 1.F));
+    EXPECT_EQ(CancelWhileBlocked(*scheduler, release).error.kind, SchedulerErrorKind::kNone);
+    ASSERT_TRUE(admission.completion.has_value());
+    SchedulerCompletion completion;
+    EXPECT_NO_THROW(completion = admission.completion->get());
+    ExpectCanceled(completion, 1);
+}
+
+TEST_F(InferenceSchedulerTest, CanceledRequestsPreserveAdmissionSequence) {
+    auto scheduler = MakeAdd(1, 3);
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    RequireStart(*scheduler);
+    Admission first = scheduler->submit(AddInputs(1.F, 0.F, 0.F, 1.F));
+    Admission second = scheduler->submit(AddInputs(1.F, 1.F, 1.F, 1.F));
+    Admission third = scheduler->submit(AddInputs(2.F, 2.F, 2.F, 2.F));
+    EXPECT_EQ(CancelWhileBlocked(*scheduler, release).error.kind, SchedulerErrorKind::kNone);
+    const SchedulerCompletion left = Take(std::move(first));
+    const SchedulerCompletion middle = Take(std::move(second));
+    const SchedulerCompletion right = Take(std::move(third));
+    ExpectCanceled(left, 1);
+    ExpectCanceled(middle, 2);
+    ExpectCanceled(right, 3);
+    EXPECT_LT(left.sequence, middle.sequence);
+    EXPECT_LT(middle.sequence, right.sequence);
+}
+
+TEST_F(InferenceSchedulerTest, CloseCancelFailureBeforeCommitStaysRunning) {
+    auto scheduler = MakeAdd(1, 1);
+    auto blocked = std::make_shared<std::latch>(1);
+    auto closed = std::make_shared<std::latch>(1);
+    JoinThread stopper;
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    SchedulerTestAccess::SetFailNextCloseCancel(*scheduler);
+    RequireStart(*scheduler);
+    Admission admission = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    EXPECT_EQ(scheduler->stats().queue_depth, 1U);
+
+    const ShutdownResult failed = scheduler->shutdown(ShutdownPolicy::kCancelPending);
+    EXPECT_EQ(failed.error.kind, SchedulerErrorKind::kWorkerStart);
+    EXPECT_EQ(failed.error.message, "shutdown close failed");
+    EXPECT_FALSE(failed.established);
+    EXPECT_FALSE(failed.changed);
+    EXPECT_FALSE(SchedulerTestAccess::IsStopped(*scheduler));
+    EXPECT_FALSE(SchedulerTestAccess::IsFailed(*scheduler));
+    EXPECT_FALSE(SchedulerTestAccess::ClosedForCancel(*scheduler));
+    EXPECT_FALSE(SchedulerTestAccess::ClosedForDrain(*scheduler));
+    EXPECT_EQ(scheduler->stats().queue_depth, 1U);
+
+    ShutdownResult shutdown;
+    stopper.thread =
+        std::thread([&] { shutdown = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    closed->wait();
+    release.release();
+    stopper.thread.join();
+    ExpectWinner(shutdown, ShutdownPolicy::kCancelPending, true);
+    ExpectCanceled(Take(std::move(admission)), 1);
+    ExpectQuiescent(*scheduler, 0, 0, 0, 0, 1);
+}
+
+TEST_F(InferenceSchedulerTest, JoinSettleFailureStillReleasesFollowers) {
+    auto scheduler = MakeAdd(1, 1);
+    auto blocked = std::make_shared<std::latch>(1);
+    auto closed = std::make_shared<std::latch>(1);
+    auto follower = std::make_shared<std::latch>(1);
+    JoinThread leader;
+    JoinThread follower_call;
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    SchedulerTestAccess::SetShutdownFollowerEntered(*scheduler, follower);
+    SchedulerTestAccess::SetFailNextJoinSettle(*scheduler);
+    RequireStart(*scheduler);
+
+    ShutdownResult lead;
+    ShutdownResult follow;
+    leader.thread =
+        std::thread([&] { lead = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    closed->wait();
+    follower_call.thread =
+        std::thread([&] { follow = scheduler->shutdown(ShutdownPolicy::kDrain); });
+    follower->wait();
+    release.release();
+    leader.thread.join();
+    follower_call.thread.join();
+
+    ExpectWinner(lead, ShutdownPolicy::kCancelPending, true);
+    ExpectWinner(follow, ShutdownPolicy::kCancelPending, false);
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
 }
 
 } // namespace

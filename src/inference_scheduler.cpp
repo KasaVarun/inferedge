@@ -68,6 +68,7 @@ enum class State {
     kStarting,
     kRunning,
     kDraining,
+    kCanceling,
     kStopped,
     kFailed,
 };
@@ -145,6 +146,7 @@ struct InferenceScheduler::Impl {
     CompletionStatus Execute(InferenceEngine& engine, RequestEntry& entry);
     bool PublishWorkerFailure(RequestEntry& entry, std::string_view text);
     void PublishSchedulerFailure(RequestEntry& entry) noexcept;
+    void PublishCanceled(RequestEntry& entry) noexcept;
     void RecordLocked(CompletionStatus status);
     void Retire(std::uint32_t index, bool faulted) noexcept;
     void FinishLastWorker(bool faulted);
@@ -152,6 +154,10 @@ struct InferenceScheduler::Impl {
     void JoinWorkers() noexcept;
     void EmergencyStop() noexcept;
     AdmissionStatus RejectionStatus() const;
+    void WaitForSettledShutdown(std::unique_lock<std::mutex>& lock);
+    void JoinOnce(std::unique_lock<std::mutex>& lock);
+    void PublishJoinFinished(std::unique_lock<std::mutex>& lock, std::uint64_t swept);
+    ShutdownResult SettledResult() const;
 
     SchedulerConfig config_;
     mutable std::mutex admission_;
@@ -162,18 +168,25 @@ struct InferenceScheduler::Impl {
     StartupSignal gate_{StartupSignal::kPending};
     bool shutdown_requested_{false};
     bool joined_{false};
+    bool join_claimed_{false};
+    bool coordinator_claimed_{false};
+    bool policy_established_{false};
+    ShutdownPolicy user_policy_{ShutdownPolicy::kDrain};
     bool cleanup_claimed_{false};
 
     std::atomic<bool> fail_close_cancel_{false};
+    std::atomic<bool> fail_join_settle_{false};
     std::atomic<bool> throw_consumed_{false};
     std::optional<std::uint32_t> stop_after_;
     std::optional<std::uint32_t> throw_in_worker_;
     std::shared_ptr<std::latch> before_pop_;
+    std::function<void()> before_loop_hook_;
     std::shared_ptr<std::latch> reached_run_;
     std::shared_ptr<std::latch> before_run_;
     std::shared_ptr<std::latch> after_publish_;
     std::shared_ptr<std::latch> hold_other_workers_;
     std::shared_ptr<std::latch> after_drain_closed_;
+    std::shared_ptr<std::latch> shutdown_follower_entered_;
     std::function<void(std::future<SchedulerCompletion>&)> on_accepted_;
 
     std::uint64_t next_id_{0};
@@ -184,6 +197,7 @@ struct InferenceScheduler::Impl {
     std::uint64_t failed_inference_{0};
     std::uint64_t failed_worker_{0};
     std::uint64_t failed_scheduler_{0};
+    std::uint64_t canceled_{0};
     std::atomic<std::uint64_t> executing_{0};
     std::atomic<std::uint32_t> live_workers_{0};
 
@@ -288,6 +302,10 @@ SchedulerError InferenceScheduler::Impl::AbortStart(SchedulerError error) {
         gate_ = StartupSignal::kAbort;
     }
     gate_cv_.notify_all();
+    {
+        std::lock_guard<std::mutex> lock(admission_);
+        join_claimed_ = true;
+    }
     JoinWorkers();
     if (queue_ != nullptr) {
         try {
@@ -326,6 +344,9 @@ void InferenceScheduler::Impl::WorkerMain(std::uint32_t index, InferenceEngine* 
         }
         entered = true;
         for (;;) {
+            if (before_loop_hook_) {
+                before_loop_hook_();
+            }
             if (const std::shared_ptr<std::latch> hold = hold_other_workers_;
                 hold != nullptr && index > 0) {
                 hold->wait();
@@ -346,16 +367,18 @@ void InferenceScheduler::Impl::WorkerMain(std::uint32_t index, InferenceEngine* 
             bool retire_now = false;
             CompletionStatus status = CompletionStatus::kWorkerFailed;
             try {
-                if (ConsumeThrow(index)) {
-                    retire_now = true;
-                    throw std::runtime_error("injected");
-                }
                 if (const std::shared_ptr<std::latch> reached = reached_run_; reached != nullptr) {
                     reached->count_down();
                 }
                 if (const std::shared_ptr<std::latch> before_run = before_run_;
                     before_run != nullptr) {
                     before_run->wait();
+                }
+                // The injected fault stays after the pop proof so a test can
+                // cancel the queue before this worker throws.
+                if (ConsumeThrow(index)) {
+                    retire_now = true;
+                    throw std::runtime_error("injected");
                 }
                 status = Execute(*engine, entry);
                 published = true;
@@ -462,6 +485,27 @@ bool InferenceScheduler::Impl::PublishWorkerFailure(RequestEntry& entry, std::st
     return true;
 }
 
+void InferenceScheduler::Impl::PublishCanceled(RequestEntry& entry) noexcept {
+    try {
+        SchedulerCompletion completion;
+        completion.request_id = entry.request_id;
+        completion.sequence = entry.sequence;
+        completion.status = CompletionStatus::kCanceled;
+        entry.completion.set_value(std::move(completion));
+    } catch (const std::future_error&) {
+        entry.backstop = false;
+        return;
+    } catch (...) {
+        return;
+    }
+    entry.backstop = false;
+    try {
+        std::lock_guard<std::mutex> lock(admission_);
+        ++canceled_;
+    } catch (...) {
+    }
+}
+
 void InferenceScheduler::Impl::PublishSchedulerFailure(RequestEntry& entry) noexcept {
     try {
         SchedulerCompletion completion;
@@ -498,6 +542,9 @@ void InferenceScheduler::Impl::RecordLocked(CompletionStatus status) {
         break;
     case CompletionStatus::kSchedulerFailed:
         ++failed_scheduler_;
+        break;
+    case CompletionStatus::kCanceled:
+        ++canceled_;
         break;
     }
 }
@@ -669,13 +716,24 @@ void InferenceScheduler::Impl::EmergencyStop() noexcept {
         }
     } catch (...) {
     }
-    JoinWorkers();
-    static_cast<void>(PublishQueuedFailures());
+    bool perform_join = false;
+    try {
+        std::lock_guard<std::mutex> lock(admission_);
+        if (!joined_) {
+            join_claimed_ = true;
+            perform_join = true;
+        }
+    } catch (...) {
+    }
+    if (perform_join) {
+        JoinWorkers();
+        static_cast<void>(PublishQueuedFailures());
+    }
     try {
         std::lock_guard<std::mutex> lock(admission_);
         joined_ = true;
-        if (state_ == State::kDraining || state_ == State::kRunning || state_ == State::kStarting ||
-            state_ == State::kIdle) {
+        if (state_ == State::kDraining || state_ == State::kCanceling ||
+            state_ == State::kRunning || state_ == State::kStarting || state_ == State::kIdle) {
             state_ = State::kStopped;
         }
     } catch (...) {
@@ -769,10 +827,86 @@ Admission InferenceScheduler::Impl::Submit(std::vector<NamedTensor> inputs) {
     return accepted;
 }
 
+void InferenceScheduler::Impl::WaitForSettledShutdown(std::unique_lock<std::mutex>& lock) {
+    std::shared_ptr<std::latch> entered = shutdown_follower_entered_;
+    if (entered != nullptr) {
+        lock.unlock();
+        try {
+            entered->count_down();
+        } catch (...) {
+        }
+        if (!lock.owns_lock()) {
+            lock.lock();
+        }
+    }
+    state_cv_.wait(lock, [this] {
+        return joined_ && (state_ == State::kStopped || state_ == State::kFailed);
+    });
+}
+
+void InferenceScheduler::Impl::PublishJoinFinished(std::unique_lock<std::mutex>& lock,
+                                                   std::uint64_t swept) {
+    auto publish = [this, swept] {
+        joined_ = true;
+        if (swept > 0 && state_ != State::kFailed) {
+            state_ = State::kFailed;
+        } else if (state_ == State::kDraining || state_ == State::kCanceling) {
+            state_ = State::kStopped;
+        }
+        state_cv_.notify_all();
+    };
+    auto attempt = [this, &lock, &publish] {
+        if (!lock.owns_lock()) {
+            lock.lock();
+        }
+        // One injected failure matches a mutex lock that throws after join.
+        // The retry below still publishes joined_ so followers are not left
+        // waiting. A second failure is not retried.
+        if (fail_join_settle_.exchange(false, std::memory_order_acq_rel)) {
+            lock.unlock();
+            throw std::runtime_error("shutdown settle failed");
+        }
+        publish();
+    };
+    try {
+        attempt();
+    } catch (...) {
+        try {
+            attempt();
+        } catch (...) {
+            state_cv_.notify_all();
+        }
+    }
+}
+
+void InferenceScheduler::Impl::JoinOnce(std::unique_lock<std::mutex>& lock) {
+    if (joined_) {
+        return;
+    }
+    if (join_claimed_) {
+        state_cv_.wait(lock, [this] { return joined_; });
+        return;
+    }
+    join_claimed_ = true;
+    lock.unlock();
+    JoinWorkers();
+    const std::uint64_t swept = PublishQueuedFailures();
+    PublishJoinFinished(lock, swept);
+}
+
+ShutdownResult InferenceScheduler::Impl::SettledResult() const {
+    ShutdownResult result;
+    result.changed = false;
+    result.established = policy_established_;
+    if (policy_established_) {
+        result.policy = user_policy_;
+    }
+    return result;
+}
+
 ShutdownResult InferenceScheduler::Impl::Shutdown(ShutdownPolicy policy) {
     ShutdownResult result;
-    result.policy = policy;
-    if (policy != ShutdownPolicy::kDrain) {
+    if (policy != ShutdownPolicy::kDrain && policy != ShutdownPolicy::kCancelPending) {
         result.error = MakeError(SchedulerErrorKind::kInvalidState, "unsupported shutdown policy");
         return result;
     }
@@ -780,70 +914,102 @@ ShutdownResult InferenceScheduler::Impl::Shutdown(ShutdownPolicy policy) {
     std::unique_lock<std::mutex> lock(admission_);
     if (state_ == State::kStarting) {
         shutdown_requested_ = true;
-        state_cv_.wait(lock,
-                       [this] { return state_ == State::kFailed || state_ == State::kStopped; });
+        state_cv_.wait(lock, [this] {
+            return joined_ && (state_ == State::kFailed || state_ == State::kStopped);
+        });
         result.changed = false;
+        result.established = false;
         result.error =
             MakeError(SchedulerErrorKind::kShutdownDuringStart, "shutdown overlapped startup");
         return result;
     }
-    if (state_ == State::kDraining) {
-        state_cv_.wait(lock,
-                       [this] { return state_ == State::kStopped || state_ == State::kFailed; });
-        result.changed = false;
-        return result;
+    if (state_ == State::kDraining || state_ == State::kCanceling) {
+        WaitForSettledShutdown(lock);
+        return SettledResult();
     }
     if (state_ == State::kStopped || state_ == State::kFailed) {
-        if (!joined_) {
-            lock.unlock();
-            JoinWorkers();
-            static_cast<void>(PublishQueuedFailures());
-            lock.lock();
-            joined_ = true;
-        }
-        result.changed = false;
-        return result;
+        JoinOnce(lock);
+        return SettledResult();
     }
     if (state_ != State::kRunning) {
         result.error = MakeError(SchedulerErrorKind::kInvalidState, "scheduler is not running");
         return result;
     }
-
-    bool drain_started = false;
-    try {
-        static_cast<void>(queue_->close_drain());
-        state_ = State::kDraining;
-        drain_started = true;
-    } catch (const std::exception& ex) {
-        result.error = MakeError(SchedulerErrorKind::kWorkerStart, ex.what());
+    if (coordinator_claimed_) {
+        // The owner stores Draining or Canceling before it releases admission_.
+        // Wait for that transition instead of waiting for join while Running.
+        state_cv_.wait(lock, [this] { return !coordinator_claimed_ || state_ != State::kRunning; });
+        if (state_ == State::kDraining || state_ == State::kCanceling) {
+            WaitForSettledShutdown(lock);
+            return SettledResult();
+        }
+        if (state_ == State::kStopped || state_ == State::kFailed) {
+            JoinOnce(lock);
+            return SettledResult();
+        }
+        result.error = MakeError(SchedulerErrorKind::kInvalidState, "scheduler is not running");
+        return result;
     }
-    std::shared_ptr<std::latch> after_drain = after_drain_closed_;
+
+    coordinator_claimed_ = true;
+    std::unique_ptr<std::deque<RequestEntry>> canceled_entries;
+    try {
+        if (policy == ShutdownPolicy::kCancelPending) {
+            // Throws before close_cancel, matching an allocation failure that
+            // happens before the queue commits its closure.
+            if (fail_close_cancel_.exchange(false, std::memory_order_acq_rel)) {
+                throw std::bad_alloc();
+            }
+            QueueClose<RequestEntry> closed = queue_->close_cancel();
+            if (!closed.changed || closed.mode != QueueCloseMode::kCancel ||
+                closed.canceled == nullptr) {
+                throw std::runtime_error("shutdown close failed");
+            }
+            canceled_entries = std::move(closed.canceled);
+            state_ = State::kCanceling;
+        } else {
+            QueueClose<RequestEntry> closed = queue_->close_drain();
+            if (!closed.changed || closed.mode != QueueCloseMode::kDrain) {
+                throw std::runtime_error("shutdown close failed");
+            }
+            state_ = State::kDraining;
+        }
+        user_policy_ = policy;
+        policy_established_ = true;
+        join_claimed_ = true;
+    } catch (const std::exception&) {
+        coordinator_claimed_ = false;
+        result.error = MakeError(SchedulerErrorKind::kWorkerStart, "shutdown close failed");
+        result.changed = false;
+        result.established = false;
+        return result;
+    }
+
+    std::shared_ptr<std::latch> after_close = after_drain_closed_;
     lock.unlock();
 
-    if (!drain_started && queue_ != nullptr) {
-        try {
-            if (!queue_->is_closed()) {
-                static_cast<void>(queue_->close_drain());
+    // Publication and the test latch must not skip the join. PublishCanceled
+    // already contains a failing set_value. The deque stays owned here, and
+    // its destructor runs the backstop before this lock is released.
+    try {
+        if (policy == ShutdownPolicy::kCancelPending && canceled_entries != nullptr) {
+            for (RequestEntry& entry : *canceled_entries) {
+                PublishCanceled(entry);
             }
-            drain_started = queue_->is_closed();
-        } catch (...) {
         }
-    }
-    if (drain_started && after_drain != nullptr) {
-        after_drain->count_down();
+        if (after_close != nullptr) {
+            after_close->count_down();
+        }
+    } catch (...) {
     }
 
     JoinWorkers();
-    const std::uint64_t swept = PublishQueuedFailures();
-    lock.lock();
-    joined_ = true;
-    if (swept > 0) {
-        state_ = State::kFailed;
-    } else if (state_ == State::kDraining) {
-        state_ = State::kStopped;
-    }
-    state_cv_.notify_all();
-    result.changed = drain_started && result.error.kind == SchedulerErrorKind::kNone;
+    const std::uint64_t swept = policy == ShutdownPolicy::kDrain ? PublishQueuedFailures() : 0;
+    PublishJoinFinished(lock, swept);
+
+    result.changed = true;
+    result.established = policy_established_;
+    result.policy = user_policy_;
     return result;
 }
 
@@ -857,6 +1023,7 @@ SchedulerStats InferenceScheduler::Impl::Stats() const {
     stats.failed_inference = failed_inference_;
     stats.failed_worker = failed_worker_;
     stats.failed_scheduler = failed_scheduler_;
+    stats.canceled = canceled_;
     stats.queue_depth = queue_ == nullptr ? 0 : static_cast<std::uint64_t>(queue_->size());
     stats.executing = executing_.load(std::memory_order_relaxed);
     stats.live_workers = live_workers_.load(std::memory_order_relaxed);
@@ -901,6 +1068,10 @@ void SchedulerTestAccess::SetBeforePop(InferenceScheduler& scheduler,
     scheduler.impl_->before_pop_ = std::move(latch);
 }
 
+void SchedulerTestAccess::SetBeforeLoop(InferenceScheduler& scheduler, std::function<void()> hook) {
+    scheduler.impl_->before_loop_hook_ = std::move(hook);
+}
+
 void SchedulerTestAccess::SetReachedRun(InferenceScheduler& scheduler,
                                         std::shared_ptr<std::latch> latch) {
     scheduler.impl_->reached_run_ = std::move(latch);
@@ -926,6 +1097,11 @@ void SchedulerTestAccess::SetAfterDrainClosed(InferenceScheduler& scheduler,
     scheduler.impl_->after_drain_closed_ = std::move(latch);
 }
 
+void SchedulerTestAccess::SetShutdownFollowerEntered(InferenceScheduler& scheduler,
+                                                     std::shared_ptr<std::latch> latch) {
+    scheduler.impl_->shutdown_follower_entered_ = std::move(latch);
+}
+
 void SchedulerTestAccess::SetOnAccepted(
     InferenceScheduler& scheduler,
     std::function<void(std::future<SchedulerCompletion>&)> callback) {
@@ -934,6 +1110,10 @@ void SchedulerTestAccess::SetOnAccepted(
 
 void SchedulerTestAccess::SetFailNextCloseCancel(InferenceScheduler& scheduler) {
     scheduler.impl_->fail_close_cancel_.store(true, std::memory_order_release);
+}
+
+void SchedulerTestAccess::SetFailNextJoinSettle(InferenceScheduler& scheduler) {
+    scheduler.impl_->fail_join_settle_.store(true, std::memory_order_release);
 }
 
 bool SchedulerTestAccess::IsStopped(const InferenceScheduler& scheduler) {
