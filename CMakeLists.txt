@@ -403,6 +403,7 @@ target_compile_definitions(
         "INFEREDGE_INVALID_MODEL_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/data/not_a_model.bin\""
         "INFEREDGE_MNIST_MODEL_PATH=\"${INFEREDGE_MNIST_MODEL}\""
         "INFEREDGE_MNIST_FIXTURE_DIR=\"${INFEREDGE_MNIST_FIXTURE_DIR}\""
+        "INFEREDGE_BATCH_ADD_MODEL_PATH=\"${INFEREDGE_BATCH_ADD_MODEL}\""
 )
 set_target_properties(
     inferedge_scheduler_tests

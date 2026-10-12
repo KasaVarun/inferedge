@@ -30,6 +30,9 @@
 #ifndef INFEREDGE_MNIST_FIXTURE_DIR
 #error "CMake must define INFEREDGE_MNIST_FIXTURE_DIR"
 #endif
+#ifndef INFEREDGE_BATCH_ADD_MODEL_PATH
+#error "CMake must define INFEREDGE_BATCH_ADD_MODEL_PATH"
+#endif
 
 namespace {
 
@@ -1993,6 +1996,132 @@ TEST_F(InferenceSchedulerTest, MnistQueuedCancelHasEmptyOutputs) {
     ExpectWinner(CancelWhileBlocked(*scheduler, release), ShutdownPolicy::kCancelPending, true);
     ExpectCanceled(TakeBounded(std::move(admission)), 1);
     ExpectQuiescent(*scheduler, 0, 0, 0, 0, 1);
+}
+
+SchedulerConfig WithBatching(std::filesystem::path model, bool enabled, std::uint32_t batch_size,
+                             std::chrono::milliseconds delay, std::uint32_t workers = 1) {
+    SchedulerConfig config{std::move(model), workers, 1};
+    config.enable_batching = enabled;
+    config.max_batch_size = batch_size;
+    config.max_batch_delay = delay;
+    return config;
+}
+
+void ExpectIdleInvalidConfig(InferenceScheduler& scheduler) {
+    const SchedulerError error = scheduler.start();
+    EXPECT_EQ(error.kind, SchedulerErrorKind::kInvalidConfig);
+    EXPECT_EQ(error.load_error.kind, InferenceErrorKind::kNone);
+    EXPECT_FALSE(SchedulerTestAccess::IsFailed(scheduler));
+    EXPECT_FALSE(SchedulerTestAccess::IsStopped(scheduler));
+    EXPECT_EQ(scheduler.start().kind, SchedulerErrorKind::kInvalidConfig);
+}
+
+std::vector<NamedTensor> DynamicAddInputs(float a0, float a1, float b0, float b1) {
+    return {NamedTensor{"A", {1, 2}, {a0, a1}}, NamedTensor{"B", {1, 2}, {b0, b1}}};
+}
+
+void ExpectDynamicSum(const SchedulerCompletion& completion, float c0, float c1) {
+    ASSERT_EQ(completion.status, CompletionStatus::kSucceeded);
+    EXPECT_EQ(completion.inference_error.kind, InferenceErrorKind::kNone);
+    ASSERT_EQ(completion.outputs.size(), 1U);
+    EXPECT_EQ(completion.outputs[0].name, "C");
+    EXPECT_EQ(completion.outputs[0].shape, (std::vector<std::int64_t>{1, 2}));
+    ASSERT_EQ(completion.outputs[0].values.size(), 2U);
+    EXPECT_FLOAT_EQ(completion.outputs[0].values[0], c0);
+    EXPECT_FLOAT_EQ(completion.outputs[0].values[1], c1);
+}
+
+TEST_F(InferenceSchedulerTest, AggregateInitializationLeavesBatchingDisabled) {
+    const SchedulerConfig config{INFEREDGE_ADD_MODEL_PATH, 1, 1};
+    EXPECT_FALSE(config.enable_batching);
+    EXPECT_EQ(config.max_batch_size, 1U);
+    EXPECT_EQ(config.max_batch_delay, std::chrono::milliseconds::zero());
+}
+
+TEST_F(InferenceSchedulerTest, RejectsZeroBatchSize) {
+    const auto scheduler = MakeScheduler(
+        WithBatching(INFEREDGE_ADD_MODEL_PATH, false, 0, std::chrono::milliseconds{0}));
+    ExpectIdleInvalidConfig(*scheduler);
+}
+
+TEST_F(InferenceSchedulerTest, RejectsBatchSizeAboveMaximum) {
+    const auto scheduler = MakeScheduler(
+        WithBatching(INFEREDGE_ADD_MODEL_PATH, false, 33, std::chrono::milliseconds{0}));
+    ExpectIdleInvalidConfig(*scheduler);
+}
+
+TEST_F(InferenceSchedulerTest, RejectsNegativeBatchDelay) {
+    const auto scheduler = MakeScheduler(
+        WithBatching(INFEREDGE_ADD_MODEL_PATH, false, 1, std::chrono::milliseconds{-1}));
+    ExpectIdleInvalidConfig(*scheduler);
+}
+
+TEST_F(InferenceSchedulerTest, RejectsExcessiveBatchDelay) {
+    const auto scheduler = MakeScheduler(
+        WithBatching(INFEREDGE_ADD_MODEL_PATH, false, 1, std::chrono::milliseconds{1001}));
+    ExpectIdleInvalidConfig(*scheduler);
+}
+
+TEST_F(InferenceSchedulerTest, DisabledBatchingStartsStaticAdd) {
+    const auto scheduler = MakeScheduler(
+        WithBatching(INFEREDGE_ADD_MODEL_PATH, false, 32, std::chrono::milliseconds{1000}));
+    RequireStart(*scheduler);
+    ExpectSum(Take(scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F))), 4.F, 6.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    ExpectQuiescent(*scheduler, 1, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, EnabledBatchingAcceptsMinimumBounds) {
+    const auto scheduler = MakeScheduler(
+        WithBatching(INFEREDGE_BATCH_ADD_MODEL_PATH, true, 1, std::chrono::milliseconds{0}));
+    RequireStart(*scheduler);
+    ExpectDynamicSum(Take(scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F))), 4.F, 6.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    ExpectQuiescent(*scheduler, 1, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, EnabledBatchingAcceptsMaximumBounds) {
+    const auto scheduler = MakeScheduler(
+        WithBatching(INFEREDGE_BATCH_ADD_MODEL_PATH, true, 32, std::chrono::milliseconds{1000}));
+    RequireStart(*scheduler);
+    ExpectDynamicSum(Take(scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F))), 12.F, 14.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    ExpectQuiescent(*scheduler, 1, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, EnabledBatchingRejectsStaticAdd) {
+    const auto scheduler = MakeScheduler(
+        WithBatching(INFEREDGE_ADD_MODEL_PATH, true, 1, std::chrono::milliseconds{0}, 2));
+    const SchedulerError error = scheduler->start();
+    EXPECT_EQ(error.kind, SchedulerErrorKind::kModelLoad);
+    EXPECT_EQ(error.load_error.kind, InferenceErrorKind::kModelInvalid);
+    EXPECT_FALSE(error.message.empty());
+    EXPECT_TRUE(SchedulerTestAccess::IsFailed(*scheduler));
+
+    const SchedulerStats stats = scheduler->stats();
+    EXPECT_EQ(stats.accepted, 0U);
+    EXPECT_EQ(stats.live_workers, 0U);
+    EXPECT_EQ(stats.executing, 0U);
+
+    std::vector<NamedTensor> inputs = AddInputs(1.F, 2.F, 3.F, 4.F);
+    const Admission rejected = scheduler->submit(std::move(inputs));
+    EXPECT_EQ(rejected.status, AdmissionStatus::kRejectedClosed);
+    EXPECT_FALSE(rejected.completion.has_value());
+    ASSERT_TRUE(rejected.inputs.has_value());
+    EXPECT_EQ(scheduler->stats().accepted, 0U);
+
+    EXPECT_EQ(scheduler->start().kind, SchedulerErrorKind::kInvalidState);
+}
+
+TEST_F(InferenceSchedulerTest, EnabledBatchingRejectsStaticMnist) {
+    const auto scheduler = MakeScheduler(
+        WithBatching(INFEREDGE_MNIST_MODEL_PATH, true, 1, std::chrono::milliseconds{0}));
+    const SchedulerError error = scheduler->start();
+    EXPECT_EQ(error.kind, SchedulerErrorKind::kModelLoad);
+    EXPECT_EQ(error.load_error.kind, InferenceErrorKind::kModelInvalid);
+    EXPECT_TRUE(SchedulerTestAccess::IsFailed(*scheduler));
+    EXPECT_EQ(scheduler->stats().live_workers, 0U);
+    EXPECT_EQ(scheduler->stats().accepted, 0U);
 }
 
 TEST_F(InferenceSchedulerTest, RepeatedSchedulerLifetime) {

@@ -107,7 +107,74 @@ SchedulerError ValidateConfig(const SchedulerConfig& config) {
         return MakeError(SchedulerErrorKind::kInvalidConfig,
                          "queue_capacity must be from 1 through 1024");
     }
+    if (config.max_batch_size == 0 || config.max_batch_size > 32) {
+        return MakeError(SchedulerErrorKind::kInvalidConfig,
+                         "max_batch_size must be from 1 through 32");
+    }
+    if (config.max_batch_delay < std::chrono::milliseconds::zero() ||
+        config.max_batch_delay > std::chrono::milliseconds{1000}) {
+        return MakeError(SchedulerErrorKind::kInvalidConfig,
+                         "max_batch_delay must be from 0 through 1000 milliseconds");
+    }
     return {};
+}
+
+SchedulerError MakeModelLoad(std::string message) {
+    SchedulerError error;
+    error.kind = SchedulerErrorKind::kModelLoad;
+    error.load_error = InferenceError{InferenceErrorKind::kModelInvalid, message};
+    error.message = std::move(message);
+    return error;
+}
+
+// Same shape contract the batch helper will require. Checked here so start()
+// can fail before any worker thread exists.
+SchedulerError ValidateBatchSignature(const std::vector<TensorMetadata>& metadata,
+                                      const char* role) {
+    if (metadata.empty()) {
+        return MakeModelLoad(std::string{role} + " metadata is empty");
+    }
+    for (std::size_t index = 0; index < metadata.size(); ++index) {
+        const TensorMetadata& tensor = metadata[index];
+        if (tensor.element_type != ElementType::kFloat32) {
+            return MakeModelLoad(std::string{role} + " " + tensor.name + " is not float32");
+        }
+        if (tensor.name.empty()) {
+            return MakeModelLoad(std::string{role} + " metadata name is empty");
+        }
+        for (std::size_t earlier = 0; earlier < index; ++earlier) {
+            if (metadata[earlier].name == tensor.name) {
+                return MakeModelLoad(std::string{role} +
+                                     " metadata name is duplicated: " + tensor.name);
+            }
+        }
+        if (tensor.dimensions.size() < 2) {
+            return MakeModelLoad(std::string{role} + " " + tensor.name + " rank is below 2");
+        }
+        if (tensor.dimensions[0] >= 0) {
+            return MakeModelLoad(std::string{role} + " " + tensor.name + " axis 0 is not dynamic");
+        }
+        for (std::size_t axis = 1; axis < tensor.dimensions.size(); ++axis) {
+            const std::int64_t dimension = tensor.dimensions[axis];
+            if (dimension < 0) {
+                return MakeModelLoad(std::string{role} + " " + tensor.name +
+                                     " has an additional dynamic axis");
+            }
+            if (dimension == 0) {
+                return MakeModelLoad(std::string{role} + " " + tensor.name +
+                                     " has a non-positive dimension");
+            }
+        }
+    }
+    return {};
+}
+
+SchedulerError ValidateBatchCapability(const InferenceEngine& engine) {
+    if (SchedulerError inputs = ValidateBatchSignature(engine.inputs(), "input");
+        inputs.kind != SchedulerErrorKind::kNone) {
+        return inputs;
+    }
+    return ValidateBatchSignature(engine.outputs(), "output");
 }
 
 std::string WorkerFailureMessage(std::string_view text) {
@@ -263,6 +330,13 @@ SchedulerError InferenceScheduler::Impl::StartWorkers() {
             return AbortStart(std::move(error));
         }
         engines.push_back(std::move(loaded.engine));
+    }
+
+    if (config_.enable_batching) {
+        if (SchedulerError capability = ValidateBatchCapability(*engines.front());
+            capability.kind != SchedulerErrorKind::kNone) {
+            return AbortStart(std::move(capability));
+        }
     }
 
     workers_.reserve(engines.size());

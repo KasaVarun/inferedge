@@ -2,6 +2,7 @@
 
 #include "inferedge/inference_engine.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -21,10 +22,18 @@ namespace inferedge {
 inline constexpr std::uint32_t kMaxSchedulerWorkers = 64;
 inline constexpr std::size_t kMaxSchedulerQueueCapacity = 1024;
 
+// enable_batching asks start() to require a dynamic batch axis on every model
+// input and output. The bounds below are checked either way. Worker-local
+// batch execution is not implemented: a started worker still runs one request
+// at a time. max_batch_size is 1 through 32. max_batch_delay is 0 through
+// 1000 milliseconds.
 struct SchedulerConfig {
     std::filesystem::path model_path;
     std::uint32_t worker_count{1};
     std::size_t queue_capacity{1};
+    bool enable_batching{false};
+    std::uint32_t max_batch_size{1};
+    std::chrono::milliseconds max_batch_delay{0};
 };
 
 enum class SchedulerErrorKind {
