@@ -217,6 +217,7 @@ add_executable(
     tests/benchmark_runner_test.cpp
     tests/concurrent_inference_test.cpp
     tests/concurrent_benchmark_test.cpp
+    tests/concurrent_reliability_test.cpp
 )
 target_link_libraries(
     inferedge_onnx_smoke
@@ -258,7 +259,9 @@ gtest_discover_tests(
 )
 gtest_discover_tests(
     inferedge_onnx_smoke
-    PROPERTIES ENVIRONMENT "ORT_DISABLE_TELEMETRY=1"
+    PROPERTIES
+        ENVIRONMENT "ORT_DISABLE_TELEMETRY=1"
+        TIMEOUT 120
 )
 
 add_executable(
@@ -350,3 +353,36 @@ set_tests_properties(
     inferedge_bench_concurrent_version
     PROPERTIES PASS_REGULAR_EXPRESSION "inferedge-bench-concurrent 0\\.1\\.0"
 )
+
+# Local bounded stress. Default CI does not build or discover this executable.
+option(INFEREDGE_ENABLE_LONG_STRESS "Build bounded local concurrency stress tests" OFF)
+if(INFEREDGE_ENABLE_LONG_STRESS)
+    add_executable(inferedge_concurrent_stress tests/concurrent_stress_test.cpp)
+    target_link_libraries(
+        inferedge_concurrent_stress
+        PRIVATE
+            inferedge_warnings
+            inferedge_benchmark
+            inferedge_concurrent_benchmark
+            GTest::gtest_main
+    )
+    target_compile_definitions(
+        inferedge_concurrent_stress
+        PRIVATE
+            "INFEREDGE_ADD_MODEL_PATH=\"${INFEREDGE_ADD_MODEL}\""
+            "INFEREDGE_MNIST_MODEL_PATH=\"${INFEREDGE_MNIST_MODEL}\""
+            "INFEREDGE_MNIST_FIXTURE_DIR=\"${INFEREDGE_MNIST_FIXTURE_DIR}\""
+    )
+    set_target_properties(
+        inferedge_concurrent_stress
+        PROPERTIES
+            BUILD_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
+            INSTALL_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
+    )
+    gtest_discover_tests(
+        inferedge_concurrent_stress
+        PROPERTIES
+            ENVIRONMENT "ORT_DISABLE_TELEMETRY=1"
+            TIMEOUT 300
+    )
+endif()
