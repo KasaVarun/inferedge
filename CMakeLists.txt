@@ -125,6 +125,16 @@ target_link_libraries(
 
 target_link_libraries(inferedge PRIVATE inferedge_onnx)
 
+find_package(Threads REQUIRED)
+add_library(inferedge_concurrent src/concurrent_inference.cpp)
+target_include_directories(inferedge_concurrent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(inferedge_concurrent PUBLIC cxx_std_20)
+target_link_libraries(
+    inferedge_concurrent
+    PUBLIC inferedge_onnx Threads::Threads
+    PRIVATE inferedge_warnings
+)
+
 add_library(inferedge_benchmark src/benchmark_runner.cpp)
 target_include_directories(inferedge_benchmark PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(inferedge_benchmark PUBLIC cxx_std_20)
@@ -171,12 +181,14 @@ add_executable(
     tests/inference_engine_test.cpp
     tests/mnist_inference_test.cpp
     tests/benchmark_runner_test.cpp
+    tests/concurrent_inference_test.cpp
 )
 target_link_libraries(
     inferedge_onnx_smoke
     PRIVATE
         inferedge_warnings
         inferedge_benchmark
+        inferedge_concurrent
         GTest::gtest_main
 )
 target_compile_definitions(

@@ -137,7 +137,17 @@ Copy the printed digest into `INFEREDGE_ADD_MODEL_SHA256` in `CMakeLists.txt`. T
 
 `InferenceEngine` is move-only. A moved-from engine has no session. `inputs()` and `outputs()` then return an empty vector, and `run` returns `kExecution`. Those accessors do not dereference an empty implementation.
 
-The engine is not thread-safe. One thread should call a given engine. Per-call input spans and returned vectors are distinct objects, and they share one `Ort::Session`. Concurrent `run` calls have not been tested.
+The engine is not thread-safe. One thread should call a given engine. Per-call input spans and returned vectors are distinct objects, and they share one `Ort::Session`. Concurrent `run` calls on that same engine are not supported.
+
+## Concurrent inference correctness
+
+`inferedge_concurrent` (`include/inferedge/concurrent_inference.hpp`) runs a fixed set of workers. Each worker owns one `InferenceEngine` loaded before any thread starts, and one `std::jthread` calls `run()` only on that engine. Input floats live in that worker's `WorkerRequest`. `NamedTensorView` objects borrow those floats for one call. Expected tensors own their reference values. Add comparisons use zero tolerance. MNIST comparisons use `rtol = 1e-4` and `atol = 1e-5`.
+
+If a model fails to load, the call returns `kModelLoad` with the engine's `InferenceError` and starts no threads. A failure during a call, a wrong output, or an exception inside a worker sets an atomic flag, lets the in-flight `run()` finish, and does not start another call on a worker that has seen the flag. Every created `std::jthread` is joined. The result's `outputs` vector is empty unless every worker completed every requested call. There is no partial success.
+
+`stop_after_starting_workers` aborts thread creation after a chosen count so a partial start cannot wait for a thread that does not exist. No fixed-size barrier is used. `throw_in_worker` makes one worker throw before its first call; the thread function catches it.
+
+This library does not make one `InferenceEngine` thread-safe. It has no request queue, scheduler, or batching. It does not measure latency or throughput, and it does not report a concurrency speedup. `inferedge` and `inferedge-bench` do not link it.
 
 ## Latency statistics
 
