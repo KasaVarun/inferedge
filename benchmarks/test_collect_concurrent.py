@@ -24,6 +24,7 @@ if str(REPO_ROOT) not in sys.path:
 from benchmarks.collect_baseline import (  # noqa: E402
     HISTORICAL_UNTRACKED,
     validate_report,
+    verify_linked_onnx_runtime,
 )
 from benchmarks.collect_baseline import (
     git_status_problems as sequential_git_status_problems,
@@ -59,6 +60,12 @@ from benchmarks.collect_concurrent import (  # noqa: E402
     verify_pinned_files,
 )
 
+PINNED_ORT_LIBRARIES = frozenset(
+    {
+        "libonnxruntime.1.31.0.dylib",
+        "libonnxruntime.so.1.31.0",
+    }
+)
 COMMIT = "a" * 40
 OTHER_COMMIT = "b" * 40
 WARMUP = 100
@@ -629,6 +636,7 @@ class PreflightTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             stage = Stage(pathlib.Path(temporary))
             stage.build()
+            runtime_root = stage.runtime.resolve()
             checked = stage.run_preflight()
         self.assertEqual(checked["verified_configuration"]["cmake_build_type"], "Release")
         self.assertEqual(checked["verified_configuration"]["cmake_cxx_flags_release"], "-O3 -DNDEBUG")
@@ -647,7 +655,9 @@ class PreflightTest(unittest.TestCase):
         )
         self.assertEqual(checked["queried"]["benchmark_tool_version"], "0.1.0")
         self.assertEqual(len(checked["queried"]["benchmark_binary_sha256"]), 64)
-        self.assertIn("libonnxruntime.1.31.0", checked["queried"]["onnxruntime_resolved_library"])
+        resolved = pathlib.Path(checked["queried"]["onnxruntime_resolved_library"])
+        self.assertIn(resolved.name, PINNED_ORT_LIBRARIES)
+        self.assertEqual(resolved, (runtime_root / "lib" / resolved.name).resolve())
         self.assertEqual(checked["source_defined_policy"]["allowed_untracked_roots"], list(ALLOWED_UNTRACKED))
         self.assertEqual(checked["collection_protocol"]["trial_order"], EXPECTED_ORDER)
         self.assertEqual(checked["collection_protocol"]["inter_trial_delay_seconds"], 5.0)
@@ -662,6 +672,71 @@ class PreflightTest(unittest.TestCase):
             self.assertIsNone(checked["queried"]["hardware_model"])
             self.assertIn("Darwin", str(checked["queried"]["hardware_model_error"]))
             self.assertEqual(checked["queried"]["nproc_cpu_count"], 8)
+
+    def test_versioned_libraries_resolve_only_inside_the_pinned_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = pathlib.Path(temporary)
+            macos = self._pinned_package(base / "macos", "libonnxruntime.1.31.0.dylib")
+            macos_library = macos / "lib" / "libonnxruntime.1.31.0.dylib"
+            resolved = verify_linked_onnx_runtime(
+                binary=pathlib.Path("/tmp") / BINARY_NAME,
+                runtime_root=macos,
+                link_output=(
+                    "inferedge-bench-concurrent:\n"
+                    "\t@rpath/libonnxruntime.1.31.0.dylib "
+                    "(compatibility version 1.0.0, current version 1.31.0)\n"
+                ),
+                load_command_output=self._rpath(macos / "lib"),
+            )
+            self.assertEqual(resolved.name, "libonnxruntime.1.31.0.dylib")
+            self.assertEqual(resolved, macos_library.resolve())
+
+            linux = self._pinned_package(base / "linux", "libonnxruntime.so.1.31.0")
+            linux_library = linux / "lib" / "libonnxruntime.so.1.31.0"
+            resolved = verify_linked_onnx_runtime(
+                binary=pathlib.Path("/tmp") / BINARY_NAME,
+                runtime_root=linux,
+                link_output=f"\tlibonnxruntime.so.1.31.0 => {linux_library} (0x1000)\n",
+            )
+            self.assertEqual(resolved.name, "libonnxruntime.so.1.31.0")
+            self.assertEqual(resolved, linux_library.resolve())
+
+            with self.assertRaises(CollectorError) as caught:
+                verify_linked_onnx_runtime(
+                    binary=pathlib.Path("/tmp") / BINARY_NAME,
+                    runtime_root=macos,
+                    link_output=(
+                        "inferedge-bench-concurrent:\n"
+                        "\t@rpath/libonnxruntime.dylib "
+                        "(compatibility version 1.0.0, current version 1.31.0)\n"
+                    ),
+                    load_command_output=self._rpath(macos / "lib"),
+                )
+            self.assertIn("unrecognized ONNX Runtime dependency", str(caught.exception))
+
+            foreign = base / "other" / "libonnxruntime.1.31.0.dylib"
+            foreign.parent.mkdir()
+            foreign.write_bytes(b"foreign")
+            with self.assertRaises(CollectorError) as caught:
+                verify_linked_onnx_runtime(
+                    binary=pathlib.Path("/tmp") / BINARY_NAME,
+                    runtime_root=macos,
+                    link_output=(
+                        "inferedge-bench-concurrent:\n"
+                        f"\t{foreign} (compatibility version 1.0.0, current version 1.31.0)\n"
+                    ),
+                )
+            self.assertIn("outside the pinned installation", str(caught.exception))
+
+    def _pinned_package(self, root: pathlib.Path, filename: str) -> pathlib.Path:
+        library = root / "lib"
+        library.mkdir(parents=True)
+        (root / "VERSION_NUMBER").write_text("1.31.0\n", encoding="utf-8")
+        (library / filename).write_bytes(b"ort")
+        return root
+
+    def _rpath(self, path: pathlib.Path) -> str:
+        return "          cmd LC_RPATH\n" f"         path {path} (offset 12)\n"
 
     def test_wrong_binary_missing_cache_and_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
