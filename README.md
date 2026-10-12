@@ -18,9 +18,10 @@ The executable runs one fixed rank-1 float32 model and still answers `--help` an
 | CMake + Ninja build | Scheduler, request queue, or dynamic batching |
 | `inferedge --model` and `--input` | HTTP API, database, frontend, Python bindings |
 | GoogleTest unit tests | CUDA, TensorRT, or CoreML provider setup |
-| Synchronous float32 `InferenceEngine` | Concurrent `run()` calls |
+| Synchronous float32 `InferenceEngine` | Concurrent `run()` on one engine |
 | clang-format 23.1.3 and Linux GitHub Actions | A production inference API |
-| Injected-duration statistics, `run_benchmark`, and `inferedge-bench` text or JSON reports | Published speed figures or concurrent runs |
+| Injected-duration statistics, `run_benchmark`, and `inferedge-bench` text or JSON reports | A concurrent CLI, JSON schema version 2, or a collected concurrent baseline |
+| Concurrent benchmark library, one session per worker | A measured concurrency speedup |
 
 Version: **0.1.0**
 
@@ -148,6 +149,20 @@ If a model fails to load, the call returns `kModelLoad` with the engine's `Infer
 `stop_after_starting_workers` aborts thread creation after a chosen count so a partial start cannot wait for a thread that does not exist. No fixed-size barrier is used. `throw_in_worker` makes one worker throw before its first call; the thread function catches it.
 
 This library does not make one `InferenceEngine` thread-safe. It has no request queue, scheduler, or batching. It does not measure latency or throughput, and it does not report a concurrency speedup. `inferedge` and `inferedge-bench` do not link it.
+
+## Concurrent benchmark runner
+
+`run_concurrent_benchmark` lives in `inferedge_concurrent_benchmark` (`include/inferedge/concurrent_benchmark.hpp`). It loads one `InferenceEngine` per worker before starting threads, using the same CPU session as the rest of the runtime: one intra-op thread and graph optimizations disabled. Each worker calls `run()` only on its own engine. Workers do not share input buffers. There is no concurrent CLI, and no concurrent performance baseline has been collected.
+
+Warmup runs on each engine before a shared start gate. Every warmup output is checked, and those durations are discarded. Warmup may be zero. After every worker arrives, the coordinator records one `steady_clock::now()` and releases the gate. A failure before that release cancels the gate and joins every thread that was created. A fixed-size barrier is not used, so a thread that was never created cannot leave the others waiting.
+
+Each measured sample is the clock immediately before `engine.run` and immediately after it returns. That sample includes validation, the input copy, ONNX Runtime execution, and the output copy inside `run`. It excludes the correctness check and destruction of that `InferenceResult`. After the last measured result on a worker is destroyed, that worker records its finish time. The wall interval is the latest of those finish times minus the shared start. It excludes model loading, thread construction, and warmup. It is not the sum of overlapping per-call durations.
+
+`call_summary` is `summarize_latencies` on the pooled per-request samples. Its active-call throughput remains the sample count divided by the sum of those samples, so overlapping calls can make it larger than the wall-clock rate. `aggregate_completed_requests_per_second` is the total completed requests divided by the wall interval in seconds. That is the concurrent throughput figure. It is not server capacity, and it is not the sequential `observed_sequential_throughput_requests_per_second` field. This page does not publish either number and does not claim a speedup.
+
+Numeric comparison matches the sequential runner: `abs(actual - expected) <= absolute_tolerance + relative_tolerance * abs(expected)`. Warmup compares every call. Measured calls always reject an inference error, a missing output, a shape or count mismatch, and a non-finite value. Value comparison uses 1-based iterations, every `correctness_check_interval` iteration, and always the last iteration. Add references use zero tolerance. MNIST references use `rtol = 1e-4` and `atol = 1e-5`. Any failure discards the report. Output tensors are not kept.
+
+Worker count must be from 1 through 64 and must match the assignment list. Warmup and measured counts above 100,000 are rejected, as is a measured count of zero, a check interval of zero, or a worker and measured-iteration product that overflows. `inferedge` and `inferedge-bench` do not link this library. JSON schema version 1 is unchanged.
 
 ## Latency statistics
 
