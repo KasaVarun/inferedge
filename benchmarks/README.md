@@ -142,7 +142,173 @@ Active-call throughput counts only measured `run` durations. Observed sequential
 The synthetic tests do not execute the model:
 
 ```bash
-python3 -m unittest benchmarks.test_collect_baseline benchmarks.test_analyze_baseline
+python3 -m unittest benchmarks.test_collect_baseline benchmarks.test_analyze_baseline \
+  benchmarks.test_collect_concurrent
 python3 -m py_compile benchmarks/collect_baseline.py benchmarks/analyze_baseline.py \
-  benchmarks/test_collect_baseline.py benchmarks/test_analyze_baseline.py
+  benchmarks/collect_concurrent.py benchmarks/test_collect_baseline.py \
+  benchmarks/test_analyze_baseline.py benchmarks/test_collect_concurrent.py
 ```
+
+## Concurrent scaling collection
+
+`benchmarks/collect_concurrent.py` launches `inferedge-bench-concurrent` and stores one schema-version-2 JSON report per process. It does not launch `inferedge-bench`, does not write `aggregate.json`, and does not run a campaign by being imported. No concurrent analyzer is included. No concurrent scaling run set has been collected, and this repository has no measured concurrent scaling results. The measurement commit is whatever full SHA the operator passes. This file does not name one.
+
+### Matrix
+
+| Workload | Workers | Warmup per worker | Measured per worker | Check interval | Counted processes |
+| --- | --- | --- | --- | --- | --- |
+| add | 1, 2, 4, 8 | 100 | 1000 | 1 | 5 each |
+| mnist | 1, 2, 4, 8 | 100 | 1000 | 1 | 5 each |
+
+Each of the eight configurations also has one uncounted pilot. The campaign is 8 pilots plus 40 counted processes, 48 processes in total. MNIST uses fixture `test_00003`. Add passes no fixture flags. `--concurrency` is present on every command. A failed process stops the campaign. There is no retry and no change of order based on a result. The cooldown is 5 seconds after every process except the first.
+
+### Trial order
+
+Pilots follow the canonical rotation. Counted round `r` rotates the start by `r - 1` positions and stamps run number `r` on each id:
+
+```text
+pilot-add-c01
+pilot-mnist-c01
+pilot-add-c02
+pilot-mnist-c02
+pilot-add-c04
+pilot-mnist-c04
+pilot-add-c08
+pilot-mnist-c08
+add-c01-01
+mnist-c01-01
+add-c02-01
+mnist-c02-01
+add-c04-01
+mnist-c04-01
+add-c08-01
+mnist-c08-01
+mnist-c01-02
+add-c02-02
+mnist-c02-02
+add-c04-02
+mnist-c04-02
+add-c08-02
+mnist-c08-02
+add-c01-02
+add-c02-03
+mnist-c02-03
+add-c04-03
+mnist-c04-03
+add-c08-03
+mnist-c08-03
+add-c01-03
+mnist-c01-03
+mnist-c02-04
+add-c04-04
+mnist-c04-04
+add-c08-04
+mnist-c08-04
+add-c01-04
+mnist-c01-04
+add-c02-04
+add-c04-05
+mnist-c04-05
+add-c08-05
+mnist-c08-05
+add-c01-05
+mnist-c01-05
+add-c02-05
+mnist-c02-05
+```
+
+`c01` is one worker. The same configuration is never adjacent to itself. Pilots stay in the run set. A later analyzer is responsible for leaving them out of any aggregate. This collector does not write that aggregate.
+
+### Release preflight
+
+Use a dedicated Release build directory. `CMakeCache.txt` must sit beside `inferedge-bench-concurrent`. `CMAKE_BUILD_TYPE` must be `Release`. `CMAKE_CXX_FLAGS_RELEASE` must request optimization (`-O2`, `-O3`, `-Ofast`, or `/O2`). Sanitizer flags and sanitizer symbols are rejected. The binary's `--version` text must be `inferedge-bench-concurrent 0.1.0`.
+
+ONNX Runtime must be the pinned 1.31.0 CPU package selected by that build. The collector reuses the sequential library resolution: on macOS the load command may name `@rpath/libonnxruntime.1.dylib` or `libonnxruntime.1.31.0.dylib`, and the resolved file must be `lib/libonnxruntime.1.31.0.dylib` inside that package. On Linux it accepts `libonnxruntime.so.1` and `libonnxruntime.so.1.31.0` under the same rule. An ambiguous match, an unrecognized filename, or a library outside the pinned package is rejected.
+
+`--expected-commit` is required. It must be a 40-character lowercase hexadecimal SHA. Preflight requires `git rev-parse HEAD` to equal that SHA. There is no default commit stored in the collector.
+
+Tracked changes are rejected. The concurrent collector allows these untracked roots, and records them in `environment.json`:
+
+- `models/experiments/`
+- `benchmarks/baselines/`
+- `benchmarks/concurrent_runs/`
+
+Any other untracked path is rejected. The sequential collector's allow-list remains `models/experiments/` only.
+
+The manifest records the operating system, OS version, architecture, Python version, compiler, CMake flags, binary SHA-256, ONNX Runtime version, and the resolved library path. CPU concurrency is queried. On macOS the collector runs `sysctl -n hw.model`, `hw.physicalcpu`, `hw.logicalcpu`, and `hw.ncpu`. `os.cpu_count()` is stored separately. A core count is not derived from a hardware identifier such as `Mac17,8`. A failed query is stored as null plus the error text.
+
+Configure and check without starting a trial:
+
+```bash
+export ORT_DISABLE_TELEMETRY=1
+cmake -S . -B build-concurrent -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build-concurrent --target inferedge-bench-concurrent
+python3 benchmarks/collect_concurrent.py \
+  --binary build-concurrent/inferedge-bench-concurrent \
+  --expected-commit <40-character-measurement-sha> \
+  --preflight-only
+```
+
+Replace `<40-character-measurement-sha>` with the commit that produced the binary. Collection, once that check has passed:
+
+```bash
+python3 benchmarks/collect_concurrent.py \
+  --binary build-concurrent/inferedge-bench-concurrent \
+  --expected-commit <40-character-measurement-sha>
+```
+
+`--preflight-only` exits before any workload process and creates no run-set directory. Each trial is a new process. Arguments are an array. The shell is not used. The child environment sets `ORT_DISABLE_TELEMETRY=1`.
+
+Add:
+
+```text
+inferedge-bench-concurrent --model <absolute add model> --workload add \
+  --concurrency <1|2|4|8> --warmup 100 --iterations 1000 \
+  --check-interval 1 --format json
+```
+
+MNIST adds `--fixture test_00003` and `--fixture-dir` set to the absolute `models/fixtures/mnist` directory.
+
+### Checksums
+
+Local files are hashed and compared with these constants. The same constants are compared with `git cat-file` blobs at `--expected-commit`. A hash computed at runtime is not used as its own expected value.
+
+| File | SHA-256 |
+| --- | --- |
+| `models/add_f32.onnx` | `37eb1b1b1adee439d2d14b91a0b217bd15ab809610d1271ea821d56e6400a447` |
+| `models/mnist_mlp.onnx` | `3473a4b2673fe4353c2b3a04a7d432717a4dfcdc42fc217565c99743542d8cce` |
+| `models/fixtures/mnist/inputs/test_00003.f32` | `692f8ff1c2aaa7dd3c5982979516e774e4daf6d8420f1818a68389825ebb84a9` |
+| `models/fixtures/mnist/onnx/test_00003.f32` | `9a5daa05f5096f5521deab05c025d3c3691e2587189f176d8699a9521b663a46` |
+| `models/fixtures/mnist/manifest.json` | `4e6f95f8626fa89a22f59aed004870b942fcf2d7bb4add2226f9ca4f9f13009a` |
+
+The binary SHA-256 is recorded as well.
+
+### Schema version 2
+
+Stdout must be one JSON object and one trailing newline. `schema_version` must be 2. The tool name is `inferedge-bench-concurrent` and the version is `0.1.0`. `correctness` must be `passed`. The backend is `ONNX Runtime CPU`. Session ownership is `one_inference_engine_per_worker`, intra-op threads per session are 1, and graph optimizations are `disabled`. The workload, absolute model path, fixture (`null` for Add, `test_00003` for MNIST), worker count, warmup, measured iterations, and check interval must match the trial. `total_completed_requests`, every per-worker count, and `latency_microseconds.sample_count` must describe `worker_count * 1000` completed calls, with 1000 on each worker.
+
+`NaN` and `Infinity` are rejected. Booleans are not counts or metrics. Negative latencies, a negative or negative-zero standard deviation, inverted percentiles, a non-positive wall duration, and a non-positive throughput are rejected. Aggregate throughput must match `total_completed_requests / (measurement_wall_microseconds / 1e6)` within a relative tolerance of `1e-6` after JSON parsing. The report is not rewritten. Schema version 1 fields such as `measurement_loop_microseconds` and `throughput_requests_per_second` are unexpected.
+
+### Evidence layout
+
+Run sets go under `benchmarks/concurrent_runs/`, separate from `benchmarks/baselines/`. The directory name is a UTC timestamp plus the seven-character commit prefix. An existing directory is left unchanged and the command fails.
+
+```text
+benchmarks/concurrent_runs/<YYYYMMDDTHHMMSSZ-commit>/
+  environment.json
+  runs/<trial>.stdout
+  runs/<trial>.stderr
+  runs/<trial>.meta.json
+  runs/<trial>.json          # accepted stdout, unchanged
+  failure.json               # only when a trial stops the set
+```
+
+`environment.json` is `running` while processes are in flight, `completed` only after all 48 trials are accepted, and `failed` when a trial stops the set. `aggregate` in that file stays null.
+
+### Failure
+
+A preflight failure exits nonzero, starts no trial, and creates no run-set directory. A trial failure keeps `.stdout`, `.stderr`, and `.meta.json` for that trial, writes `failure.json`, marks the manifest `failed`, and keeps earlier accepted `.json` files, including pilots. Later trials are not started. An exception while launching a process is recorded the same way. The collector does not create `aggregate.json`.
+
+### Private artifacts
+
+`benchmarks/concurrent_runs/` stays untracked until a later review. The manifest contains absolute paths for the binary, compiler, models, fixture directory, and resolved ONNX Runtime library. Those raw files are not a published result. A later sanitization pass would have to write a separate derivative and leave this directory unchanged. The synthetic tests hash and parse reports. They do not execute a model.
