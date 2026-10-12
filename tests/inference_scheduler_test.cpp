@@ -1,5 +1,6 @@
 #include "inferedge/inference_scheduler.hpp"
 
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -1286,6 +1287,736 @@ TEST_F(InferenceSchedulerTest, JoinSettleFailureStillReleasesFollowers) {
     ExpectWinner(lead, ShutdownPolicy::kCancelPending, true);
     ExpectWinner(follow, ShutdownPolicy::kCancelPending, false);
     EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+}
+
+constexpr auto kCompletionBound = std::chrono::seconds{10};
+
+void ExpectRejectedInputs(const Admission& admission, AdmissionStatus status, float a0) {
+    EXPECT_EQ(admission.status, status);
+    EXPECT_FALSE(admission.completion.has_value());
+    ASSERT_TRUE(admission.inputs.has_value());
+    ASSERT_EQ(admission.inputs->size(), 2U);
+    EXPECT_FLOAT_EQ(admission.inputs->front().values[0], a0);
+    EXPECT_FLOAT_EQ(admission.inputs->front().values[1], 0.F);
+    EXPECT_FLOAT_EQ(admission.inputs->back().values[0], 1.F);
+    EXPECT_FLOAT_EQ(admission.inputs->back().values[1], 0.F);
+}
+
+SchedulerCompletion TakeBounded(Admission admission) {
+    SchedulerCompletion completion;
+    EXPECT_EQ(admission.status, AdmissionStatus::kAccepted);
+    EXPECT_FALSE(admission.inputs.has_value());
+    if (!admission.completion.has_value()) {
+        ADD_FAILURE() << "accepted admission has no future";
+        return completion;
+    }
+    if (admission.completion->wait_for(kCompletionBound) != std::future_status::ready) {
+        ADD_FAILURE() << "completion was not ready";
+        return completion;
+    }
+    EXPECT_NO_THROW(completion = admission.completion->get());
+    return completion;
+}
+
+void ExpectUnique(const std::vector<std::uint64_t>& values) {
+    for (std::size_t left = 0; left < values.size(); ++left) {
+        for (std::size_t right = left + 1; right < values.size(); ++right) {
+            EXPECT_NE(values[left], values[right]);
+        }
+    }
+}
+
+struct BeforePopThrow {
+    std::shared_ptr<std::latch> arrived;
+    std::shared_ptr<std::latch> release;
+};
+
+BeforePopThrow ArmThrowBeforePop(InferenceScheduler& scheduler, int workers, int throws) {
+    BeforePopThrow gate;
+    gate.arrived = std::make_shared<std::latch>(static_cast<std::ptrdiff_t>(workers));
+    gate.release = std::make_shared<std::latch>(1);
+    auto arrived = gate.arrived;
+    auto release = gate.release;
+    auto budget = std::make_shared<std::atomic<int>>(throws);
+    auto visits = std::make_shared<std::atomic<int>>(0);
+    // The hook runs on every loop. Only the first visit of each worker may
+    // touch the latches; a later count_down would pass zero.
+    SchedulerTestAccess::SetBeforeLoop(scheduler, [arrived, release, budget, visits, workers] {
+        if (visits->fetch_add(1) >= workers) {
+            return;
+        }
+        arrived->count_down();
+        release->wait();
+        if (budget->fetch_sub(1) > 0) {
+            throw std::runtime_error("before pop");
+        }
+    });
+    return gate;
+}
+
+TEST_F(InferenceSchedulerTest, ProducersFillABlockedQueue) {
+    for (const int producers : {2, 4, 8, 16}) {
+        SCOPED_TRACE(producers);
+        auto scheduler = MakeAdd(4, 4);
+        auto blocked = std::make_shared<std::latch>(1);
+        LatchRelease release{blocked};
+        SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+        RequireStart(*scheduler);
+
+        const auto count = static_cast<std::size_t>(producers);
+        std::vector<Admission> admissions(count);
+        std::vector<JoinThread> threads(count);
+        for (int index = 0; index < producers; ++index) {
+            threads[static_cast<std::size_t>(index)].thread = std::thread([&, index] {
+                admissions[static_cast<std::size_t>(index)] =
+                    scheduler->submit(AddInputs(static_cast<float>(index), 0.F, 1.F, 0.F));
+            });
+        }
+        for (JoinThread& thread : threads) {
+            thread.thread.join();
+        }
+
+        const int accepted = producers < 4 ? producers : 4;
+        const int rejected = producers - accepted;
+        int accepted_count = 0;
+        int rejected_count = 0;
+        for (int index = 0; index < producers; ++index) {
+            const Admission& admission = admissions[static_cast<std::size_t>(index)];
+            if (admission.status == AdmissionStatus::kAccepted) {
+                ++accepted_count;
+                EXPECT_TRUE(admission.completion.has_value());
+                EXPECT_FALSE(admission.inputs.has_value());
+            } else {
+                ++rejected_count;
+                ExpectRejectedInputs(admission, AdmissionStatus::kRejectedFull,
+                                     static_cast<float>(index));
+            }
+        }
+        EXPECT_EQ(accepted_count, accepted);
+        EXPECT_EQ(rejected_count, rejected);
+        EXPECT_EQ(scheduler->stats().queue_depth, static_cast<std::uint64_t>(accepted));
+        EXPECT_EQ(scheduler->stats().executing, 0U);
+        EXPECT_EQ(scheduler->stats().rejected_full, static_cast<std::uint64_t>(rejected));
+
+        release.release();
+        std::vector<std::uint64_t> ids;
+        std::vector<std::uint64_t> sequences;
+        for (int index = 0; index < producers; ++index) {
+            Admission& admission = admissions[static_cast<std::size_t>(index)];
+            if (admission.status != AdmissionStatus::kAccepted) {
+                continue;
+            }
+            const SchedulerCompletion completion = TakeBounded(std::move(admission));
+            ExpectSum(completion, static_cast<float>(index) + 1.F, 0.F);
+            EXPECT_EQ(completion.request_id, completion.sequence);
+            ids.push_back(completion.request_id);
+            sequences.push_back(completion.sequence);
+        }
+        ExpectUnique(ids);
+        ExpectUnique(sequences);
+        EXPECT_EQ(ids.size(), static_cast<std::size_t>(accepted));
+        EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind,
+                  SchedulerErrorKind::kNone);
+        ExpectQuiescent(*scheduler, static_cast<std::uint64_t>(accepted), 0, 0, 0);
+        EXPECT_EQ(scheduler->stats().rejected_full, static_cast<std::uint64_t>(rejected));
+    }
+}
+
+TEST_F(InferenceSchedulerTest, ProducersSubmitUntilShutdown) {
+    auto scheduler = MakeAdd(2, 4);
+    constexpr int kProducers = 4;
+    constexpr int kAttempts = 8;
+    ShutdownResult drain;
+    ShutdownResult cancel;
+    std::vector<std::vector<Admission>> records(kProducers);
+    std::vector<JoinThread> producers(kProducers);
+    JoinThread drain_call;
+    JoinThread cancel_call;
+    RequireStart(*scheduler);
+    for (int producer = 0; producer < kProducers; ++producer) {
+        producers[static_cast<std::size_t>(producer)].thread = std::thread([&, producer] {
+            auto& mine = records[static_cast<std::size_t>(producer)];
+            mine.reserve(kAttempts);
+            for (int attempt = 0; attempt < kAttempts; ++attempt) {
+                const float tag = static_cast<float>(producer * kAttempts + attempt);
+                mine.push_back(scheduler->submit(AddInputs(tag, 0.F, 1.F, 0.F)));
+            }
+        });
+    }
+    drain_call.thread = std::thread([&] { drain = scheduler->shutdown(ShutdownPolicy::kDrain); });
+    cancel_call.thread =
+        std::thread([&] { cancel = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    for (JoinThread& thread : producers) {
+        thread.thread.join();
+    }
+    drain_call.thread.join();
+    cancel_call.thread.join();
+
+    EXPECT_EQ(drain.error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(cancel.error.kind, SchedulerErrorKind::kNone);
+    EXPECT_TRUE(drain.established);
+    EXPECT_TRUE(cancel.established);
+    EXPECT_EQ(drain.policy, cancel.policy);
+    EXPECT_NE(drain.changed, cancel.changed);
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+
+    std::uint64_t accepted = 0;
+    std::uint64_t rejected_full = 0;
+    std::uint64_t rejected_closed = 0;
+    std::uint64_t succeeded = 0;
+    std::uint64_t canceled = 0;
+    std::vector<std::uint64_t> ids;
+    for (int producer = 0; producer < kProducers; ++producer) {
+        for (Admission& admission : records[static_cast<std::size_t>(producer)]) {
+            const float tag = static_cast<float>(
+                producer * kAttempts +
+                static_cast<int>(&admission - records[static_cast<std::size_t>(producer)].data()));
+            if (admission.status == AdmissionStatus::kAccepted) {
+                ++accepted;
+                const SchedulerCompletion completion = TakeBounded(std::move(admission));
+                EXPECT_EQ(completion.request_id, completion.sequence);
+                ids.push_back(completion.request_id);
+                if (completion.status == CompletionStatus::kSucceeded) {
+                    ++succeeded;
+                    ExpectSum(completion, tag + 1.F, 0.F);
+                } else if (completion.status == CompletionStatus::kCanceled) {
+                    ++canceled;
+                    EXPECT_TRUE(completion.outputs.empty());
+                    EXPECT_EQ(completion.inference_error.kind, InferenceErrorKind::kNone);
+                } else {
+                    ADD_FAILURE() << "unexpected terminal status";
+                }
+            } else if (admission.status == AdmissionStatus::kRejectedFull) {
+                ++rejected_full;
+                ExpectRejectedInputs(admission, AdmissionStatus::kRejectedFull, tag);
+            } else {
+                ++rejected_closed;
+                ExpectRejectedInputs(admission, AdmissionStatus::kRejectedClosed, tag);
+            }
+        }
+    }
+    EXPECT_EQ(accepted + rejected_full + rejected_closed,
+              static_cast<std::uint64_t>(kProducers * kAttempts));
+    ExpectUnique(ids);
+    EXPECT_EQ(scheduler->stats().rejected_full, rejected_full);
+    EXPECT_EQ(scheduler->stats().rejected_closed, rejected_closed);
+    ExpectQuiescent(*scheduler, succeeded, 0, 0, 0, canceled);
+}
+
+TEST_F(InferenceSchedulerTest, CapacityExcludesExecutingRequests) {
+    auto scheduler = MakeAdd(1, 2);
+    auto before_pop = std::make_shared<std::latch>(1);
+    auto before_run = std::make_shared<std::latch>(1);
+    auto reached = std::make_shared<std::latch>(1);
+    LatchRelease release_pop{before_pop};
+    LatchRelease release_run{before_run};
+    SchedulerTestAccess::SetBeforePop(*scheduler, before_pop);
+    SchedulerTestAccess::SetBeforeRun(*scheduler, before_run);
+    SchedulerTestAccess::SetReachedRun(*scheduler, reached);
+    RequireStart(*scheduler);
+
+    Admission first = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission second = scheduler->submit(AddInputs(5.F, 6.F, 7.F, 8.F));
+    EXPECT_EQ(first.status, AdmissionStatus::kAccepted);
+    EXPECT_EQ(second.status, AdmissionStatus::kAccepted);
+    EXPECT_EQ(scheduler->stats().queue_depth, 2U);
+    EXPECT_EQ(scheduler->stats().executing, 0U);
+    ExpectRejectedInputs(scheduler->submit(AddInputs(8.F, 0.F, 1.F, 0.F)),
+                         AdmissionStatus::kRejectedFull, 8.F);
+
+    release_pop.release();
+    reached->wait();
+    EXPECT_EQ(scheduler->stats().queue_depth, 1U);
+    EXPECT_EQ(scheduler->stats().executing, 1U);
+    Admission third = scheduler->submit(AddInputs(1.F, 0.F, 1.F, 0.F));
+    EXPECT_EQ(third.status, AdmissionStatus::kAccepted);
+    EXPECT_EQ(scheduler->stats().queue_depth, 2U);
+    EXPECT_EQ(scheduler->stats().executing, 1U);
+    ExpectRejectedInputs(scheduler->submit(AddInputs(9.F, 0.F, 1.F, 0.F)),
+                         AdmissionStatus::kRejectedFull, 9.F);
+
+    release_run.release();
+    ExpectSum(TakeBounded(std::move(first)), 4.F, 6.F);
+    ExpectSum(TakeBounded(std::move(second)), 12.F, 14.F);
+    ExpectSum(TakeBounded(std::move(third)), 2.F, 0.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    ExpectQuiescent(*scheduler, 3, 0, 0, 0);
+    EXPECT_EQ(scheduler->stats().rejected_full, 2U);
+}
+
+TEST_F(InferenceSchedulerTest, Capacity1024RejectsTheNextWaitingRequest) {
+    constexpr int kCapacity = 1024;
+    auto scheduler = MakeAdd(1, static_cast<std::size_t>(kCapacity));
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    RequireStart(*scheduler);
+
+    std::vector<Admission> admissions;
+    admissions.reserve(static_cast<std::size_t>(kCapacity));
+    for (int index = 0; index < kCapacity; ++index) {
+        admissions.push_back(
+            scheduler->submit(AddInputs(static_cast<float>(index), 0.F, 1.F, 0.F)));
+        EXPECT_EQ(admissions.back().status, AdmissionStatus::kAccepted);
+    }
+    EXPECT_EQ(scheduler->stats().queue_depth, static_cast<std::uint64_t>(kCapacity));
+    EXPECT_EQ(scheduler->stats().executing, 0U);
+    EXPECT_EQ(scheduler->stats().accepted, static_cast<std::uint64_t>(kCapacity));
+    ExpectRejectedInputs(scheduler->submit(AddInputs(static_cast<float>(kCapacity), 0.F, 1.F, 0.F)),
+                         AdmissionStatus::kRejectedFull, static_cast<float>(kCapacity));
+
+    release.release();
+    std::vector<std::uint64_t> ids;
+    for (int index = 0; index < kCapacity; ++index) {
+        const SchedulerCompletion completion =
+            TakeBounded(std::move(admissions[static_cast<std::size_t>(index)]));
+        ExpectSum(completion, static_cast<float>(index) + 1.F, 0.F);
+        EXPECT_EQ(completion.request_id, completion.sequence);
+        ids.push_back(completion.request_id);
+    }
+    ExpectUnique(ids);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    ExpectQuiescent(*scheduler, static_cast<std::uint64_t>(kCapacity), 0, 0, 0);
+    EXPECT_EQ(scheduler->stats().rejected_full, 1U);
+}
+
+TEST_F(InferenceSchedulerTest, DrainWithProducersAndFollowers) {
+    auto scheduler = MakeAdd(1, 4);
+    auto blocked = std::make_shared<std::latch>(1);
+    auto closed = std::make_shared<std::latch>(1);
+    auto followers = std::make_shared<std::latch>(2);
+    ShutdownResult lead;
+    ShutdownResult follow_a;
+    ShutdownResult follow_b;
+    JoinThread leader;
+    JoinThread follower_a;
+    JoinThread follower_b;
+    constexpr int kLater = 4;
+    std::vector<Admission> later(static_cast<std::size_t>(kLater));
+    std::vector<JoinThread> producers(static_cast<std::size_t>(kLater));
+    // Release the worker before joining a shutdown thread. Joining first would
+    // wait for that worker while it is still blocked on this latch.
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    SchedulerTestAccess::SetShutdownFollowerEntered(*scheduler, followers);
+    RequireStart(*scheduler);
+    Admission first = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission second = scheduler->submit(AddInputs(0.F, 1.F, 1.F, 1.F));
+    EXPECT_EQ(scheduler->stats().queue_depth, 2U);
+
+    leader.thread = std::thread([&] { lead = scheduler->shutdown(ShutdownPolicy::kDrain); });
+    closed->wait();
+    follower_a.thread =
+        std::thread([&] { follow_a = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    follower_b.thread =
+        std::thread([&] { follow_b = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    followers->wait();
+
+    for (int index = 0; index < kLater; ++index) {
+        producers[static_cast<std::size_t>(index)].thread = std::thread([&, index] {
+            later[static_cast<std::size_t>(index)] =
+                scheduler->submit(AddInputs(10.F + static_cast<float>(index), 0.F, 1.F, 0.F));
+        });
+    }
+    for (JoinThread& thread : producers) {
+        thread.thread.join();
+    }
+    for (int index = 0; index < kLater; ++index) {
+        ExpectRejectedInputs(later[static_cast<std::size_t>(index)],
+                             AdmissionStatus::kRejectedClosed, 10.F + static_cast<float>(index));
+    }
+
+    release.release();
+    leader.thread.join();
+    follower_a.thread.join();
+    follower_b.thread.join();
+    ExpectWinner(lead, ShutdownPolicy::kDrain, true);
+    ExpectWinner(follow_a, ShutdownPolicy::kDrain, false);
+    ExpectWinner(follow_b, ShutdownPolicy::kDrain, false);
+    ExpectSum(TakeBounded(std::move(first)), 4.F, 6.F);
+    ExpectSum(TakeBounded(std::move(second)), 1.F, 2.F);
+    EXPECT_TRUE(SchedulerTestAccess::ClosedForDrain(*scheduler));
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+    ExpectQuiescent(*scheduler, 2, 0, 0, 0);
+    EXPECT_EQ(scheduler->stats().canceled, 0U);
+    EXPECT_EQ(scheduler->stats().rejected_closed, static_cast<std::uint64_t>(kLater));
+}
+
+TEST_F(InferenceSchedulerTest, CancelWithProducersAndInFlight) {
+    auto scheduler = MakeAdd(1, 4);
+    auto reached = std::make_shared<std::latch>(1);
+    auto before_run = std::make_shared<std::latch>(1);
+    auto closed = std::make_shared<std::latch>(1);
+    auto followers = std::make_shared<std::latch>(2);
+    ShutdownResult lead;
+    ShutdownResult follow_a;
+    ShutdownResult follow_b;
+    JoinThread leader;
+    JoinThread follower_a;
+    JoinThread follower_b;
+    constexpr int kLater = 4;
+    std::vector<Admission> later(static_cast<std::size_t>(kLater));
+    std::vector<JoinThread> producers(static_cast<std::size_t>(kLater));
+    // Release the in-flight worker before joining shutdown.
+    LatchRelease release{before_run};
+    SchedulerTestAccess::SetReachedRun(*scheduler, reached);
+    SchedulerTestAccess::SetBeforeRun(*scheduler, before_run);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    SchedulerTestAccess::SetShutdownFollowerEntered(*scheduler, followers);
+    RequireStart(*scheduler);
+
+    Admission popped = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    reached->wait();
+    Admission waiting_a = scheduler->submit(AddInputs(1.F, 0.F, 1.F, 0.F));
+    Admission waiting_b = scheduler->submit(AddInputs(2.F, 0.F, 2.F, 0.F));
+    EXPECT_EQ(scheduler->stats().queue_depth, 2U);
+    EXPECT_EQ(scheduler->stats().executing, 1U);
+
+    leader.thread =
+        std::thread([&] { lead = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    closed->wait();
+    EXPECT_TRUE(SchedulerTestAccess::ClosedForCancel(*scheduler));
+    follower_a.thread =
+        std::thread([&] { follow_a = scheduler->shutdown(ShutdownPolicy::kDrain); });
+    follower_b.thread =
+        std::thread([&] { follow_b = scheduler->shutdown(ShutdownPolicy::kDrain); });
+    followers->wait();
+
+    for (int index = 0; index < kLater; ++index) {
+        producers[static_cast<std::size_t>(index)].thread = std::thread([&, index] {
+            later[static_cast<std::size_t>(index)] =
+                scheduler->submit(AddInputs(20.F + static_cast<float>(index), 0.F, 1.F, 0.F));
+        });
+    }
+    for (JoinThread& thread : producers) {
+        thread.thread.join();
+    }
+
+    release.release();
+    leader.thread.join();
+    follower_a.thread.join();
+    follower_b.thread.join();
+
+    ExpectWinner(lead, ShutdownPolicy::kCancelPending, true);
+    ExpectWinner(follow_a, ShutdownPolicy::kCancelPending, false);
+    ExpectWinner(follow_b, ShutdownPolicy::kCancelPending, false);
+    ExpectSum(TakeBounded(std::move(popped)), 4.F, 6.F);
+    ExpectCanceled(TakeBounded(std::move(waiting_a)), 2);
+    ExpectCanceled(TakeBounded(std::move(waiting_b)), 3);
+    for (int index = 0; index < kLater; ++index) {
+        ExpectRejectedInputs(later[static_cast<std::size_t>(index)],
+                             AdmissionStatus::kRejectedClosed, 20.F + static_cast<float>(index));
+    }
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+    ExpectQuiescent(*scheduler, 1, 0, 0, 0, 2);
+    EXPECT_EQ(scheduler->stats().rejected_closed, static_cast<std::uint64_t>(kLater));
+}
+
+TEST_F(InferenceSchedulerTest, UnorderedMixedShutdownSettlesEveryFuture) {
+    auto scheduler = MakeAdd(2, 4);
+    constexpr int kProducers = 4;
+    constexpr int kAttempts = 8;
+    ShutdownResult drain;
+    ShutdownResult cancel;
+    std::vector<std::vector<Admission>> records(kProducers);
+    std::vector<JoinThread> producers(kProducers);
+    JoinThread drain_call;
+    JoinThread cancel_call;
+    RequireStart(*scheduler);
+    for (int producer = 0; producer < kProducers; ++producer) {
+        producers[static_cast<std::size_t>(producer)].thread = std::thread([&, producer] {
+            auto& mine = records[static_cast<std::size_t>(producer)];
+            mine.reserve(kAttempts);
+            for (int attempt = 0; attempt < kAttempts; ++attempt) {
+                const float tag = static_cast<float>(producer * kAttempts + attempt);
+                mine.push_back(scheduler->submit(AddInputs(tag, 0.F, 1.F, 0.F)));
+            }
+        });
+    }
+    drain_call.thread = std::thread([&] { drain = scheduler->shutdown(ShutdownPolicy::kDrain); });
+    cancel_call.thread =
+        std::thread([&] { cancel = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    for (JoinThread& thread : producers) {
+        thread.thread.join();
+    }
+    drain_call.thread.join();
+    cancel_call.thread.join();
+
+    EXPECT_EQ(drain.error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(cancel.error.kind, SchedulerErrorKind::kNone);
+    EXPECT_TRUE(drain.established);
+    EXPECT_TRUE(cancel.established);
+    EXPECT_EQ(drain.policy, cancel.policy);
+    EXPECT_NE(drain.changed, cancel.changed);
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+    if (drain.policy == ShutdownPolicy::kDrain) {
+        EXPECT_TRUE(SchedulerTestAccess::ClosedForDrain(*scheduler));
+    } else {
+        EXPECT_TRUE(SchedulerTestAccess::ClosedForCancel(*scheduler));
+    }
+
+    std::uint64_t accepted = 0;
+    std::uint64_t rejected_full = 0;
+    std::uint64_t rejected_closed = 0;
+    std::uint64_t succeeded = 0;
+    std::uint64_t canceled = 0;
+    std::vector<std::uint64_t> ids;
+    for (int producer = 0; producer < kProducers; ++producer) {
+        int attempt = 0;
+        for (Admission& admission : records[static_cast<std::size_t>(producer)]) {
+            const float tag = static_cast<float>(producer * kAttempts + attempt);
+            ++attempt;
+            if (admission.status == AdmissionStatus::kAccepted) {
+                ++accepted;
+                const SchedulerCompletion completion = TakeBounded(std::move(admission));
+                EXPECT_EQ(completion.request_id, completion.sequence);
+                ids.push_back(completion.request_id);
+                if (completion.status == CompletionStatus::kSucceeded) {
+                    ++succeeded;
+                    ExpectSum(completion, tag + 1.F, 0.F);
+                } else if (completion.status == CompletionStatus::kCanceled) {
+                    ++canceled;
+                    EXPECT_TRUE(completion.outputs.empty());
+                    EXPECT_EQ(completion.inference_error.kind, InferenceErrorKind::kNone);
+                    EXPECT_EQ(drain.policy, ShutdownPolicy::kCancelPending);
+                } else {
+                    ADD_FAILURE() << "unexpected terminal status";
+                }
+            } else if (admission.status == AdmissionStatus::kRejectedFull) {
+                ++rejected_full;
+                ExpectRejectedInputs(admission, AdmissionStatus::kRejectedFull, tag);
+            } else {
+                ++rejected_closed;
+                ExpectRejectedInputs(admission, AdmissionStatus::kRejectedClosed, tag);
+            }
+        }
+    }
+    EXPECT_EQ(accepted + rejected_full + rejected_closed,
+              static_cast<std::uint64_t>(kProducers * kAttempts));
+    ExpectUnique(ids);
+    EXPECT_EQ(scheduler->stats().rejected_full, rejected_full);
+    EXPECT_EQ(scheduler->stats().rejected_closed, rejected_closed);
+    ExpectQuiescent(*scheduler, succeeded, 0, 0, 0, canceled);
+}
+
+TEST_F(InferenceSchedulerTest, OneWorkerRetiresBeforePop) {
+    auto scheduler = MakeAdd(2, 2);
+    const BeforePopThrow gate = ArmThrowBeforePop(*scheduler, 2, 1);
+    LatchRelease release{gate.release};
+    RequireStart(*scheduler);
+    gate.arrived->wait();
+    Admission first = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission second = scheduler->submit(AddInputs(1.F, 0.F, 1.F, 0.F));
+    EXPECT_EQ(scheduler->stats().queue_depth, 2U);
+    release.release();
+    ExpectSum(TakeBounded(std::move(first)), 4.F, 6.F);
+    ExpectSum(TakeBounded(std::move(second)), 2.F, 0.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+    EXPECT_FALSE(SchedulerTestAccess::IsFailed(*scheduler));
+    ExpectQuiescent(*scheduler, 2, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, SeveralWorkersRetireBeforePop) {
+    auto scheduler = MakeAdd(4, 4);
+    const BeforePopThrow gate = ArmThrowBeforePop(*scheduler, 4, 3);
+    LatchRelease release{gate.release};
+    RequireStart(*scheduler);
+    gate.arrived->wait();
+    std::vector<Admission> admissions;
+    for (int index = 0; index < 4; ++index) {
+        admissions.push_back(
+            scheduler->submit(AddInputs(static_cast<float>(index), 0.F, 1.F, 0.F)));
+    }
+    EXPECT_EQ(scheduler->stats().queue_depth, 4U);
+    release.release();
+    for (int index = 0; index < 4; ++index) {
+        ExpectSum(TakeBounded(std::move(admissions[static_cast<std::size_t>(index)])),
+                  static_cast<float>(index) + 1.F, 0.F);
+    }
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+    EXPECT_FALSE(SchedulerTestAccess::IsFailed(*scheduler));
+    ExpectQuiescent(*scheduler, 4, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, LastWorkerThrowsBeforePop) {
+    auto scheduler = MakeAdd(1, 2);
+    const BeforePopThrow gate = ArmThrowBeforePop(*scheduler, 1, 1);
+    LatchRelease release{gate.release};
+    RequireStart(*scheduler);
+    gate.arrived->wait();
+    Admission first = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission second = scheduler->submit(AddInputs(4.F, 0.F, 1.F, 0.F));
+    EXPECT_EQ(scheduler->stats().queue_depth, 2U);
+    release.release();
+    const SchedulerCompletion left = TakeBounded(std::move(first));
+    const SchedulerCompletion right = TakeBounded(std::move(second));
+    EXPECT_EQ(left.status, CompletionStatus::kSchedulerFailed);
+    EXPECT_EQ(right.status, CompletionStatus::kSchedulerFailed);
+    EXPECT_EQ(left.inference_error.message, "no worker");
+    EXPECT_EQ(right.inference_error.message, "no worker");
+    EXPECT_TRUE(left.outputs.empty());
+    EXPECT_TRUE(right.outputs.empty());
+    const ShutdownResult shutdown = scheduler->shutdown(ShutdownPolicy::kDrain);
+    EXPECT_EQ(shutdown.error.kind, SchedulerErrorKind::kNone);
+    EXPECT_FALSE(shutdown.established);
+    EXPECT_FALSE(shutdown.changed);
+    EXPECT_TRUE(SchedulerTestAccess::IsFailed(*scheduler));
+    EXPECT_TRUE(SchedulerTestAccess::ClosedForCancel(*scheduler));
+    ExpectQuiescent(*scheduler, 0, 0, 0, 2);
+}
+
+TEST_F(InferenceSchedulerTest, TwoPoppedWorkersFailWhileSiblingContinues) {
+    auto scheduler = MakeAdd(3, 3);
+    auto gate0 = std::make_shared<std::latch>(1);
+    auto gate1 = std::make_shared<std::latch>(1);
+    auto gate2 = std::make_shared<std::latch>(1);
+    LatchRelease release0{gate0};
+    LatchRelease release1{gate1};
+    LatchRelease release2{gate2};
+    SchedulerTestAccess::SetBeforePopForWorker(*scheduler, 0, gate0);
+    SchedulerTestAccess::SetBeforePopForWorker(*scheduler, 1, gate1);
+    SchedulerTestAccess::SetBeforePopForWorker(*scheduler, 2, gate2);
+    SchedulerTestAccess::SetThrowInWorker(*scheduler, 0);
+    SchedulerTestAccess::SetThrowInWorker(*scheduler, 1);
+    RequireStart(*scheduler);
+
+    release0.release();
+    Admission first = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    const SchedulerCompletion failed_first = TakeBounded(std::move(first));
+    EXPECT_EQ(failed_first.status, CompletionStatus::kWorkerFailed);
+    EXPECT_EQ(failed_first.inference_error.message, "injected");
+    EXPECT_TRUE(failed_first.outputs.empty());
+
+    release1.release();
+    Admission second = scheduler->submit(AddInputs(5.F, 0.F, 1.F, 0.F));
+    const SchedulerCompletion failed_second = TakeBounded(std::move(second));
+    EXPECT_EQ(failed_second.status, CompletionStatus::kWorkerFailed);
+    EXPECT_EQ(failed_second.inference_error.message, "injected");
+
+    release2.release();
+    Admission third = scheduler->submit(AddInputs(2.F, 0.F, 2.F, 0.F));
+    ExpectSum(TakeBounded(std::move(third)), 4.F, 0.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+    EXPECT_FALSE(SchedulerTestAccess::IsFailed(*scheduler));
+    ExpectQuiescent(*scheduler, 1, 0, 2, 0);
+}
+
+TEST_F(InferenceSchedulerTest, DroppedFutureStillCompletes) {
+    auto scheduler = MakeAdd(1, 2);
+    RequireStart(*scheduler);
+    Admission kept = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission dropped = scheduler->submit(AddInputs(1.F, 0.F, 0.F, 1.F));
+    ASSERT_TRUE(dropped.completion.has_value());
+    dropped.completion.reset();
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    ExpectSum(TakeBounded(std::move(kept)), 4.F, 6.F);
+    ExpectQuiescent(*scheduler, 2, 0, 0, 0);
+    EXPECT_EQ(scheduler->stats().canceled, 0U);
+}
+
+TEST_F(InferenceSchedulerTest, AcceptedOutputsDoNotAlias) {
+    auto scheduler = MakeAdd(1, 2);
+    RequireStart(*scheduler);
+    SchedulerCompletion left = TakeBounded(scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F)));
+    SchedulerCompletion right = TakeBounded(scheduler->submit(AddInputs(5.F, 6.F, 7.F, 8.F)));
+    ASSERT_EQ(left.outputs.size(), 1U);
+    ASSERT_EQ(right.outputs.size(), 1U);
+    const float right_first = right.outputs[0].values[0];
+    const float right_second = right.outputs[0].values[1];
+    left.outputs[0].values[0] = 42.F;
+    EXPECT_FLOAT_EQ(right.outputs[0].values[0], right_first);
+    EXPECT_FLOAT_EQ(right.outputs[0].values[1], right_second);
+    EXPECT_FLOAT_EQ(left.outputs[0].values[0], 42.F);
+    scheduler.reset();
+    EXPECT_FLOAT_EQ(left.outputs[0].values[0], 42.F);
+    EXPECT_FLOAT_EQ(right.outputs[0].values[0], right_first);
+    EXPECT_FLOAT_EQ(right.outputs[0].values[1], right_second);
+}
+
+TEST_F(InferenceSchedulerTest, MnistInputReleasedAfterAccept) {
+    constexpr std::size_t kInputCount = 784;
+    constexpr std::size_t kLogitCount = 10;
+    const std::filesystem::path root{INFEREDGE_MNIST_FIXTURE_DIR};
+    std::vector<float> image = ReadFloats(root / "inputs" / "test_00000.f32", kInputCount);
+    const std::vector<float> reference = ReadFloats(root / "onnx" / "test_00000.f32", kLogitCount);
+    ASSERT_EQ(image.size(), kInputCount);
+    ASSERT_EQ(reference.size(), kLogitCount);
+
+    auto scheduler = MakeScheduler(SchedulerConfig{INFEREDGE_MNIST_MODEL_PATH, 1, 1});
+    RequireStart(*scheduler);
+    std::vector<NamedTensor> caller{
+        NamedTensor{"image", {static_cast<std::int64_t>(kInputCount)}, image}};
+    Admission admission = scheduler->submit(caller);
+    caller.clear();
+    caller.shrink_to_fit();
+    image.clear();
+    image.shrink_to_fit();
+    SchedulerCompletion completion = TakeBounded(std::move(admission));
+    ASSERT_EQ(completion.status, CompletionStatus::kSucceeded);
+    ASSERT_EQ(completion.outputs.size(), 1U);
+    EXPECT_EQ(completion.outputs[0].name, "logits");
+    ASSERT_EQ(completion.outputs[0].values.size(), kLogitCount);
+    EXPECT_EQ(ArgMax(completion.outputs[0].values), 7);
+    for (std::size_t index = 0; index < kLogitCount; ++index) {
+        const double actual = completion.outputs[0].values[index];
+        const double expected = reference[index];
+        const double difference = std::fabs(actual - expected);
+        const double limit = 1e-5 + 1e-4 * std::fabs(expected);
+        EXPECT_LE(difference, limit) << index;
+    }
+    const float first_logit = completion.outputs[0].values[0];
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    ExpectQuiescent(*scheduler, 1, 0, 0, 0);
+    scheduler.reset();
+    EXPECT_FLOAT_EQ(completion.outputs[0].values[0], first_logit);
+    EXPECT_EQ(ArgMax(completion.outputs[0].values), 7);
+}
+
+TEST_F(InferenceSchedulerTest, MnistQueuedCancelHasEmptyOutputs) {
+    constexpr std::size_t kInputCount = 784;
+    const std::filesystem::path root{INFEREDGE_MNIST_FIXTURE_DIR};
+    const std::vector<float> image = ReadFloats(root / "inputs" / "test_00000.f32", kInputCount);
+    ASSERT_EQ(image.size(), kInputCount);
+    auto scheduler = MakeScheduler(SchedulerConfig{INFEREDGE_MNIST_MODEL_PATH, 1, 1});
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    RequireStart(*scheduler);
+    Admission admission =
+        scheduler->submit({NamedTensor{"image", {static_cast<std::int64_t>(kInputCount)}, image}});
+    EXPECT_EQ(scheduler->stats().queue_depth, 1U);
+    EXPECT_EQ(scheduler->stats().executing, 0U);
+    ExpectWinner(CancelWhileBlocked(*scheduler, release), ShutdownPolicy::kCancelPending, true);
+    ExpectCanceled(TakeBounded(std::move(admission)), 1);
+    ExpectQuiescent(*scheduler, 0, 0, 0, 0, 1);
+}
+
+TEST_F(InferenceSchedulerTest, RepeatedSchedulerLifetime) {
+    for (int cycle = 0; cycle < 8; ++cycle) {
+        SCOPED_TRACE(cycle);
+        auto scheduler = MakeAdd(1, 2);
+        RequireStart(*scheduler);
+        const float base = static_cast<float>(cycle);
+        Admission first = scheduler->submit(AddInputs(base, 0.F, 1.F, 0.F));
+        Admission second = scheduler->submit(AddInputs(base + 1.F, 0.F, 1.F, 0.F));
+        ASSERT_TRUE(first.completion.has_value());
+        ASSERT_TRUE(second.completion.has_value());
+        std::future<SchedulerCompletion> left = std::move(*first.completion);
+        std::future<SchedulerCompletion> right = std::move(*second.completion);
+        scheduler.reset();
+        ASSERT_EQ(left.wait_for(std::chrono::seconds{0}), std::future_status::ready);
+        ASSERT_EQ(right.wait_for(std::chrono::seconds{0}), std::future_status::ready);
+        SchedulerCompletion left_completion;
+        SchedulerCompletion right_completion;
+        EXPECT_NO_THROW(left_completion = left.get());
+        EXPECT_NO_THROW(right_completion = right.get());
+        ExpectSum(left_completion, base + 1.F, 0.F);
+        ExpectSum(right_completion, base + 2.F, 0.F);
+    }
 }
 
 } // namespace

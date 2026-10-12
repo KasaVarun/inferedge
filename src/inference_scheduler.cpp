@@ -3,6 +3,7 @@
 #include "inferedge/bounded_queue.hpp"
 #include "inferedge/concurrent_inference.hpp"
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -176,10 +177,16 @@ struct InferenceScheduler::Impl {
 
     std::atomic<bool> fail_close_cancel_{false};
     std::atomic<bool> fail_join_settle_{false};
-    std::atomic<bool> throw_consumed_{false};
+    // Test-only. any_throw_armed_ keeps an inactive worker to one atomic load.
+    // Each armed worker consumes its own flag once, after it has popped.
+    std::atomic<bool> any_throw_armed_{false};
+    std::array<std::atomic<bool>, kMaxSchedulerWorkers> throw_armed_{};
     std::optional<std::uint32_t> stop_after_;
-    std::optional<std::uint32_t> throw_in_worker_;
     std::shared_ptr<std::latch> before_pop_;
+    // Test-only per-worker pause before wait_pop. The flag stays false unless
+    // a test stores a latch, so production does not touch the array.
+    std::atomic<bool> worker_pop_gate_armed_{false};
+    std::array<std::shared_ptr<std::latch>, kMaxSchedulerWorkers> worker_pop_gate_{};
     std::function<void()> before_loop_hook_;
     std::shared_ptr<std::latch> reached_run_;
     std::shared_ptr<std::latch> before_run_;
@@ -351,6 +358,13 @@ void InferenceScheduler::Impl::WorkerMain(std::uint32_t index, InferenceEngine* 
                 hold != nullptr && index > 0) {
                 hold->wait();
             }
+            if (worker_pop_gate_armed_.load(std::memory_order_acquire) &&
+                index < worker_pop_gate_.size()) {
+                if (const std::shared_ptr<std::latch> gate = worker_pop_gate_[index];
+                    gate != nullptr) {
+                    gate->wait();
+                }
+            }
             if (const std::shared_ptr<std::latch> before_pop = before_pop_; before_pop != nullptr) {
                 before_pop->wait();
             }
@@ -430,11 +444,11 @@ void InferenceScheduler::Impl::WorkerMain(std::uint32_t index, InferenceEngine* 
 }
 
 bool InferenceScheduler::Impl::ConsumeThrow(std::uint32_t index) {
-    if (!throw_in_worker_.has_value() || *throw_in_worker_ != index) {
+    if (!any_throw_armed_.load(std::memory_order_acquire) || index >= throw_armed_.size()) {
         return false;
     }
-    bool expected = false;
-    return throw_consumed_.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+    bool expected = true;
+    return throw_armed_[index].compare_exchange_strong(expected, false, std::memory_order_acq_rel);
 }
 
 CompletionStatus InferenceScheduler::Impl::Execute(InferenceEngine& engine, RequestEntry& entry) {
@@ -1060,7 +1074,20 @@ void SchedulerTestAccess::SetStopAfterStartingWorkers(InferenceScheduler& schedu
 }
 
 void SchedulerTestAccess::SetThrowInWorker(InferenceScheduler& scheduler, std::uint32_t index) {
-    scheduler.impl_->throw_in_worker_ = index;
+    if (index >= scheduler.impl_->throw_armed_.size()) {
+        return;
+    }
+    scheduler.impl_->throw_armed_[index].store(true, std::memory_order_release);
+    scheduler.impl_->any_throw_armed_.store(true, std::memory_order_release);
+}
+
+void SchedulerTestAccess::SetBeforePopForWorker(InferenceScheduler& scheduler, std::uint32_t index,
+                                                std::shared_ptr<std::latch> latch) {
+    if (index >= scheduler.impl_->worker_pop_gate_.size()) {
+        return;
+    }
+    scheduler.impl_->worker_pop_gate_[index] = std::move(latch);
+    scheduler.impl_->worker_pop_gate_armed_.store(true, std::memory_order_release);
 }
 
 void SchedulerTestAccess::SetBeforePop(InferenceScheduler& scheduler,

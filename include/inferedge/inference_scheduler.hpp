@@ -163,8 +163,15 @@ private:
 class SchedulerTestAccess {
 public:
     static void SetStopAfterStartingWorkers(InferenceScheduler& scheduler, std::uint32_t count);
+    // Arms that worker to fail the next request it has already popped, once.
+    // Calling it for several indices arms each worker independently. An unarmed
+    // worker does not throw. Production runs leave every flag false.
     static void SetThrowInWorker(InferenceScheduler& scheduler, std::uint32_t index);
     static void SetBeforePop(InferenceScheduler& scheduler, std::shared_ptr<std::latch> latch);
+    // Holds one worker before wait_pop. Set it before start(). A null slot
+    // does not wait. This is how a test chooses which worker pops.
+    static void SetBeforePopForWorker(InferenceScheduler& scheduler, std::uint32_t index,
+                                      std::shared_ptr<std::latch> latch);
     // Runs at the start of every worker loop, before wait_pop. Set it before
     // start(). It must not call back into the scheduler.
     static void SetBeforeLoop(InferenceScheduler& scheduler, std::function<void()> hook);
