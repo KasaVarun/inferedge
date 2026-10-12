@@ -20,8 +20,8 @@ The executable runs one fixed rank-1 float32 model and still answers `--help` an
 | GoogleTest unit tests | CUDA, TensorRT, or CoreML provider setup |
 | Synchronous float32 `InferenceEngine` | Concurrent `run()` on one engine |
 | clang-format 23.1.3 and Linux GitHub Actions | A production inference API |
-| Injected-duration statistics, `run_benchmark`, and `inferedge-bench` text or JSON reports | A concurrent CLI, JSON schema version 2, or a collected concurrent baseline |
-| Concurrent benchmark library, one session per worker | A measured concurrency speedup |
+| Injected-duration statistics, `run_benchmark`, and `inferedge-bench` text or JSON schema version 1 | A collected concurrent performance baseline |
+| Concurrent benchmark library and `inferedge-bench-concurrent` JSON schema version 2, one session per worker | A measured concurrency speedup |
 
 Version: **0.1.0**
 
@@ -152,7 +152,7 @@ This library does not make one `InferenceEngine` thread-safe. It has no request 
 
 ## Concurrent benchmark runner
 
-`run_concurrent_benchmark` lives in `inferedge_concurrent_benchmark` (`include/inferedge/concurrent_benchmark.hpp`). It loads one `InferenceEngine` per worker before starting threads, using the same CPU session as the rest of the runtime: one intra-op thread and graph optimizations disabled. Each worker calls `run()` only on its own engine. Workers do not share input buffers. There is no concurrent CLI, and no concurrent performance baseline has been collected.
+`run_concurrent_benchmark` lives in `inferedge_concurrent_benchmark` (`include/inferedge/concurrent_benchmark.hpp`). It loads one `InferenceEngine` per worker before starting threads, using the same CPU session as the rest of the runtime: one intra-op thread and graph optimizations disabled. Each worker calls `run()` only on its own engine. Workers do not share input buffers. `inferedge-bench-concurrent` is the command-line wrapper. No concurrent performance baseline has been collected.
 
 Warmup runs on each engine before a shared start gate. Every warmup output is checked, and those durations are discarded. Warmup may be zero. After every worker arrives, the coordinator records one `steady_clock::now()` and releases the gate. A failure before that release cancels the gate and joins every thread that was created. A fixed-size barrier is not used, so a thread that was never created cannot leave the others waiting.
 
@@ -162,7 +162,79 @@ Each measured sample is the clock immediately before `engine.run` and immediatel
 
 Numeric comparison matches the sequential runner: `abs(actual - expected) <= absolute_tolerance + relative_tolerance * abs(expected)`. Warmup compares every call. Measured calls always reject an inference error, a missing output, a shape or count mismatch, and a non-finite value. Value comparison uses 1-based iterations, every `correctness_check_interval` iteration, and always the last iteration. Add references use zero tolerance. MNIST references use `rtol = 1e-4` and `atol = 1e-5`. Any failure discards the report. Output tensors are not kept.
 
-Worker count must be from 1 through 64 and must match the assignment list. Warmup and measured counts above 100,000 are rejected, as is a measured count of zero, a check interval of zero, or a worker and measured-iteration product that overflows. `inferedge` and `inferedge-bench` do not link this library. JSON schema version 1 is unchanged.
+Worker count must be from 1 through 64 and must match the assignment list. Warmup and measured counts above 100,000 are rejected, as is a measured count of zero, a check interval of zero, or a worker and measured-iteration product that overflows. `inferedge` and `inferedge-bench` do not link this library. `inferedge-bench-concurrent` does. JSON schema version 1 is unchanged.
+
+## Concurrent benchmark command
+
+`inferedge-bench-concurrent` is a separate executable. It links `inferedge_concurrent_benchmark_cli`, which links `inferedge_concurrent_benchmark`. `inferedge` and `inferedge-bench` do not link that library. The command parses arguments, prepares one workload, loads the model once to check metadata, destroys that probe session, copies the inputs into one owned assignment per worker, and calls `run_concurrent_benchmark`. It does not run the worker loop itself. Fault-injection options on `ConcurrentBenchmarkConfig` stay unset. The default report is text. `--format json` writes schema version 2.
+
+```bash
+export ORT_DISABLE_TELEMETRY=1
+./build/inferedge-bench-concurrent --help
+./build/inferedge-bench-concurrent \
+  --model models/add_f32.onnx \
+  --workload add \
+  --concurrency 2 \
+  --warmup 10 \
+  --iterations 100
+./build/inferedge-bench-concurrent \
+  --model models/mnist_mlp.onnx \
+  --workload mnist \
+  --concurrency 2 \
+  --fixture test_00003 \
+  --format json
+```
+
+`--model`, `--workload`, and `--concurrency` are required. `--concurrency` has no default and is not clamped: it must be an integer from 1 through 64. `--workload` is `add` or `mnist`. `--warmup` defaults to 10 and may be 0. `--iterations` defaults to 100. `--check-interval` defaults to 1. Measured iterations and the check interval must be from 1 through 100000. `--format` is `text` or `json` and defaults to text. `--help`, `-h`, `--version`, and `-V` are standalone and exit 0. With no arguments, the program prints help and exits 0. `--flag value` and `--flag=value` are both accepted. Duplicate flags, unknown flags, and non-numeric counts are usage errors. `std::from_chars` must consume each count. A value that does not fit in a 32-bit unsigned integer is an overflow. A separate argument that starts with `-` is an option, so a negative count has to be written as `--concurrency=-1`, and that form is rejected.
+
+The Add workload uses `A = [1, 2]`, `B = [3, 4]`, and expected `C = [4, 6]`, compared exactly. `--fixture` and `--fixture-dir` are rejected for Add. The MNIST workload reads the committed `inputs/<id>.f32` and `onnx/<id>.f32` files. The default id is `test_00003`. The command checks tensor names, float32 rank-1 shapes, byte length, finite values, and the catalog reference class before the model runs. Comparison uses `rtol = 1e-4` and `atol = 1e-5`. The prepared inputs are copied so each worker owns its own float storage. Those copies stay alive until `run_concurrent_benchmark` returns.
+
+Each worker has its own `InferenceEngine`. Each session uses one intra-op thread and graph optimizations disabled. Inference is CPU only. There is no request queue, no batching, and no scheduler. The text report states that aggregate throughput divides completed requests by the shared wall-clock duration, and active-call throughput divides them by the sum of per-call durations. Neither figure is production server capacity. No concurrency speedup has been measured.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Help, version, or a completed benchmark |
+| 2 | Invalid command line |
+| 3 | The model file is missing, invalid, or not a float32 tensor |
+| 4 | The fixture directory or file is missing, unreadable, the wrong size, non-finite, the wrong reference class, or a fixture filesystem or I/O exception |
+| 5 | Inference failed during warmup or a measured call |
+| 6 | Loaded metadata does not match the workload |
+| 7 | An output failed the correctness check |
+| 8 | A worker failed to start, a worker exception, timing, statistics, JSON serialization, or an unexpected internal error |
+
+Successful text goes to stdout. Errors go to stderr as `error: ...`. A usage error also reprints the help text. A failure does not print a benchmark report. When the runner reports a worker and iteration, the diagnostic includes them. A fixture filesystem exception, such as a symlink loop or a permission error while stating a fixture path, is exit 4 and includes the filesystem reason. An unexpected exception from another step is exit 8 and is reported as `error: internal error: ` followed by the exception text. A JSON failure exits 8, writes the reason to stderr, and leaves stdout empty. The JSON document is assembled completely before it is written.
+
+### JSON schema version 2
+
+`--format json` prints one JSON object and a newline. The document is built in memory and written only after it passes the checks below. Schema version 1 is a different writer and is not used here.
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | Integer `2` |
+| `tool.name` | `inferedge-bench-concurrent` |
+| `tool.version` | The `inferedge` version string |
+| `model` | Model path as typed |
+| `workload` | `add` or `mnist` |
+| `fixture` | JSON `null` for Add. For MNIST, the selected fixture id |
+| `backend` | `ONNX Runtime CPU` |
+| `configuration.worker_count` | Workers. It matches `--concurrency` |
+| `configuration.session_ownership` | `one_inference_engine_per_worker` |
+| `configuration.onnx_intra_op_threads_per_session` | `1` |
+| `configuration.graph_optimizations` | `disabled` |
+| `configuration.warmup_iterations_per_worker` | Unmeasured calls on each worker |
+| `configuration.measured_iterations_per_worker` | Measured calls on each worker |
+| `configuration.correctness_check_interval` | Numeric check interval |
+| `latency_microseconds.sample_count` | Pooled measured samples. It equals the total completed requests |
+| `latency_microseconds.minimum`, `mean`, `p50`, `p95`, `p99`, `maximum` | Summary values, in microseconds |
+| `latency_microseconds.population_standard_deviation` | Population standard deviation, in microseconds |
+| `measurement_wall_microseconds` | Shared wall interval, in microseconds |
+| `total_completed_requests` | `worker_count * measured_iterations_per_worker` |
+| `per_worker_completed_requests` | One count per worker, each equal to the measured iteration count |
+| `aggregate_completed_requests_per_second` | Completed requests divided by the shared wall interval |
+| `active_call_requests_per_second` | Completed requests divided by the sum of per-call durations |
+| `correctness` | `passed`. JSON is written only after a successful run |
+
+Counts are JSON integers. Durations and both throughput rates are JSON numbers from `std::to_chars` in general format. Raw per-request samples are not serialized. The writer rejects a worker count below 1, a per-worker list whose length or values disagree with the measured work, a sample count that disagrees with the completed requests, a non-positive wall duration, a non-positive throughput, a non-finite metric, a negative latency, percentiles out of order, a negative standard deviation including negative zero, an aggregate rate that does not match the wall interval, and a string that is not valid UTF-8. Quotes, backslashes, and ASCII controls are escaped. An inconsistent report produces no JSON.
 
 ## Latency statistics
 
@@ -322,6 +394,7 @@ One command accepts at most 64 named inputs and 1,048,576 floats in total, with 
 - The CLI runs fixed rank-1 float32 inputs only. It does not accept a dynamic dimension or a rank other than 1.
 - There is no scheduler, request queue, thread pool, or batching API.
 - `inferedge-bench` does not publish a speed figure. It runs the Add and MNIST workloads only. P99 from a short sample is the nearest-rank element, often the maximum. The default fixture directory is fixed at configure time. JSON schema version 1 omits hardware, build configuration, the model hash, and raw latency samples.
+- `inferedge-bench-concurrent` is CPU inference only. Each worker has one independent session, one intra-op thread, and graph optimizations disabled. It has no request queue, batching, scheduler, or production server. No concurrency speedup has been measured, and no concurrent performance baseline has been collected. JSON schema version 2 omits raw samples, hardware, build configuration, and a model hash.
 - The engine runs one synchronous `float32` model on CPU, with one intra-op thread and graph optimizations disabled.
 - Each `run` copies input floats and output floats. This is not zero-copy execution.
 - Concurrent `run()` calls are not supported.
@@ -338,6 +411,7 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ./build/inferedge --version
 ./build/inferedge-bench --help
+./build/inferedge-bench-concurrent --help
 ```
 
 Use `Release` for an optimized build. Ninja is a single-configuration generator, so the build type is chosen at configure time. Reconfigure into a separate directory if you want both trees at once:
@@ -357,7 +431,7 @@ Project targets compile as C++20 with extensions off (`-std=c++20`, not `gnu++20
 ctest --test-dir build --output-on-failure
 ```
 
-`ctest` runs the project tests, the ONNX Runtime tests (version check, direct Add execution, `InferenceEngine`, and the MNIST MLP fixtures), process tests that spawn `inferedge`, and two direct checks: `inferedge --help` and `inferedge --version`.
+`ctest` runs the project tests, the ONNX Runtime tests (version check, direct Add execution, `InferenceEngine`, and the MNIST MLP fixtures), process tests that spawn `inferedge`, `inferedge-bench`, and `inferedge-bench-concurrent`, and direct checks for `--help` and `--version` on each executable.
 
 To run the binaries directly:
 
@@ -387,7 +461,7 @@ tests/               GoogleTest sources
 .github/workflows/   Linux CI
 ```
 
-`inferedge_core` is a static library. It contains `parse_cli` and does not link ONNX Runtime. The `inferedge` executable links `inferedge_core` and `inferedge_onnx`. `src/run_command.cpp` is compiled into that executable, and its `main` only parses arguments, runs a model when asked, and prints the result. `inferedge-bench` is a second executable. It links `inferedge_benchmark_cli` and does not add benchmark code to `inferedge`.
+`inferedge_core` is a static library. It contains `parse_cli` and does not link ONNX Runtime. The `inferedge` executable links `inferedge_core` and `inferedge_onnx`. `src/run_command.cpp` is compiled into that executable, and its `main` only parses arguments, runs a model when asked, and prints the result. `inferedge-bench` links `inferedge_benchmark_cli` and does not add benchmark code to `inferedge`. `inferedge-bench-concurrent` links `inferedge_concurrent_benchmark_cli`. That library is not linked into `inferedge` or `inferedge-bench`.
 
 ## How a C++ build works
 
