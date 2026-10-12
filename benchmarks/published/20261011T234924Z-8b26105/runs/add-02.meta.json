@@ -1,0 +1,25 @@
+{
+  "trial_id": "add-02",
+  "accepted": true,
+  "command": [
+    "build-baseline/inferedge-bench",
+    "--model",
+    "models/add_f32.onnx",
+    "--workload",
+    "add",
+    "--warmup",
+    "100",
+    "--iterations",
+    "1000",
+    "--check-interval",
+    "1",
+    "--format",
+    "json"
+  ],
+  "started_utc": "2026-10-11T23:49:44Z",
+  "finished_utc": "2026-10-11T23:49:44Z",
+  "returncode": 0,
+  "stdout_path": "benchmarks/baselines/20261011T234924Z-8b26105/runs/add-02.stdout",
+  "stderr_path": "benchmarks/baselines/20261011T234924Z-8b26105/runs/add-02.stderr",
+  "problems": []
+}

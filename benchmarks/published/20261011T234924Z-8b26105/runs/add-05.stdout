@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "tool": {
+    "name": "inferedge-bench",
+    "version": "0.1.0"
+  },
+  "model": "models/add_f32.onnx",
+  "workload": "add",
+  "fixture": null,
+  "backend": "ONNX Runtime CPU",
+  "configuration": {
+    "warmup_iterations": 100,
+    "measured_iterations": 1000,
+    "correctness_check_interval": 1,
+    "calling_threads": 1,
+    "onnx_intra_op_threads": 1,
+    "graph_optimizations": "disabled"
+  },
+  "latency_microseconds": {
+    "sample_count": 1000,
+    "minimum": 1.458,
+    "mean": 1.5562,
+    "p50": 1.541,
+    "p95": 1.709,
+    "p99": 1.917,
+    "maximum": 10.666,
+    "population_standard_deviation": 0.30921204051588935
+  },
+  "measurement_loop_microseconds": 1600.375,
+  "throughput_requests_per_second": {
+    "active_call": 642590.9266161162,
+    "observed_sequential": 624853.5499492306
+  },
+  "correctness": "passed"
+}

@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "tool": {
+    "name": "inferedge-bench",
+    "version": "0.1.0"
+  },
+  "model": "models/mnist_mlp.onnx",
+  "workload": "mnist",
+  "fixture": "test_00003",
+  "backend": "ONNX Runtime CPU",
+  "configuration": {
+    "warmup_iterations": 100,
+    "measured_iterations": 1000,
+    "correctness_check_interval": 1,
+    "calling_threads": 1,
+    "onnx_intra_op_threads": 1,
+    "graph_optimizations": "disabled"
+  },
+  "latency_microseconds": {
+    "sample_count": 1000,
+    "minimum": 6,
+    "mean": 7.357575,
+    "p50": 7.375,
+    "p95": 7.625,
+    "p99": 11.375,
+    "maximum": 51.875,
+    "population_standard_deviation": 1.6558738642707662
+  },
+  "measurement_loop_microseconds": 7444.875,
+  "throughput_requests_per_second": {
+    "active_call": 135914.34677866008,
+    "observed_sequential": 134320.58966738865
+  },
+  "correctness": "passed"
+}

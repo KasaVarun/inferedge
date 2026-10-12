@@ -1,0 +1,83 @@
+{
+  "run_set_id": "20261011T234924Z-8b26105",
+  "status": "completed",
+  "aggregate": null,
+  "queried": {
+    "git_commit": "8b26105f5971035a38af6227bc34ca11589327f7",
+    "git_status_porcelain": "?? models/experiments/\n",
+    "approved_untracked_paths": [
+      "models/experiments"
+    ],
+    "started_utc": "2026-10-11T23:49:24Z",
+    "operating_system": "Darwin",
+    "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+    "macos_version": "27.0.1",
+    "hardware_model": "Mac17,8",
+    "hardware_model_error": null,
+    "cpu_architecture": "arm64",
+    "compiler_path": "/usr/bin/c++",
+    "compiler_version": "Apple clang version 21.0.0 (clang-2100.3.34.2)\nTarget: arm64-apple-darwin27.0.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin\n",
+    "cmake_version": "cmake version 4.4.4\n\nCMake suite maintained and supported by Kitware (kitware.com/cmake).\n",
+    "benchmark_binary_path": "build-baseline/inferedge-bench",
+    "benchmark_binary_sha256": "871c094371fc8678fe11534f80bb5e5a21adbe51ab4dfd59570b01b2a68c9e39",
+    "benchmark_tool_version": "0.1.0",
+    "onnxruntime_link_output": "build-baseline/inferedge-bench:\n\t@rpath/libonnxruntime.1.dylib (compatibility version 1.0.0, current version 1.31.0)\n\t/usr/lib/libc++.1.dylib (compatibility version 1.0.0, current version 2200.27.0)\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1359.0.0)\n",
+    "onnxruntime_resolved_library": "build-baseline/_deps/onnxruntime/onnxruntime-osx-arm64-1.31.0/lib/libonnxruntime.1.31.0.dylib"
+  },
+  "verified_configuration": {
+    "cmake_build_type": "Release",
+    "cmake_cxx_flags": "",
+    "cmake_cxx_flags_release": "-O3 -DNDEBUG",
+    "cmake_exe_linker_flags": "",
+    "cmake_exe_linker_flags_release": "",
+    "sanitizer_instrumentation": "absent",
+    "onnxruntime_version": "1.31.0",
+    "add_model_path": "models/add_f32.onnx",
+    "add_model_sha256": "37eb1b1b1adee439d2d14b91a0b217bd15ab809610d1271ea821d56e6400a447",
+    "mnist_model_path": "models/mnist_mlp.onnx",
+    "mnist_model_sha256": "3473a4b2673fe4353c2b3a04a7d432717a4dfcdc42fc217565c99743542d8cce",
+    "mnist_fixture_directory": "models/fixtures/mnist",
+    "mnist_fixture_id": "test_00003"
+  },
+  "source_defined_policy": {
+    "backend": "ONNX Runtime CPU",
+    "calling_threads": 1,
+    "onnx_intra_op_threads": 1,
+    "graph_optimizations": "disabled",
+    "onnxruntime_version_pin": "1.31.0",
+    "allowed_untracked_roots": [
+      "models/experiments"
+    ],
+    "note": "InferenceEngine sets one intra-op thread, ORT_DISABLE_ALL, and the CPU provider. run_benchmark uses the calling thread. These values are source policy, not a hardware probe."
+  },
+  "collection_protocol": {
+    "workloads": [
+      "add",
+      "mnist"
+    ],
+    "warmup_iterations": 100,
+    "measured_iterations": 1000,
+    "correctness_check_interval": 1,
+    "counted_runs_per_workload": 5,
+    "pilots": [
+      "pilot-add",
+      "pilot-mnist"
+    ],
+    "trial_order": [
+      "pilot-add",
+      "pilot-mnist",
+      "add-01",
+      "mnist-01",
+      "add-02",
+      "mnist-02",
+      "add-03",
+      "mnist-03",
+      "add-04",
+      "mnist-04",
+      "add-05",
+      "mnist-05"
+    ],
+    "inter_trial_delay_seconds": 5.0,
+    "environment_variable": "ORT_DISABLE_TELEMETRY=1"
+  }
+}

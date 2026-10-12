@@ -1,0 +1,29 @@
+{
+  "trial_id": "mnist-03",
+  "accepted": true,
+  "command": [
+    "build-baseline/inferedge-bench",
+    "--model",
+    "models/mnist_mlp.onnx",
+    "--workload",
+    "mnist",
+    "--fixture",
+    "test_00003",
+    "--fixture-dir",
+    "models/fixtures/mnist",
+    "--warmup",
+    "100",
+    "--iterations",
+    "1000",
+    "--check-interval",
+    "1",
+    "--format",
+    "json"
+  ],
+  "started_utc": "2026-10-11T23:49:59Z",
+  "finished_utc": "2026-10-11T23:49:59Z",
+  "returncode": 0,
+  "stdout_path": "benchmarks/baselines/20261011T234924Z-8b26105/runs/mnist-03.stdout",
+  "stderr_path": "benchmarks/baselines/20261011T234924Z-8b26105/runs/mnist-03.stderr",
+  "problems": []
+}
