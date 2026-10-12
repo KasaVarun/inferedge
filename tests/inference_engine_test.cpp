@@ -21,6 +21,10 @@
 #error "CMake must define INFEREDGE_INT64_MODEL_PATH"
 #endif
 
+#ifndef INFEREDGE_BATCH_ADD_MODEL_PATH
+#error "CMake must define INFEREDGE_BATCH_ADD_MODEL_PATH"
+#endif
+
 namespace {
 
 using inferedge::ElementType;
@@ -55,6 +59,29 @@ InferenceResult RunAdd(InferenceEngine& engine, const std::vector<float>& left,
     }
     const NamedTensorView ordered[] = {first, second};
     return engine.run(ordered);
+}
+
+EngineLoad LoadBatchAddModel() {
+    return load_inference_engine(INFEREDGE_BATCH_ADD_MODEL_PATH);
+}
+
+InferenceResult RunBatchAdd(InferenceEngine& engine, const std::vector<float>& left,
+                            const std::vector<float>& right, std::int64_t rows) {
+    const NamedTensorView inputs[] = {View("A", {rows, 2}, left), View("B", {rows, 2}, right)};
+    return engine.run(inputs);
+}
+
+void ExpectBatchAdd(const InferenceResult& result, std::int64_t rows,
+                    const std::vector<float>& expected) {
+    ASSERT_EQ(result.error.kind, InferenceErrorKind::kNone);
+    EXPECT_TRUE(result.error.message.empty());
+    ASSERT_EQ(result.outputs.size(), 1U);
+    const inferedge::NamedTensor& output = result.outputs.front();
+    EXPECT_EQ(output.name, "C");
+    ASSERT_EQ(output.shape.size(), 2U);
+    EXPECT_EQ(output.shape[0], rows);
+    EXPECT_EQ(output.shape[1], 2);
+    EXPECT_EQ(output.values, expected);
 }
 
 void ExpectAdd(const InferenceResult& result, float first, float second) {
@@ -314,4 +341,134 @@ TEST_F(InferenceEngineTest, StaysUsableAfterARejectedRequest) {
 
     const std::vector<float> right{3.0f, 4.0f};
     ExpectAdd(RunAdd(*loaded.engine, left, right, false), 4.0f, 6.0f);
+}
+
+TEST_F(InferenceEngineTest, ExecutesBatchAddWithOneRow) {
+    EngineLoad loaded = LoadBatchAddModel();
+    ASSERT_NE(loaded.engine, nullptr);
+    const std::vector<float> left{1.0f, 2.0f};
+    const std::vector<float> right{3.0f, 4.0f};
+    ExpectBatchAdd(RunBatchAdd(*loaded.engine, left, right, 1), 1, {4.0f, 6.0f});
+}
+
+TEST_F(InferenceEngineTest, ExecutesBatchAddWithTwoRows) {
+    EngineLoad loaded = LoadBatchAddModel();
+    ASSERT_NE(loaded.engine, nullptr);
+    const std::vector<float> left{1.0f, 2.0f, 5.0f, 6.0f};
+    const std::vector<float> right{3.0f, 4.0f, 7.0f, 8.0f};
+    ExpectBatchAdd(RunBatchAdd(*loaded.engine, left, right, 2), 2, {4.0f, 6.0f, 12.0f, 14.0f});
+}
+
+TEST_F(InferenceEngineTest, ExecutesBatchAddWithFourRows) {
+    EngineLoad loaded = LoadBatchAddModel();
+    ASSERT_NE(loaded.engine, nullptr);
+    const std::vector<float> left{1.0f, 2.0f, 5.0f, 6.0f, 9.0f, 0.0f, -1.0f, 4.0f};
+    const std::vector<float> right{3.0f, 4.0f, 7.0f, 8.0f, 1.0f, 1.0f, 2.0f, -3.0f};
+    ExpectBatchAdd(RunBatchAdd(*loaded.engine, left, right, 4), 4,
+                   {4.0f, 6.0f, 12.0f, 14.0f, 10.0f, 1.0f, 1.0f, 1.0f});
+}
+
+TEST_F(InferenceEngineTest, ReportsBatchAddDynamicMetadata) {
+    const EngineLoad loaded = LoadBatchAddModel();
+    ASSERT_NE(loaded.engine, nullptr);
+    const auto& inputs = loaded.engine->inputs();
+    const auto& outputs = loaded.engine->outputs();
+    ASSERT_EQ(inputs.size(), 2U);
+    EXPECT_EQ(inputs[0].name, "A");
+    EXPECT_EQ(inputs[1].name, "B");
+    ASSERT_EQ(outputs.size(), 1U);
+    EXPECT_EQ(outputs[0].name, "C");
+    for (const auto& tensor : inputs) {
+        EXPECT_EQ(tensor.element_type, ElementType::kFloat32);
+        ASSERT_EQ(tensor.dimensions.size(), 2U);
+        EXPECT_EQ(tensor.dimensions[0], -1);
+        EXPECT_EQ(tensor.dimensions[1], 2);
+    }
+    EXPECT_EQ(outputs[0].element_type, ElementType::kFloat32);
+    ASSERT_EQ(outputs[0].dimensions.size(), 2U);
+    EXPECT_EQ(outputs[0].dimensions[0], -1);
+    EXPECT_EQ(outputs[0].dimensions[1], 2);
+}
+
+TEST_F(InferenceEngineTest, BatchAddRejectsARankMismatch) {
+    EngineLoad loaded = LoadBatchAddModel();
+    ASSERT_NE(loaded.engine, nullptr);
+    const std::vector<float> left{1.0f, 2.0f};
+    const std::vector<float> right{3.0f, 4.0f};
+    const NamedTensorView inputs[] = {View("A", {2}, left), View("B", {1, 2}, right)};
+    const InferenceResult result = loaded.engine->run(inputs);
+    EXPECT_EQ(result.error.kind, InferenceErrorKind::kShapeMismatch);
+    EXPECT_TRUE(result.outputs.empty());
+}
+
+TEST_F(InferenceEngineTest, BatchAddRejectsAFeatureDimensionMismatch) {
+    EngineLoad loaded = LoadBatchAddModel();
+    ASSERT_NE(loaded.engine, nullptr);
+    const std::vector<float> left{1.0f, 2.0f, 3.0f};
+    const std::vector<float> right{4.0f, 5.0f};
+    const NamedTensorView inputs[] = {View("A", {1, 3}, left), View("B", {1, 2}, right)};
+    const InferenceResult result = loaded.engine->run(inputs);
+    EXPECT_EQ(result.error.kind, InferenceErrorKind::kShapeMismatch);
+    EXPECT_TRUE(result.outputs.empty());
+}
+
+TEST_F(InferenceEngineTest, BatchAddRejectsAMissingInput) {
+    EngineLoad loaded = LoadBatchAddModel();
+    ASSERT_NE(loaded.engine, nullptr);
+    const std::vector<float> left{1.0f, 2.0f};
+    const NamedTensorView inputs[] = {View("A", {1, 2}, left)};
+    const InferenceResult result = loaded.engine->run(inputs);
+    EXPECT_EQ(result.error.kind, InferenceErrorKind::kMissingInput);
+    EXPECT_TRUE(result.outputs.empty());
+}
+
+TEST_F(InferenceEngineTest, BatchAddRejectsAnUnknownInput) {
+    EngineLoad loaded = LoadBatchAddModel();
+    ASSERT_NE(loaded.engine, nullptr);
+    const std::vector<float> left{1.0f, 2.0f};
+    const std::vector<float> right{3.0f, 4.0f};
+    const std::vector<float> extra{5.0f, 6.0f};
+    const NamedTensorView inputs[] = {View("A", {1, 2}, left), View("B", {1, 2}, right),
+                                      View("D", {1, 2}, extra)};
+    const InferenceResult result = loaded.engine->run(inputs);
+    EXPECT_EQ(result.error.kind, InferenceErrorKind::kUnexpectedInput);
+    EXPECT_TRUE(result.outputs.empty());
+}
+
+TEST_F(InferenceEngineTest, BatchAddRejectsAnElementCountMismatch) {
+    EngineLoad loaded = LoadBatchAddModel();
+    ASSERT_NE(loaded.engine, nullptr);
+    const std::vector<float> left{1.0f, 2.0f, 3.0f};
+    const std::vector<float> right{4.0f, 5.0f};
+    const NamedTensorView inputs[] = {View("A", {1, 2}, left), View("B", {1, 2}, right)};
+    const InferenceResult result = loaded.engine->run(inputs);
+    EXPECT_EQ(result.error.kind, InferenceErrorKind::kElementCountMismatch);
+    EXPECT_TRUE(result.outputs.empty());
+}
+
+TEST_F(InferenceEngineTest, BatchAddOutputOutlivesItsInputs) {
+    EngineLoad loaded = LoadBatchAddModel();
+    ASSERT_NE(loaded.engine, nullptr);
+    InferenceResult result;
+    {
+        const std::vector<float> left{1.0f, 2.0f};
+        const std::vector<float> right{3.0f, 4.0f};
+        result = RunBatchAdd(*loaded.engine, left, right, 1);
+    }
+    ASSERT_EQ(result.error.kind, InferenceErrorKind::kNone);
+    loaded.engine.reset();
+    ASSERT_EQ(result.outputs.size(), 1U);
+    EXPECT_EQ(result.outputs.front().values, (std::vector<float>{4.0f, 6.0f}));
+    EXPECT_EQ(result.outputs.front().shape, (std::vector<std::int64_t>{1, 2}));
+}
+
+TEST_F(InferenceEngineTest, ExecutesBatchAddWithZeroRows) {
+    EngineLoad loaded = LoadBatchAddModel();
+    ASSERT_NE(loaded.engine, nullptr);
+    const InferenceResult result = RunBatchAdd(*loaded.engine, {}, {}, 0);
+    ASSERT_EQ(result.error.kind, InferenceErrorKind::kNone) << result.error.message;
+    ASSERT_EQ(result.outputs.size(), 1U);
+    EXPECT_EQ(result.outputs.front().name, "C");
+    EXPECT_EQ(result.outputs.front().shape, (std::vector<std::int64_t>{0, 2}));
+    EXPECT_TRUE(result.outputs.front().values.empty());
 }
