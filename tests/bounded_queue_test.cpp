@@ -52,12 +52,14 @@ struct CompletionItem {
 
 // Move-only element whose move constructor can be armed to throw. A negative
 // throw_after disables the throw. Destruction of a moved-from object, whose
-// id is negative, is not recorded.
+// id is negative, is not recorded. The destructor does not allocate.
 struct ThrowingMove {
     int id{-1};
+    static constexpr int kMaxDestroyed = 8;
     static int moves;
     static int throw_after;
-    static std::vector<int> destroyed_ids;
+    static int destroyed_ids[kMaxDestroyed];
+    static int destroyed_count;
 
     explicit ThrowingMove(int item_id) : id{item_id} {}
 
@@ -73,16 +75,25 @@ struct ThrowingMove {
         other.id = -1;
     }
 
-    ~ThrowingMove() {
-        if (id >= 0) {
-            destroyed_ids.push_back(id);
+    ~ThrowingMove() noexcept {
+        if (id < 0 || destroyed_count >= kMaxDestroyed) {
+            return;
         }
+        destroyed_ids[destroyed_count] = id;
+        ++destroyed_count;
     }
 };
 
 int ThrowingMove::moves = 0;
 int ThrowingMove::throw_after = -1;
-std::vector<int> ThrowingMove::destroyed_ids;
+int ThrowingMove::destroyed_ids[ThrowingMove::kMaxDestroyed] = {};
+int ThrowingMove::destroyed_count = 0;
+
+void reset_throwing_move() {
+    ThrowingMove::moves = 0;
+    ThrowingMove::throw_after = -1;
+    ThrowingMove::destroyed_count = 0;
+}
 
 template <typename T> T take_ready(inferedge::QueuePop<T> popped) {
     EXPECT_EQ(popped.result, inferedge::QueuePopResult::kReady);
@@ -213,7 +224,8 @@ TEST(BoundedFifoQueueTest, WakesAWaitingPopOnCancel) {
     const inferedge::QueueClose<int> closed = queue.close_cancel();
     EXPECT_TRUE(closed.changed);
     EXPECT_EQ(closed.mode, inferedge::QueueCloseMode::kCancel);
-    EXPECT_TRUE(closed.canceled.empty());
+    ASSERT_NE(closed.canceled, nullptr);
+    EXPECT_TRUE(closed.canceled->empty());
     const inferedge::QueuePop<int> popped = finished.get_future().get();
     EXPECT_EQ(popped.result, inferedge::QueuePopResult::kClosed);
     EXPECT_FALSE(popped.value.has_value());
@@ -227,7 +239,7 @@ TEST(BoundedFifoQueueTest, DrainPreservesQueuedValues) {
 
     const inferedge::QueueClose<int> closed = queue.close_drain();
     EXPECT_TRUE(closed.changed);
-    EXPECT_TRUE(closed.canceled.empty());
+    EXPECT_EQ(closed.canceled, nullptr);
     EXPECT_EQ(queue.size(), 3U);
     EXPECT_EQ(take_ready(queue.wait_pop()), 1);
     EXPECT_EQ(take_ready(queue.wait_pop()), 2);
@@ -244,10 +256,11 @@ TEST(BoundedFifoQueueTest, CancelReturnsPendingValuesInOrder) {
     const inferedge::QueueClose<int> closed = queue.close_cancel();
     EXPECT_TRUE(closed.changed);
     EXPECT_EQ(closed.mode, inferedge::QueueCloseMode::kCancel);
-    ASSERT_EQ(closed.canceled.size(), 3U);
-    EXPECT_EQ(closed.canceled[0], 1);
-    EXPECT_EQ(closed.canceled[1], 2);
-    EXPECT_EQ(closed.canceled[2], 3);
+    ASSERT_NE(closed.canceled, nullptr);
+    ASSERT_EQ(closed.canceled->size(), 3U);
+    EXPECT_EQ((*closed.canceled)[0], 1);
+    EXPECT_EQ((*closed.canceled)[1], 2);
+    EXPECT_EQ((*closed.canceled)[2], 3);
     EXPECT_EQ(queue.size(), 0U);
     EXPECT_EQ(queue.wait_pop().result, inferedge::QueuePopResult::kClosed);
 }
@@ -261,11 +274,12 @@ TEST(BoundedFifoQueueTest, AlreadyPoppedValuesStayWithTheConsumer) {
 
     const std::unique_ptr<int> popped = take_ready(queue.wait_pop());
     const inferedge::QueueClose<std::unique_ptr<int>> closed = queue.close_cancel();
-    ASSERT_EQ(closed.canceled.size(), 1U);
+    ASSERT_NE(closed.canceled, nullptr);
+    ASSERT_EQ(closed.canceled->size(), 1U);
     ASSERT_NE(popped, nullptr);
-    ASSERT_NE(closed.canceled[0], nullptr);
+    ASSERT_NE((*closed.canceled)[0], nullptr);
     EXPECT_EQ(*popped, 8);
-    EXPECT_EQ(*closed.canceled[0], 9);
+    EXPECT_EQ(*(*closed.canceled)[0], 9);
 }
 
 TEST(BoundedFifoQueueTest, RepeatedDrainIsIdempotent) {
@@ -277,7 +291,8 @@ TEST(BoundedFifoQueueTest, RepeatedDrainIsIdempotent) {
     EXPECT_FALSE(second.changed);
     EXPECT_EQ(first.mode, inferedge::QueueCloseMode::kDrain);
     EXPECT_EQ(second.mode, inferedge::QueueCloseMode::kDrain);
-    EXPECT_TRUE(second.canceled.empty());
+    EXPECT_EQ(first.canceled, nullptr);
+    EXPECT_EQ(second.canceled, nullptr);
     EXPECT_EQ(take_ready(queue.wait_pop()), 5);
 }
 
@@ -288,10 +303,12 @@ TEST(BoundedFifoQueueTest, RepeatedCancelIsIdempotent) {
     const inferedge::QueueClose<int> second = queue.close_cancel();
     EXPECT_TRUE(first.changed);
     EXPECT_FALSE(second.changed);
+    EXPECT_EQ(first.mode, inferedge::QueueCloseMode::kCancel);
     EXPECT_EQ(second.mode, inferedge::QueueCloseMode::kCancel);
-    ASSERT_EQ(first.canceled.size(), 1U);
-    EXPECT_EQ(first.canceled[0], 5);
-    EXPECT_TRUE(second.canceled.empty());
+    ASSERT_NE(first.canceled, nullptr);
+    ASSERT_EQ(first.canceled->size(), 1U);
+    EXPECT_EQ((*first.canceled)[0], 5);
+    EXPECT_EQ(second.canceled, nullptr);
 }
 
 TEST(BoundedFifoQueueTest, CancelAfterDrainPreservesDrain) {
@@ -303,7 +320,7 @@ TEST(BoundedFifoQueueTest, CancelAfterDrainPreservesDrain) {
     const inferedge::QueueClose<int> later = queue.close_cancel();
     EXPECT_FALSE(later.changed);
     EXPECT_EQ(later.mode, inferedge::QueueCloseMode::kDrain);
-    EXPECT_TRUE(later.canceled.empty());
+    EXPECT_EQ(later.canceled, nullptr);
     EXPECT_EQ(queue.close_mode(), inferedge::QueueCloseMode::kDrain);
     EXPECT_EQ(take_ready(queue.wait_pop()), 1);
     EXPECT_EQ(take_ready(queue.wait_pop()), 2);
@@ -316,9 +333,10 @@ TEST(BoundedFifoQueueTest, DrainAfterCancelPreservesCancel) {
     const inferedge::QueueClose<int> later = queue.close_drain();
     EXPECT_FALSE(later.changed);
     EXPECT_EQ(later.mode, inferedge::QueueCloseMode::kCancel);
-    EXPECT_TRUE(later.canceled.empty());
-    ASSERT_EQ(canceled.canceled.size(), 1U);
-    EXPECT_EQ(canceled.canceled[0], 1);
+    EXPECT_EQ(later.canceled, nullptr);
+    ASSERT_NE(canceled.canceled, nullptr);
+    ASSERT_EQ(canceled.canceled->size(), 1U);
+    EXPECT_EQ((*canceled.canceled)[0], 1);
     EXPECT_EQ(queue.wait_pop().result, inferedge::QueuePopResult::kClosed);
     EXPECT_EQ(queue.close_mode(), inferedge::QueueCloseMode::kCancel);
 }
@@ -527,24 +545,38 @@ TEST(BoundedFifoQueueTest, MoveOnlyCompletionHasOneOwner) {
     popped.completion.set_value(popped.id);
 
     inferedge::QueueClose<CompletionItem> canceled = queue.close_cancel();
-    ASSERT_EQ(canceled.canceled.size(), 1U);
-    EXPECT_EQ(canceled.canceled[0].id, 22);
-    canceled.canceled[0].completion.set_value(canceled.canceled[0].id);
+    ASSERT_NE(canceled.canceled, nullptr);
+    const std::deque<CompletionItem>* const storage = canceled.canceled.get();
+    inferedge::QueueClose<CompletionItem> delivered = std::move(canceled);
+    ASSERT_EQ(delivered.canceled.get(), storage);
+    EXPECT_EQ(canceled.canceled, nullptr);
+    ASSERT_EQ(delivered.canceled->size(), 1U);
+    EXPECT_EQ((*delivered.canceled)[0].id, 22);
+    (*delivered.canceled)[0].completion.set_value((*delivered.canceled)[0].id);
 
     EXPECT_EQ(first_future.get(), 11);
     EXPECT_EQ(second_future.get(), 22);
     EXPECT_THROW(popped.completion.set_value(11), std::future_error);
-    EXPECT_THROW(canceled.canceled[0].completion.set_value(22), std::future_error);
+    EXPECT_THROW((*delivered.canceled)[0].completion.set_value(22), std::future_error);
+}
+
+TEST(BoundedFifoQueueTest, QueueCloseIsNothrowMoveOnly) {
+    static_assert(!std::is_nothrow_move_constructible_v<ThrowingMove>);
+    static_assert(std::is_nothrow_destructible_v<ThrowingMove>);
+    static_assert(std::is_nothrow_move_constructible_v<CompletionItem>);
+    static_assert(std::is_nothrow_destructible_v<CompletionItem>);
+    static_assert(std::is_nothrow_default_constructible_v<inferedge::QueueClose<ThrowingMove>>);
+    static_assert(std::is_nothrow_move_constructible_v<inferedge::QueueClose<ThrowingMove>>);
+    static_assert(std::is_nothrow_move_constructible_v<inferedge::QueueClose<CompletionItem>>);
+    static_assert(std::is_nothrow_move_constructible_v<inferedge::QueueClose<int>>);
+    static_assert(!std::is_copy_constructible_v<inferedge::QueueClose<ThrowingMove>>);
+    static_assert(!std::is_copy_assignable_v<inferedge::QueueClose<ThrowingMove>>);
+    static_assert(!std::is_move_assignable_v<inferedge::QueueClose<ThrowingMove>>);
+    static_assert(std::is_nothrow_swappable_v<std::deque<ThrowingMove>>);
 }
 
 TEST(BoundedFifoQueueTest, CancelDoesNotMoveElements) {
-    static_assert(!std::is_nothrow_move_constructible_v<ThrowingMove>);
-    static_assert(std::is_nothrow_move_constructible_v<inferedge::QueueClose<ThrowingMove>>);
-    static_assert(std::is_nothrow_swappable_v<std::deque<ThrowingMove>>);
-
-    ThrowingMove::moves = 0;
-    ThrowingMove::throw_after = -1;
-    ThrowingMove::destroyed_ids.clear();
+    reset_throwing_move();
 
     inferedge::BoundedFifoQueue<ThrowingMove> queue(3);
     {
@@ -556,7 +588,7 @@ TEST(BoundedFifoQueueTest, CancelDoesNotMoveElements) {
         EXPECT_EQ(queue.try_push(std::move(third)).result, inferedge::QueuePushResult::kAccepted);
     }
     EXPECT_GT(ThrowingMove::moves, 0);
-    EXPECT_TRUE(ThrowingMove::destroyed_ids.empty());
+    EXPECT_EQ(ThrowingMove::destroyed_count, 0);
     EXPECT_EQ(queue.size(), 3U);
 
     const int moves_after_enqueue = ThrowingMove::moves;
@@ -564,25 +596,101 @@ TEST(BoundedFifoQueueTest, CancelDoesNotMoveElements) {
     {
         const inferedge::QueueClose<ThrowingMove> closed = queue.close_cancel();
         EXPECT_EQ(ThrowingMove::moves, moves_after_enqueue);
-        EXPECT_TRUE(ThrowingMove::destroyed_ids.empty());
+        EXPECT_EQ(ThrowingMove::destroyed_count, 0);
         EXPECT_TRUE(closed.changed);
         EXPECT_EQ(closed.mode, inferedge::QueueCloseMode::kCancel);
         EXPECT_TRUE(queue.is_closed());
         EXPECT_EQ(queue.close_mode(), inferedge::QueueCloseMode::kCancel);
         EXPECT_EQ(queue.size(), 0U);
-        ASSERT_EQ(closed.canceled.size(), 3U);
-        EXPECT_EQ(closed.canceled[0].id, 1);
-        EXPECT_EQ(closed.canceled[1].id, 2);
-        EXPECT_EQ(closed.canceled[2].id, 3);
+        ASSERT_NE(closed.canceled, nullptr);
+        ASSERT_EQ(closed.canceled->size(), 3U);
+        EXPECT_EQ((*closed.canceled)[0].id, 1);
+        EXPECT_EQ((*closed.canceled)[1].id, 2);
+        EXPECT_EQ((*closed.canceled)[2].id, 3);
         EXPECT_EQ(queue.wait_pop().result, inferedge::QueuePopResult::kClosed);
     }
 
-    std::vector<int> destroyed = ThrowingMove::destroyed_ids;
+    std::vector<int> destroyed(ThrowingMove::destroyed_ids,
+                               ThrowingMove::destroyed_ids + ThrowingMove::destroyed_count);
     std::sort(destroyed.begin(), destroyed.end());
     ASSERT_EQ(destroyed.size(), 3U);
     EXPECT_EQ(destroyed[0], 1);
     EXPECT_EQ(destroyed[1], 2);
     EXPECT_EQ(destroyed[2], 3);
+}
+
+TEST(BoundedFifoQueueTest, CancelHandleTransfersWithoutMovingElements) {
+    reset_throwing_move();
+    inferedge::BoundedFifoQueue<ThrowingMove> queue(3);
+    {
+        ThrowingMove first{1};
+        ThrowingMove second{2};
+        ThrowingMove third{3};
+        EXPECT_EQ(queue.try_push(std::move(first)).result, inferedge::QueuePushResult::kAccepted);
+        EXPECT_EQ(queue.try_push(std::move(second)).result, inferedge::QueuePushResult::kAccepted);
+        EXPECT_EQ(queue.try_push(std::move(third)).result, inferedge::QueuePushResult::kAccepted);
+    }
+
+    const int moves_after_enqueue = ThrowingMove::moves;
+    ThrowingMove::throw_after = moves_after_enqueue;
+    inferedge::QueueClose<ThrowingMove> closed = queue.close_cancel();
+    ASSERT_NE(closed.canceled, nullptr);
+    const std::deque<ThrowingMove>* const storage = closed.canceled.get();
+    const ThrowingMove* const first_element = &(*closed.canceled)[0];
+    EXPECT_EQ(ThrowingMove::moves, moves_after_enqueue);
+    EXPECT_EQ(ThrowingMove::destroyed_count, 0);
+
+    inferedge::QueueClose<ThrowingMove> delivered = std::move(closed);
+    EXPECT_EQ(delivered.canceled.get(), storage);
+    EXPECT_EQ(&(*delivered.canceled)[0], first_element);
+    EXPECT_EQ(closed.canceled, nullptr);
+    EXPECT_EQ(ThrowingMove::moves, moves_after_enqueue);
+    EXPECT_EQ(ThrowingMove::destroyed_count, 0);
+    ASSERT_EQ(delivered.canceled->size(), 3U);
+    EXPECT_EQ((*delivered.canceled)[0].id, 1);
+    EXPECT_EQ((*delivered.canceled)[1].id, 2);
+    EXPECT_EQ((*delivered.canceled)[2].id, 3);
+
+    delivered.canceled.reset();
+    std::vector<int> destroyed(ThrowingMove::destroyed_ids,
+                               ThrowingMove::destroyed_ids + ThrowingMove::destroyed_count);
+    std::sort(destroyed.begin(), destroyed.end());
+    ASSERT_EQ(destroyed.size(), 3U);
+    EXPECT_EQ(destroyed[0], 1);
+    EXPECT_EQ(destroyed[1], 2);
+    EXPECT_EQ(destroyed[2], 3);
+}
+
+TEST(BoundedFifoQueueTest, EmptyCancelOwnsAnEmptyDeque) {
+    reset_throwing_move();
+    inferedge::BoundedFifoQueue<ThrowingMove> queue(1);
+    inferedge::QueueClose<ThrowingMove> closed = queue.close_cancel();
+    EXPECT_TRUE(closed.changed);
+    EXPECT_EQ(closed.mode, inferedge::QueueCloseMode::kCancel);
+    ASSERT_NE(closed.canceled, nullptr);
+    EXPECT_TRUE(closed.canceled->empty());
+    EXPECT_EQ(ThrowingMove::moves, 0);
+    EXPECT_EQ(ThrowingMove::destroyed_count, 0);
+    EXPECT_TRUE(queue.is_closed());
+    EXPECT_EQ(queue.size(), 0U);
+
+    const std::deque<ThrowingMove>* const storage = closed.canceled.get();
+    inferedge::QueueClose<ThrowingMove> delivered = std::move(closed);
+    EXPECT_EQ(delivered.canceled.get(), storage);
+    EXPECT_EQ(closed.canceled, nullptr);
+    EXPECT_EQ(ThrowingMove::moves, 0);
+    EXPECT_EQ(ThrowingMove::destroyed_count, 0);
+
+    const inferedge::QueueClose<ThrowingMove> repeated = queue.close_cancel();
+    EXPECT_FALSE(repeated.changed);
+    EXPECT_EQ(repeated.mode, inferedge::QueueCloseMode::kCancel);
+    EXPECT_EQ(repeated.canceled, nullptr);
+
+    const inferedge::QueueClose<ThrowingMove> crossed = queue.close_drain();
+    EXPECT_FALSE(crossed.changed);
+    EXPECT_EQ(crossed.mode, inferedge::QueueCloseMode::kCancel);
+    EXPECT_EQ(crossed.canceled, nullptr);
+    EXPECT_EQ(queue.wait_pop().result, inferedge::QueuePopResult::kClosed);
 }
 
 TEST(BoundedFifoQueueTest, CancelTransfersEveryPromise) {
@@ -595,15 +703,21 @@ TEST(BoundedFifoQueueTest, CancelTransfersEveryPromise) {
     }
 
     inferedge::QueueClose<CompletionItem> canceled = queue.close_cancel();
-    ASSERT_EQ(canceled.canceled.size(), 3U);
+    ASSERT_NE(canceled.canceled, nullptr);
+    const std::deque<CompletionItem>* const storage = canceled.canceled.get();
+    inferedge::QueueClose<CompletionItem> delivered = std::move(canceled);
+    ASSERT_EQ(delivered.canceled.get(), storage);
+    EXPECT_EQ(canceled.canceled, nullptr);
+    ASSERT_EQ(delivered.canceled->size(), 3U);
     EXPECT_TRUE(queue.is_closed());
     EXPECT_EQ(queue.size(), 0U);
-    for (std::size_t index = 0; index < canceled.canceled.size(); ++index) {
+    for (std::size_t index = 0; index < delivered.canceled->size(); ++index) {
         const int id = static_cast<int>(index) + 1;
-        EXPECT_EQ(canceled.canceled[index].id, id);
-        canceled.canceled[index].completion.set_value(id);
+        CompletionItem& item = (*delivered.canceled)[index];
+        EXPECT_EQ(item.id, id);
+        item.completion.set_value(id);
         try {
-            canceled.canceled[index].completion.set_value(id);
+            item.completion.set_value(id);
             ADD_FAILURE() << "canceled promise accepted a second completion";
         } catch (const std::future_error& error) {
             EXPECT_EQ(error.code(),
@@ -663,17 +777,18 @@ TEST(BoundedFifoQueueTest, ConcurrentCloseChoosesOneMode) {
 
     EXPECT_EQ(drained.mode, canceled.mode);
     EXPECT_NE(drained.changed, canceled.changed);
-    EXPECT_TRUE(drained.canceled.empty());
+    EXPECT_EQ(drained.canceled, nullptr);
     if (drained.mode == inferedge::QueueCloseMode::kDrain) {
-        EXPECT_TRUE(canceled.canceled.empty());
+        EXPECT_EQ(canceled.canceled, nullptr);
         EXPECT_EQ(take_ready(queue.wait_pop()), 1);
         EXPECT_EQ(take_ready(queue.wait_pop()), 2);
         EXPECT_EQ(take_ready(queue.wait_pop()), 3);
     } else {
-        ASSERT_EQ(canceled.canceled.size(), 3U);
-        EXPECT_EQ(canceled.canceled[0], 1);
-        EXPECT_EQ(canceled.canceled[1], 2);
-        EXPECT_EQ(canceled.canceled[2], 3);
+        ASSERT_NE(canceled.canceled, nullptr);
+        ASSERT_EQ(canceled.canceled->size(), 3U);
+        EXPECT_EQ((*canceled.canceled)[0], 1);
+        EXPECT_EQ((*canceled.canceled)[1], 2);
+        EXPECT_EQ((*canceled.canceled)[2], 3);
         EXPECT_EQ(queue.wait_pop().result, inferedge::QueuePopResult::kClosed);
     }
 }

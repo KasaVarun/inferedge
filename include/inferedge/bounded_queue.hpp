@@ -3,9 +3,11 @@
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 namespace inferedge {
@@ -44,13 +46,25 @@ template <typename T> struct QueuePop {
 };
 
 // changed is true only for the call that performs the open-to-closed transition.
-// canceled owns items removed by a winning close_cancel, in FIFO order.
-// Ownership moves by swapping deques, not by move-constructing each T.
-// A losing close, a repeated close, and close_drain leave canceled empty.
+//
+// canceled is null unless this call won close_cancel. A winning close_cancel
+// owns the waiting items in FIFO order, including when that collection is
+// empty. The deque is allocated before cancellation commits. QueueClose then
+// carries it by std::unique_ptr. Moving a QueueClose moves that pointer: the
+// move is noexcept, allocates nothing, and does not move or destroy T.
+//
+// QueueClose is move-only. Move assignment is deleted. A losing close, a
+// repeated close, and close_drain leave canceled null.
 template <typename T> struct QueueClose {
     QueueCloseMode mode{QueueCloseMode::kDrain};
     bool changed{false};
-    std::deque<T> canceled;
+    std::unique_ptr<std::deque<T>> canceled;
+
+    QueueClose() noexcept = default;
+    QueueClose(const QueueClose&) = delete;
+    QueueClose& operator=(const QueueClose&) = delete;
+    QueueClose(QueueClose&&) noexcept = default;
+    QueueClose& operator=(QueueClose&&) = delete;
 };
 
 // A bounded FIFO queue. Capacity counts items waiting in the queue. A popped
@@ -71,14 +85,33 @@ template <typename T> struct QueueClose {
 //
 // close_drain does not move or destroy T. If the mutex lock throws, admission
 // stays open. Otherwise the queue closes in drain mode and the waiting items
-// remain in place. close_cancel also does not move or destroy T. Lock failure
-// leaves the queue open. The winning call swaps the waiting deque into
-// QueueClose::canceled, then closes admission and wakes consumers.
-// std::deque::swap and the move of that deque are noexcept for std::allocator
-// and do not invoke T's move constructor, so a throwing T move cannot destroy
-// or drop an accepted item during cancellation. A later close returns the
-// winning mode and an empty deque. close_drain and close_cancel are not
-// noexcept, because locking the mutex can throw.
+// remain in place. The returned handle is null. Moving that QueueClose is
+// noexcept, so constructing the return value cannot throw after admission
+// has closed.
+//
+// close_cancel does not move or destroy T. If the mutex lock throws, admission
+// stays open. A queue that is already closed allocates nothing and returns the
+// winning mode with a null handle. Otherwise the winning call allocates an
+// empty deque while admission is still open and the waiting items are still
+// owned by the queue. std::deque's default constructor can allocate, on both
+// libstdc++ and libc++. If that allocation throws, the queue is unchanged.
+//
+// Cancellation commits when the waiting deque is swapped into that allocated
+// deque and kCancel is stored. deque::swap is unconditionally noexcept and
+// does not move, copy, or destroy T. The mode store is noexcept. The mutex is
+// still held, so other callers cannot observe a partial transition.
+//
+// After that commit the function only move-assigns the unique_ptr, stores the
+// result fields, calls notify_all, and move-constructs the return value. Those
+// operations are noexcept. They do not allocate, and they do not move or
+// destroy T. A later close returns the winning mode and a null handle.
+//
+// close_drain and close_cancel are not noexcept. Locking the mutex can throw,
+// and the winning close_cancel can throw std::bad_alloc before it commits.
+//
+// The return moves of try_push and wait_pop are separate. When the returned
+// optional owns a T, that return move-constructs T and provides only the basic
+// guarantee above.
 //
 // capacity() only reads the fixed capacity and is noexcept. size(),
 // is_closed(), and close_mode() lock the mutex and are not noexcept.
@@ -160,6 +193,11 @@ template <typename T> QueuePop<T> BoundedFifoQueue<T>::wait_pop() {
 }
 
 template <typename T> QueueClose<T> BoundedFifoQueue<T>::close_drain() {
+    static_assert(std::is_nothrow_default_constructible_v<QueueClose<T>>);
+    static_assert(std::is_nothrow_move_constructible_v<QueueClose<T>>);
+    static_assert(!std::is_copy_constructible_v<QueueClose<T>>);
+    static_assert(!std::is_move_assignable_v<QueueClose<T>>);
+
     std::lock_guard<std::mutex> lock(mutex_);
     QueueClose<T> outcome;
     if (mode_.has_value()) {
@@ -174,16 +212,28 @@ template <typename T> QueueClose<T> BoundedFifoQueue<T>::close_drain() {
 }
 
 template <typename T> QueueClose<T> BoundedFifoQueue<T>::close_cancel() {
+    static_assert(std::is_nothrow_default_constructible_v<QueueClose<T>>);
+    static_assert(std::is_nothrow_move_constructible_v<QueueClose<T>>);
+    static_assert(!std::is_copy_constructible_v<QueueClose<T>>);
+    static_assert(!std::is_move_assignable_v<QueueClose<T>>);
+
     std::lock_guard<std::mutex> lock(mutex_);
-    QueueClose<T> outcome;
     if (mode_.has_value()) {
+        QueueClose<T> outcome;
         outcome.mode = *mode_;
         return outcome;
     }
-    outcome.canceled.swap(items_);
+
+    // This allocation is the last operation that may throw. It runs before
+    // items_ is disturbed and before admission closes.
+    auto transferred = std::make_unique<std::deque<T>>();
+    transferred->swap(items_);
     mode_ = QueueCloseMode::kCancel;
+
+    QueueClose<T> outcome;
     outcome.mode = QueueCloseMode::kCancel;
     outcome.changed = true;
+    outcome.canceled = std::move(transferred);
     cv_.notify_all();
     return outcome;
 }
