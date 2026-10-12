@@ -354,6 +354,22 @@ set_tests_properties(
     PROPERTIES PASS_REGULAR_EXPRESSION "inferedge-bench-concurrent 0\\.1\\.0"
 )
 
+# Header-only bounded queue. This target does not link ONNX Runtime.
+add_executable(inferedge_queue_tests tests/bounded_queue_test.cpp)
+target_include_directories(inferedge_queue_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(inferedge_queue_tests PRIVATE cxx_std_20)
+target_link_libraries(
+    inferedge_queue_tests
+    PRIVATE
+        inferedge_warnings
+        GTest::gtest_main
+        Threads::Threads
+)
+gtest_discover_tests(
+    inferedge_queue_tests
+    PROPERTIES TIMEOUT 30
+)
+
 # Local bounded stress. Default CI does not build or discover this executable.
 option(INFEREDGE_ENABLE_LONG_STRESS "Build bounded local concurrency stress tests" OFF)
 if(INFEREDGE_ENABLE_LONG_STRESS)
