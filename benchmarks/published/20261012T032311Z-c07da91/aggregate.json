@@ -1,0 +1,803 @@
+{
+  "aggregate_schema_version": 2,
+  "source_benchmark_schema_version": 2,
+  "run_set_id": "20261012T032311Z-c07da91",
+  "git_commit": "c07da912da109c09b6e3ea6f9ae8f1a89e97a79e",
+  "build_type": "Release",
+  "pilots_excluded": true,
+  "pilot_trial_ids": [
+    "pilot-add-c01",
+    "pilot-mnist-c01",
+    "pilot-add-c02",
+    "pilot-mnist-c02",
+    "pilot-add-c04",
+    "pilot-mnist-c04",
+    "pilot-add-c08",
+    "pilot-mnist-c08"
+  ],
+  "counted_trial_ids": [
+    "add-c01-01",
+    "mnist-c01-01",
+    "add-c02-01",
+    "mnist-c02-01",
+    "add-c04-01",
+    "mnist-c04-01",
+    "add-c08-01",
+    "mnist-c08-01",
+    "mnist-c01-02",
+    "add-c02-02",
+    "mnist-c02-02",
+    "add-c04-02",
+    "mnist-c04-02",
+    "add-c08-02",
+    "mnist-c08-02",
+    "add-c01-02",
+    "add-c02-03",
+    "mnist-c02-03",
+    "add-c04-03",
+    "mnist-c04-03",
+    "add-c08-03",
+    "mnist-c08-03",
+    "add-c01-03",
+    "mnist-c01-03",
+    "mnist-c02-04",
+    "add-c04-04",
+    "mnist-c04-04",
+    "add-c08-04",
+    "mnist-c08-04",
+    "add-c01-04",
+    "mnist-c01-04",
+    "add-c02-04",
+    "add-c04-05",
+    "mnist-c04-05",
+    "add-c08-05",
+    "mnist-c08-05",
+    "add-c01-05",
+    "mnist-c01-05",
+    "add-c02-05",
+    "mnist-c02-05"
+  ],
+  "trial_order": [
+    "pilot-add-c01",
+    "pilot-mnist-c01",
+    "pilot-add-c02",
+    "pilot-mnist-c02",
+    "pilot-add-c04",
+    "pilot-mnist-c04",
+    "pilot-add-c08",
+    "pilot-mnist-c08",
+    "add-c01-01",
+    "mnist-c01-01",
+    "add-c02-01",
+    "mnist-c02-01",
+    "add-c04-01",
+    "mnist-c04-01",
+    "add-c08-01",
+    "mnist-c08-01",
+    "mnist-c01-02",
+    "add-c02-02",
+    "mnist-c02-02",
+    "add-c04-02",
+    "mnist-c04-02",
+    "add-c08-02",
+    "mnist-c08-02",
+    "add-c01-02",
+    "add-c02-03",
+    "mnist-c02-03",
+    "add-c04-03",
+    "mnist-c04-03",
+    "add-c08-03",
+    "mnist-c08-03",
+    "add-c01-03",
+    "mnist-c01-03",
+    "mnist-c02-04",
+    "add-c04-04",
+    "mnist-c04-04",
+    "add-c08-04",
+    "mnist-c08-04",
+    "add-c01-04",
+    "mnist-c01-04",
+    "add-c02-04",
+    "add-c04-05",
+    "mnist-c04-05",
+    "add-c08-05",
+    "mnist-c08-05",
+    "add-c01-05",
+    "mnist-c01-05",
+    "add-c02-05",
+    "mnist-c02-05"
+  ],
+  "counted_runs_per_configuration": 5,
+  "models": {
+    "add": {
+      "path": "models/add_f32.onnx",
+      "sha256": "37eb1b1b1adee439d2d14b91a0b217bd15ab809610d1271ea821d56e6400a447",
+      "fixture": null
+    },
+    "mnist": {
+      "path": "models/mnist_mlp.onnx",
+      "sha256": "3473a4b2673fe4353c2b3a04a7d432717a4dfcdc42fc217565c99743542d8cce",
+      "fixture": "test_00003"
+    }
+  },
+  "experiment_configuration": {
+    "workloads": [
+      "add",
+      "mnist"
+    ],
+    "worker_counts": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "warmup_iterations_per_worker": 100,
+    "measured_iterations_per_worker": 1000,
+    "correctness_check_interval": 1,
+    "counted_runs_per_configuration": 5,
+    "session_ownership": "one_inference_engine_per_worker",
+    "onnx_intra_op_threads_per_session": 1,
+    "graph_optimizations": "disabled",
+    "backend": "ONNX Runtime CPU",
+    "onnxruntime_version": "1.31.0",
+    "cmake_build_type": "Release",
+    "sanitizer_instrumentation": "absent",
+    "inter_trial_delay_seconds": 5.0,
+    "environment_variable": "ORT_DISABLE_TELEMETRY=1",
+    "control_worker_count": 1
+  },
+  "units": {
+    "latency": "microseconds",
+    "throughput": "requests_per_second",
+    "ratios": "dimensionless",
+    "relative_run_mean_range": "dimensionless_ratio",
+    "relative_aggregate_throughput_range": "dimensionless_ratio"
+  },
+  "definitions": {
+    "within_run": "Each report's mean, p50, p95, and p99 describe the measured calls pooled inside that one concurrent process. P99 is that process's nearest-rank order statistic.",
+    "median_of_run_p99": "median_of_run_p99_microseconds is the median of the five per-process P99 values. It is not a pooled percentile of the combined samples. Schema version 2 does not contain raw samples, so a pooled P99 is not computed.",
+    "relative_run_mean_range": "(maximum run mean - minimum run mean) / median of the run means",
+    "relative_aggregate_throughput_range": "(maximum aggregate throughput - minimum aggregate throughput) / median aggregate throughput",
+    "throughput_ratio": "throughput_ratio(N) is the median aggregate completed requests per second at worker count N divided by the same median at worker count 1 for that workload. Active-call throughput is recorded separately and is not the scaling numerator. Sequential active-call throughput is not a speedup baseline.",
+    "scaling_efficiency": "scaling_efficiency(N) is throughput_ratio(N) divided by N. Linear scaling is not assumed.",
+    "latency_ratios": "latency_mean_ratio(N) and latency_p99_ratio(N) divide the worker-count-N median of run means, or the median of per-process P99 values, by the worker-count-1 value for the same workload.",
+    "confidence_interval": "Five counted runs do not establish statistical significance. No confidence interval is computed.",
+    "pilots": "Pilot trials are validated with the same evidence checks and then excluded from latency reductions, throughput reductions, scaling ratios, scaling efficiency, and run-to-run variation."
+  },
+  "median_of_run_p99_is_pooled_p99": false,
+  "confidence_interval_computed": false,
+  "workloads": {
+    "add": {
+      "worker_results": [
+        {
+          "worker_count": 1,
+          "counted_trial_ids": [
+            "add-c01-01",
+            "add-c01-02",
+            "add-c01-03",
+            "add-c01-04",
+            "add-c01-05"
+          ],
+          "per_run": [
+            {
+              "trial_id": "add-c01-01",
+              "mean_microseconds": 1.614209,
+              "p50_microseconds": 1.625,
+              "p95_microseconds": 1.709,
+              "p99_microseconds": 2.042,
+              "aggregate_completed_requests_per_second": 597639.3246675631,
+              "active_call_requests_per_second": 619498.4664315464
+            },
+            {
+              "trial_id": "add-c01-02",
+              "mean_microseconds": 1.714015,
+              "p50_microseconds": 1.666,
+              "p95_microseconds": 1.875,
+              "p99_microseconds": 1.917,
+              "aggregate_completed_requests_per_second": 565317.649160475,
+              "active_call_requests_per_second": 583425.4659381628
+            },
+            {
+              "trial_id": "add-c01-03",
+              "mean_microseconds": 1.512262,
+              "p50_microseconds": 1.5,
+              "p95_microseconds": 1.583,
+              "p99_microseconds": 1.875,
+              "aggregate_completed_requests_per_second": 637111.4894137555,
+              "active_call_requests_per_second": 661261.0777762055
+            },
+            {
+              "trial_id": "add-c01-04",
+              "mean_microseconds": 1.610916,
+              "p50_microseconds": 1.583,
+              "p95_microseconds": 1.792,
+              "p99_microseconds": 2.0,
+              "aggregate_completed_requests_per_second": 592900.0222337508,
+              "active_call_requests_per_second": 620764.8319341294
+            },
+            {
+              "trial_id": "add-c01-05",
+              "mean_microseconds": 1.714895,
+              "p50_microseconds": 1.625,
+              "p95_microseconds": 2.0,
+              "p99_microseconds": 2.292,
+              "aggregate_completed_requests_per_second": 561232.7364810258,
+              "active_call_requests_per_second": 583126.0806055182
+            }
+          ],
+          "cross_run": {
+            "mean_of_run_means_microseconds": 1.6332594,
+            "median_of_run_means_microseconds": 1.614209,
+            "median_of_run_p50_microseconds": 1.625,
+            "median_of_run_p95_microseconds": 1.792,
+            "median_of_run_p99_microseconds": 2.0,
+            "minimum_run_mean_microseconds": 1.512262,
+            "maximum_run_mean_microseconds": 1.714895,
+            "relative_run_mean_range": 0.12553083274842358,
+            "median_aggregate_completed_requests_per_second": 592900.0222337508,
+            "minimum_aggregate_completed_requests_per_second": 561232.7364810258,
+            "maximum_aggregate_completed_requests_per_second": 637111.4894137555,
+            "relative_aggregate_throughput_range": 0.12797900166516518,
+            "median_active_call_requests_per_second": 619498.4664315464
+          },
+          "scaling": {
+            "throughput_ratio": 1.0,
+            "latency_mean_ratio": 1.0,
+            "latency_p99_ratio": 1.0,
+            "scaling_efficiency": 1.0
+          }
+        },
+        {
+          "worker_count": 2,
+          "counted_trial_ids": [
+            "add-c02-01",
+            "add-c02-02",
+            "add-c02-03",
+            "add-c02-04",
+            "add-c02-05"
+          ],
+          "per_run": [
+            {
+              "trial_id": "add-c02-01",
+              "mean_microseconds": 7.0812535,
+              "p50_microseconds": 6.958,
+              "p95_microseconds": 9.5,
+              "p99_microseconds": 10.167,
+              "aggregate_completed_requests_per_second": 275814.51473883813,
+              "active_call_requests_per_second": 141217.93549687215
+            },
+            {
+              "trial_id": "add-c02-02",
+              "mean_microseconds": 7.00695,
+              "p50_microseconds": 6.958,
+              "p95_microseconds": 9.375,
+              "p99_microseconds": 10.167,
+              "aggregate_completed_requests_per_second": 276489.7196974871,
+              "active_call_requests_per_second": 142715.4468063851
+            },
+            {
+              "trial_id": "add-c02-03",
+              "mean_microseconds": 7.492414,
+              "p50_microseconds": 7.459,
+              "p95_microseconds": 9.833,
+              "p99_microseconds": 10.541,
+              "aggregate_completed_requests_per_second": 258056.19173575044,
+              "active_call_requests_per_second": 133468.3321023104
+            },
+            {
+              "trial_id": "add-c02-04",
+              "mean_microseconds": 7.804463,
+              "p50_microseconds": 7.791,
+              "p95_microseconds": 9.875,
+              "p99_microseconds": 11.0,
+              "aggregate_completed_requests_per_second": 249868.5691326362,
+              "active_call_requests_per_second": 128131.81380961124
+            },
+            {
+              "trial_id": "add-c02-05",
+              "mean_microseconds": 7.108745,
+              "p50_microseconds": 6.792,
+              "p95_microseconds": 9.625,
+              "p99_microseconds": 11.292,
+              "aggregate_completed_requests_per_second": 273552.6058074124,
+              "active_call_requests_per_second": 140671.80634556452
+            }
+          ],
+          "cross_run": {
+            "mean_of_run_means_microseconds": 7.2987651,
+            "median_of_run_means_microseconds": 7.108745,
+            "median_of_run_p50_microseconds": 6.958,
+            "median_of_run_p95_microseconds": 9.625,
+            "median_of_run_p99_microseconds": 10.541,
+            "minimum_run_mean_microseconds": 7.00695,
+            "maximum_run_mean_microseconds": 7.804463,
+            "relative_run_mean_range": 0.11218759429407024,
+            "median_aggregate_completed_requests_per_second": 273552.6058074124,
+            "minimum_aggregate_completed_requests_per_second": 249868.5691326362,
+            "maximum_aggregate_completed_requests_per_second": 276489.7196974871,
+            "relative_aggregate_throughput_range": 0.09731638448947107,
+            "median_active_call_requests_per_second": 140671.80634556452
+          },
+          "scaling": {
+            "throughput_ratio": 0.461380663769927,
+            "latency_mean_ratio": 4.403856625752923,
+            "latency_p99_ratio": 5.2705,
+            "scaling_efficiency": 0.2306903318849635
+          }
+        },
+        {
+          "worker_count": 4,
+          "counted_trial_ids": [
+            "add-c04-01",
+            "add-c04-02",
+            "add-c04-03",
+            "add-c04-04",
+            "add-c04-05"
+          ],
+          "per_run": [
+            {
+              "trial_id": "add-c04-01",
+              "mean_microseconds": 6.529506250000001,
+              "p50_microseconds": 6.416,
+              "p95_microseconds": 7.708,
+              "p99_microseconds": 9.333,
+              "aggregate_completed_requests_per_second": 587353.5727543123,
+              "active_call_requests_per_second": 153150.93694871647
+            },
+            {
+              "trial_id": "add-c04-02",
+              "mean_microseconds": 6.2487315,
+              "p50_microseconds": 6.042,
+              "p95_microseconds": 8.125,
+              "p99_microseconds": 9.791,
+              "aggregate_completed_requests_per_second": 608422.853883449,
+              "active_call_requests_per_second": 160032.4801921798
+            },
+            {
+              "trial_id": "add-c04-03",
+              "mean_microseconds": 5.0828335,
+              "p50_microseconds": 4.791,
+              "p95_microseconds": 6.958,
+              "p99_microseconds": 8.125,
+              "aggregate_completed_requests_per_second": 747390.0206242276,
+              "active_call_requests_per_second": 196740.6565648865
+            },
+            {
+              "trial_id": "add-c04-04",
+              "mean_microseconds": 7.36211325,
+              "p50_microseconds": 7.375,
+              "p95_microseconds": 8.833,
+              "p99_microseconds": 9.875,
+              "aggregate_completed_requests_per_second": 529182.2163553553,
+              "active_call_requests_per_second": 135830.5646819546
+            },
+            {
+              "trial_id": "add-c04-05",
+              "mean_microseconds": 7.981366,
+              "p50_microseconds": 7.875,
+              "p95_microseconds": 9.375,
+              "p99_microseconds": 11.292,
+              "aggregate_completed_requests_per_second": 487472.92087924515,
+              "active_call_requests_per_second": 125291.83600902402
+            }
+          ],
+          "cross_run": {
+            "mean_of_run_means_microseconds": 6.640910100000001,
+            "median_of_run_means_microseconds": 6.529506250000001,
+            "median_of_run_p50_microseconds": 6.416,
+            "median_of_run_p95_microseconds": 8.125,
+            "median_of_run_p99_microseconds": 9.791,
+            "minimum_run_mean_microseconds": 5.0828335,
+            "maximum_run_mean_microseconds": 7.981366,
+            "relative_run_mean_range": 0.44391296815130554,
+            "median_aggregate_completed_requests_per_second": 587353.5727543123,
+            "minimum_aggregate_completed_requests_per_second": 487472.92087924515,
+            "maximum_aggregate_completed_requests_per_second": 747390.0206242276,
+            "relative_aggregate_throughput_range": 0.44252237800501937,
+            "median_active_call_requests_per_second": 153150.93694871647
+          },
+          "scaling": {
+            "throughput_ratio": 0.9906452196467421,
+            "latency_mean_ratio": 4.045019108430197,
+            "latency_p99_ratio": 4.8955,
+            "scaling_efficiency": 0.24766130491168553
+          }
+        },
+        {
+          "worker_count": 8,
+          "counted_trial_ids": [
+            "add-c08-01",
+            "add-c08-02",
+            "add-c08-03",
+            "add-c08-04",
+            "add-c08-05"
+          ],
+          "per_run": [
+            {
+              "trial_id": "add-c08-01",
+              "mean_microseconds": 5.153318125,
+              "p50_microseconds": 5.0,
+              "p95_microseconds": 7.459,
+              "p99_microseconds": 9.625,
+              "aggregate_completed_requests_per_second": 1385401.3334487835,
+              "active_call_requests_per_second": 194049.73179295036
+            },
+            {
+              "trial_id": "add-c08-02",
+              "mean_microseconds": 4.882451375,
+              "p50_microseconds": 3.875,
+              "p95_microseconds": 10.25,
+              "p99_microseconds": 13.708,
+              "aggregate_completed_requests_per_second": 1375437.0666191224,
+              "active_call_requests_per_second": 204815.1478006271
+            },
+            {
+              "trial_id": "add-c08-03",
+              "mean_microseconds": 5.052490625000001,
+              "p50_microseconds": 4.666,
+              "p95_microseconds": 8.041,
+              "p99_microseconds": 11.291,
+              "aggregate_completed_requests_per_second": 1404340.2892063283,
+              "active_call_requests_per_second": 197922.18812875086
+            },
+            {
+              "trial_id": "add-c08-04",
+              "mean_microseconds": 4.2332395,
+              "p50_microseconds": 4.25,
+              "p95_microseconds": 5.625,
+              "p99_microseconds": 7.75,
+              "aggregate_completed_requests_per_second": 1605109.7062388407,
+              "active_call_requests_per_second": 236225.70846747508
+            },
+            {
+              "trial_id": "add-c08-05",
+              "mean_microseconds": 6.122706625,
+              "p50_microseconds": 5.834,
+              "p95_microseconds": 8.75,
+              "p99_microseconds": 11.292,
+              "aggregate_completed_requests_per_second": 1193132.1523611862,
+              "active_call_requests_per_second": 163326.460215624
+            }
+          ],
+          "cross_run": {
+            "mean_of_run_means_microseconds": 5.08884125,
+            "median_of_run_means_microseconds": 5.052490625000001,
+            "median_of_run_p50_microseconds": 4.666,
+            "median_of_run_p95_microseconds": 8.041,
+            "median_of_run_p99_microseconds": 11.291,
+            "minimum_run_mean_microseconds": 4.2332395,
+            "maximum_run_mean_microseconds": 6.122706625,
+            "relative_run_mean_range": 0.37396746777734,
+            "median_aggregate_completed_requests_per_second": 1385401.3334487835,
+            "minimum_aggregate_completed_requests_per_second": 1193132.1523611862,
+            "maximum_aggregate_completed_requests_per_second": 1605109.7062388407,
+            "relative_aggregate_throughput_range": 0.2973705481083145,
+            "median_active_call_requests_per_second": 197922.18812875086
+          },
+          "scaling": {
+            "throughput_ratio": 2.3366525240280547,
+            "latency_mean_ratio": 3.1300101938472658,
+            "latency_p99_ratio": 5.6455,
+            "scaling_efficiency": 0.29208156550350683
+          }
+        }
+      ]
+    },
+    "mnist": {
+      "worker_results": [
+        {
+          "worker_count": 1,
+          "counted_trial_ids": [
+            "mnist-c01-01",
+            "mnist-c01-02",
+            "mnist-c01-03",
+            "mnist-c01-04",
+            "mnist-c01-05"
+          ],
+          "per_run": [
+            {
+              "trial_id": "mnist-c01-01",
+              "mean_microseconds": 7.500732,
+              "p50_microseconds": 7.459,
+              "p95_microseconds": 7.709,
+              "p99_microseconds": 10.875,
+              "aggregate_completed_requests_per_second": 132147.68666884885,
+              "active_call_requests_per_second": 133320.32126997737
+            },
+            {
+              "trial_id": "mnist-c01-02",
+              "mean_microseconds": 7.632878,
+              "p50_microseconds": 7.583,
+              "p95_microseconds": 7.791,
+              "p99_microseconds": 10.833,
+              "aggregate_completed_requests_per_second": 129957.33630606408,
+              "active_call_requests_per_second": 131012.18177468577
+            },
+            {
+              "trial_id": "mnist-c01-03",
+              "mean_microseconds": 7.551585,
+              "p50_microseconds": 7.542,
+              "p95_microseconds": 7.833,
+              "p99_microseconds": 14.0,
+              "aggregate_completed_requests_per_second": 131213.50050458152,
+              "active_call_requests_per_second": 132422.5311639874
+            },
+            {
+              "trial_id": "mnist-c01-04",
+              "mean_microseconds": 7.320873,
+              "p50_microseconds": 7.292,
+              "p95_microseconds": 7.542,
+              "p99_microseconds": 8.125,
+              "aggregate_completed_requests_per_second": 135525.081084656,
+              "active_call_requests_per_second": 136595.73113752963
+            },
+            {
+              "trial_id": "mnist-c01-05",
+              "mean_microseconds": 7.441535,
+              "p50_microseconds": 7.583,
+              "p95_microseconds": 7.791,
+              "p99_microseconds": 8.375,
+              "aggregate_completed_requests_per_second": 132954.413255555,
+              "active_call_requests_per_second": 134380.87706367034
+            }
+          ],
+          "cross_run": {
+            "mean_of_run_means_microseconds": 7.4895206000000005,
+            "median_of_run_means_microseconds": 7.500732,
+            "median_of_run_p50_microseconds": 7.542,
+            "median_of_run_p95_microseconds": 7.791,
+            "median_of_run_p99_microseconds": 10.833,
+            "minimum_run_mean_microseconds": 7.320873,
+            "maximum_run_mean_microseconds": 7.632878,
+            "relative_run_mean_range": 0.041596606837839306,
+            "median_aggregate_completed_requests_per_second": 132147.68666884885,
+            "minimum_aggregate_completed_requests_per_second": 129957.33630606408,
+            "maximum_aggregate_completed_requests_per_second": 135525.081084656,
+            "relative_aggregate_throughput_range": 0.04213274495333564,
+            "median_active_call_requests_per_second": 133320.32126997737
+          },
+          "scaling": {
+            "throughput_ratio": 1.0,
+            "latency_mean_ratio": 1.0,
+            "latency_p99_ratio": 1.0,
+            "scaling_efficiency": 1.0
+          }
+        },
+        {
+          "worker_count": 2,
+          "counted_trial_ids": [
+            "mnist-c02-01",
+            "mnist-c02-02",
+            "mnist-c02-03",
+            "mnist-c02-04",
+            "mnist-c02-05"
+          ],
+          "per_run": [
+            {
+              "trial_id": "mnist-c02-01",
+              "mean_microseconds": 15.1877875,
+              "p50_microseconds": 15.0,
+              "p95_microseconds": 17.75,
+              "p99_microseconds": 21.583,
+              "aggregate_completed_requests_per_second": 130022.45877930496,
+              "active_call_requests_per_second": 65842.37500030865
+            },
+            {
+              "trial_id": "mnist-c02-02",
+              "mean_microseconds": 16.310343,
+              "p50_microseconds": 15.916,
+              "p95_microseconds": 20.5,
+              "p99_microseconds": 24.75,
+              "aggregate_completed_requests_per_second": 121492.223373901,
+              "active_call_requests_per_second": 61310.78911093408
+            },
+            {
+              "trial_id": "mnist-c02-03",
+              "mean_microseconds": 15.713026,
+              "p50_microseconds": 15.5,
+              "p95_microseconds": 18.875,
+              "p99_microseconds": 23.458,
+              "aggregate_completed_requests_per_second": 125392.17185448564,
+              "active_call_requests_per_second": 63641.46536765101
+            },
+            {
+              "trial_id": "mnist-c02-04",
+              "mean_microseconds": 16.3760985,
+              "p50_microseconds": 16.083,
+              "p95_microseconds": 19.25,
+              "p99_microseconds": 24.75,
+              "aggregate_completed_requests_per_second": 120894.00877702593,
+              "active_call_requests_per_second": 61064.605833923146
+            },
+            {
+              "trial_id": "mnist-c02-05",
+              "mean_microseconds": 16.022337,
+              "p50_microseconds": 15.875,
+              "p95_microseconds": 18.875,
+              "p99_microseconds": 22.25,
+              "aggregate_completed_requests_per_second": 123198.2259455464,
+              "active_call_requests_per_second": 62412.86773583653
+            }
+          ],
+          "cross_run": {
+            "mean_of_run_means_microseconds": 15.921918400000001,
+            "median_of_run_means_microseconds": 16.022337,
+            "median_of_run_p50_microseconds": 15.875,
+            "median_of_run_p95_microseconds": 18.875,
+            "median_of_run_p99_microseconds": 23.458,
+            "minimum_run_mean_microseconds": 15.1877875,
+            "maximum_run_mean_microseconds": 16.3760985,
+            "relative_run_mean_range": 0.07416589727203969,
+            "median_aggregate_completed_requests_per_second": 123198.2259455464,
+            "minimum_aggregate_completed_requests_per_second": 120894.00877702593,
+            "maximum_aggregate_completed_requests_per_second": 130022.45877930496,
+            "relative_aggregate_throughput_range": 0.07409562866849889,
+            "median_active_call_requests_per_second": 62412.86773583653
+          },
+          "scaling": {
+            "throughput_ratio": 0.9322768264136998,
+            "latency_mean_ratio": 2.1361031163358457,
+            "latency_p99_ratio": 2.1654204744761376,
+            "scaling_efficiency": 0.4661384132068499
+          }
+        },
+        {
+          "worker_count": 4,
+          "counted_trial_ids": [
+            "mnist-c04-01",
+            "mnist-c04-02",
+            "mnist-c04-03",
+            "mnist-c04-04",
+            "mnist-c04-05"
+          ],
+          "per_run": [
+            {
+              "trial_id": "mnist-c04-01",
+              "mean_microseconds": 13.99221075,
+              "p50_microseconds": 13.916,
+              "p95_microseconds": 16.75,
+              "p99_microseconds": 18.625,
+              "aggregate_completed_requests_per_second": 278469.9302599907,
+              "active_call_requests_per_second": 71468.33462324744
+            },
+            {
+              "trial_id": "mnist-c04-02",
+              "mean_microseconds": 17.437314750000002,
+              "p50_microseconds": 17.084,
+              "p95_microseconds": 23.042,
+              "p99_microseconds": 26.833,
+              "aggregate_completed_requests_per_second": 224942.89402867158,
+              "active_call_requests_per_second": 57348.27949928472
+            },
+            {
+              "trial_id": "mnist-c04-03",
+              "mean_microseconds": 12.531949749999999,
+              "p50_microseconds": 12.166,
+              "p95_microseconds": 16.0,
+              "p99_microseconds": 18.875,
+              "aggregate_completed_requests_per_second": 308458.51865264087,
+              "active_call_requests_per_second": 79796.04291024228
+            },
+            {
+              "trial_id": "mnist-c04-04",
+              "mean_microseconds": 15.4861335,
+              "p50_microseconds": 15.416,
+              "p95_microseconds": 19.958,
+              "p99_microseconds": 22.375,
+              "aggregate_completed_requests_per_second": 251838.94370688163,
+              "active_call_requests_per_second": 64573.8976743291
+            },
+            {
+              "trial_id": "mnist-c04-05",
+              "mean_microseconds": 13.01724025,
+              "p50_microseconds": 12.708,
+              "p95_microseconds": 16.458,
+              "p99_microseconds": 18.375,
+              "aggregate_completed_requests_per_second": 301164.1802551945,
+              "active_call_requests_per_second": 76821.1987176007
+            }
+          ],
+          "cross_run": {
+            "mean_of_run_means_microseconds": 14.492969800000001,
+            "median_of_run_means_microseconds": 13.99221075,
+            "median_of_run_p50_microseconds": 13.916,
+            "median_of_run_p95_microseconds": 16.75,
+            "median_of_run_p99_microseconds": 18.875,
+            "minimum_run_mean_microseconds": 12.531949749999999,
+            "maximum_run_mean_microseconds": 17.437314750000002,
+            "relative_run_mean_range": 0.3505782672691664,
+            "median_aggregate_completed_requests_per_second": 278469.9302599907,
+            "minimum_aggregate_completed_requests_per_second": 224942.89402867158,
+            "maximum_aggregate_completed_requests_per_second": 308458.51865264087,
+            "relative_aggregate_throughput_range": 0.29990895083715413,
+            "median_active_call_requests_per_second": 71468.33462324744
+          },
+          "scaling": {
+            "throughput_ratio": 2.1072629970270556,
+            "latency_mean_ratio": 1.865446032467231,
+            "latency_p99_ratio": 1.7423613034247207,
+            "scaling_efficiency": 0.5268157492567639
+          }
+        },
+        {
+          "worker_count": 8,
+          "counted_trial_ids": [
+            "mnist-c08-01",
+            "mnist-c08-02",
+            "mnist-c08-03",
+            "mnist-c08-04",
+            "mnist-c08-05"
+          ],
+          "per_run": [
+            {
+              "trial_id": "mnist-c08-01",
+              "mean_microseconds": 11.49337075,
+              "p50_microseconds": 10.875,
+              "p95_microseconds": 15.333,
+              "p99_microseconds": 23.417,
+              "aggregate_completed_requests_per_second": 643425.1321374044,
+              "active_call_requests_per_second": 87006.67730569815
+            },
+            {
+              "trial_id": "mnist-c08-02",
+              "mean_microseconds": 10.690282125,
+              "p50_microseconds": 10.041,
+              "p95_microseconds": 15.25,
+              "p99_microseconds": 20.25,
+              "aggregate_completed_requests_per_second": 698456.1412760252,
+              "active_call_requests_per_second": 93542.90076792524
+            },
+            {
+              "trial_id": "mnist-c08-03",
+              "mean_microseconds": 11.028789125,
+              "p50_microseconds": 10.458,
+              "p95_microseconds": 15.208,
+              "p99_microseconds": 22.333,
+              "aggregate_completed_requests_per_second": 668838.0493940244,
+              "active_call_requests_per_second": 90671.78533074001
+            },
+            {
+              "trial_id": "mnist-c08-04",
+              "mean_microseconds": 11.42514625,
+              "p50_microseconds": 11.208,
+              "p95_microseconds": 14.5,
+              "p99_microseconds": 21.375,
+              "aggregate_completed_requests_per_second": 640271.0651581454,
+              "active_call_requests_per_second": 87526.23188521547
+            },
+            {
+              "trial_id": "mnist-c08-05",
+              "mean_microseconds": 12.112359625,
+              "p50_microseconds": 11.708,
+              "p95_microseconds": 15.875,
+              "p99_microseconds": 19.792,
+              "aggregate_completed_requests_per_second": 625584.4327067428,
+              "active_call_requests_per_second": 82560.29633862527
+            }
+          ],
+          "cross_run": {
+            "mean_of_run_means_microseconds": 11.349989574999999,
+            "median_of_run_means_microseconds": 11.42514625,
+            "median_of_run_p50_microseconds": 10.875,
+            "median_of_run_p95_microseconds": 15.25,
+            "median_of_run_p99_microseconds": 21.375,
+            "minimum_run_mean_microseconds": 10.690282125,
+            "maximum_run_mean_microseconds": 12.112359625,
+            "relative_run_mean_range": 0.12446908502374754,
+            "median_aggregate_completed_requests_per_second": 643425.1321374044,
+            "minimum_aggregate_completed_requests_per_second": 625584.4327067428,
+            "maximum_aggregate_completed_requests_per_second": 698456.1412760252,
+            "relative_aggregate_throughput_range": 0.11325592509451522,
+            "median_active_call_requests_per_second": 87526.23188521547
+          },
+          "scaling": {
+            "throughput_ratio": 4.868985211597192,
+            "latency_mean_ratio": 1.5232041686064772,
+            "latency_p99_ratio": 1.9731376350041538,
+            "scaling_efficiency": 0.608623151449649
+          }
+        }
+      ]
+    }
+  }
+}

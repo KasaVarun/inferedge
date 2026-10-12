@@ -1,0 +1,36 @@
+{
+  "schema_version": 2,
+  "tool": {
+    "name": "inferedge-bench-concurrent",
+    "version": "0.1.0"
+  },
+  "model": "models/mnist_mlp.onnx",
+  "workload": "mnist",
+  "fixture": "test_00003",
+  "backend": "ONNX Runtime CPU",
+  "configuration": {
+    "worker_count": 2,
+    "session_ownership": "one_inference_engine_per_worker",
+    "onnx_intra_op_threads_per_session": 1,
+    "graph_optimizations": "disabled",
+    "warmup_iterations_per_worker": 100,
+    "measured_iterations_per_worker": 1000,
+    "correctness_check_interval": 1
+  },
+  "latency_microseconds": {
+    "sample_count": 2000,
+    "minimum": 5.875,
+    "mean": 15.713026,
+    "p50": 15.5,
+    "p95": 18.875,
+    "p99": 23.458,
+    "maximum": 53.292,
+    "population_standard_deviation": 2.374404183647759
+  },
+  "measurement_wall_microseconds": 15949.959,
+  "total_completed_requests": 2000,
+  "per_worker_completed_requests": [1000, 1000],
+  "aggregate_completed_requests_per_second": 125392.17185448564,
+  "active_call_requests_per_second": 63641.46536765101,
+  "correctness": "passed"
+}

@@ -1,0 +1,30 @@
+{
+  "trial_id": "add-c04-04",
+  "workload": "add",
+  "worker_count": 4,
+  "pilot": false,
+  "accepted": true,
+  "command": [
+    "build-concurrent/inferedge-bench-concurrent",
+    "--model",
+    "models/add_f32.onnx",
+    "--workload",
+    "add",
+    "--concurrency",
+    "4",
+    "--warmup",
+    "100",
+    "--iterations",
+    "1000",
+    "--check-interval",
+    "1",
+    "--format",
+    "json"
+  ],
+  "started_utc": "2026-10-12T03:25:53Z",
+  "finished_utc": "2026-10-12T03:25:58Z",
+  "returncode": 0,
+  "stdout_path": "benchmarks/concurrent_runs/20261012T032311Z-c07da91/runs/add-c04-04.stdout",
+  "stderr_path": "benchmarks/concurrent_runs/20261012T032311Z-c07da91/runs/add-c04-04.stderr",
+  "problems": []
+}

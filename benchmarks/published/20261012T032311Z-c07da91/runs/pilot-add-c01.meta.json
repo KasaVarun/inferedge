@@ -1,0 +1,30 @@
+{
+  "trial_id": "pilot-add-c01",
+  "workload": "add",
+  "worker_count": 1,
+  "pilot": true,
+  "accepted": true,
+  "command": [
+    "build-concurrent/inferedge-bench-concurrent",
+    "--model",
+    "models/add_f32.onnx",
+    "--workload",
+    "add",
+    "--concurrency",
+    "1",
+    "--warmup",
+    "100",
+    "--iterations",
+    "1000",
+    "--check-interval",
+    "1",
+    "--format",
+    "json"
+  ],
+  "started_utc": "2026-10-12T03:23:11Z",
+  "finished_utc": "2026-10-12T03:23:11Z",
+  "returncode": 0,
+  "stdout_path": "benchmarks/concurrent_runs/20261012T032311Z-c07da91/runs/pilot-add-c01.stdout",
+  "stderr_path": "benchmarks/concurrent_runs/20261012T032311Z-c07da91/runs/pilot-add-c01.stderr",
+  "problems": []
+}

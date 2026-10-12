@@ -152,7 +152,9 @@ python3 -m py_compile benchmarks/collect_baseline.py benchmarks/analyze_baseline
 
 ## Concurrent scaling collection
 
-`benchmarks/collect_concurrent.py` launches `inferedge-bench-concurrent` and stores one schema-version-2 JSON report per process. It does not launch `inferedge-bench`, does not write `aggregate.json`, and does not run a campaign by being imported. `benchmarks/analyze_concurrent.py` reads one completed run set and writes `aggregate.json`. It does not launch a benchmark. No concurrent scaling run set has been collected, and this repository has no measured concurrent scaling results. The measurement commit is whatever full SHA the operator passes. This file does not name one.
+`benchmarks/collect_concurrent.py` launches `inferedge-bench-concurrent` and stores one schema-version-2 JSON report per process. It does not launch `inferedge-bench`, does not write `aggregate.json`, and does not run a campaign by being imported. `benchmarks/analyze_concurrent.py` reads one completed run set and writes `aggregate.json`. It does not launch a benchmark. The measurement commit for a new collection is whatever full SHA the operator passes.
+
+One completed campaign is recorded in [`CONCURRENT_RESULTS.md`](CONCURRENT_RESULTS.md). Its sanitized derivative is [`published/20261012T032311Z-c07da91/`](published/20261012T032311Z-c07da91/), with provenance in [`published/20261012T032311Z-c07da91/PROVENANCE.md`](published/20261012T032311Z-c07da91/PROVENANCE.md) and the aggregate in [`published/20261012T032311Z-c07da91/aggregate.json`](published/20261012T032311Z-c07da91/aggregate.json). The private collector directory under `benchmarks/concurrent_runs/` stays untracked and is the authoritative record. The published directory is a path-sanitized copy, not a collector run set. Do not pass it to `analyze_concurrent.py`.
 
 ### Matrix
 
@@ -343,8 +345,12 @@ At worker count 1 each of those four values is 1. A zero or non-finite denominat
 
 `aggregate.json` uses aggregate schema version 2 and records source benchmark schema version 2. It contains the run-set id, the measurement commit, the experiment configuration, both model identities, the full trial order, the pilot ids, the counted ids, and one result per workload and worker count. Each cell lists the five counted trial ids that contributed, the per-run values, the cross-run reductions, and the scaling ratios. `median_of_run_p99_is_pooled_p99` and `confidence_interval_computed` are false. No estimated measurement is inserted.
 
-An existing `aggregate.json` is left untouched and the command returns an error. The full document is built and checked in memory first. It is published by writing a temporary file in the run set, flushing and closing it, then linking it into place without replacing an existing file. A failed publish removes only that temporary file. Source reports, stdout, stderr, metadata, `environment.json`, and any aggregate that was already present are not modified. No measured concurrent `aggregate.json` is in this repository.
+An existing `aggregate.json` is left untouched and the command returns an error. The full document is built and checked in memory first. It is published by writing a temporary file in the run set, flushing and closing it, then linking it into place without replacing an existing file. A failed publish removes only that temporary file. Source reports, stdout, stderr, metadata, `environment.json`, and any aggregate that was already present are not modified.
 
-### Private artifacts
+The measured aggregate for run set `20261012T032311Z-c07da91` is summarized in [`CONCURRENT_RESULTS.md`](CONCURRENT_RESULTS.md). The public copy is [`published/20261012T032311Z-c07da91/aggregate.json`](published/20261012T032311Z-c07da91/aggregate.json). Pass the analyzer a private collector directory, not that published derivative.
 
-`benchmarks/concurrent_runs/` stays untracked until a later review. The manifest contains absolute paths for the binary, compiler, models, fixture directory, and resolved ONNX Runtime library. `aggregate.json` repeats the model paths from that manifest and is part of the same private run set. Those raw files are not a published result. A later sanitization pass would have to write a separate derivative and leave this directory unchanged. The synthetic tests hash and parse reports. They do not execute a model.
+### Private artifacts and the published derivative
+
+`benchmarks/concurrent_runs/` stays untracked. The private manifest contains absolute paths for the binary, models, fixture directory, and resolved ONNX Runtime library. Its `aggregate.json` repeats the model paths from that manifest. Those raw files are the authoritative record and are not the GitHub copy.
+
+The sanitized derivative [`published/20261012T032311Z-c07da91/`](published/20261012T032311Z-c07da91/) rewrites those repository paths to repository-relative paths and leaves the private directory unchanged. [`PROVENANCE.md`](published/20261012T032311Z-c07da91/PROVENANCE.md) lists the rewritten fields. The synthetic tests hash and parse reports. They do not execute a model.
