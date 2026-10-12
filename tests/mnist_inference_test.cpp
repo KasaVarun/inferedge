@@ -1,15 +1,22 @@
 #include "inferedge/inference_engine.hpp"
 
+#include <atomic>
 #include <bit>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <system_error>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -296,17 +303,97 @@ TEST_F(MnistInferenceTest, StaysUsableAfterARejectedInput) {
     ExpectLogits("synthetic", result.outputs.front().values, reference.values, 5, maximum, total);
 }
 
-TEST_F(MnistInferenceTest, RejectsATruncatedFixtureFile) {
-    const std::filesystem::path path =
-        std::filesystem::temp_directory_path() / "inferedge-mnist-truncated.f32";
-    {
-        std::ofstream output{path, std::ios::binary | std::ios::trunc};
-        const char bytes[8] = {};
-        output.write(bytes, sizeof(bytes));
-        ASSERT_TRUE(output.good());
+namespace {
+
+constexpr std::string_view kTruncatedFixturePrefix = "inferedge-mnist-truncated-";
+constexpr int kTruncatedFixtureAttempts = 32;
+
+std::atomic<std::uint64_t>& TruncatedFixtureIds() {
+    static std::atomic<std::uint64_t> next{0};
+    return next;
+}
+
+// native() and string_view do not allocate. filename().string() can throw, so
+// the destructor must not call it.
+bool IsOwnedTruncatedFixture(const std::filesystem::path& path) noexcept {
+    const std::filesystem::path::string_type& native = path.native();
+    if (native.size() < 2 || native.front() != '/') {
+        return false;
     }
-    const FloatFile file = ReadLittleEndianFloat32(path, kInputCount);
-    std::filesystem::remove(path);
+    const auto separator = native.find_last_of('/');
+    if (separator == std::filesystem::path::string_type::npos || separator == 0 ||
+        separator + 1 >= native.size()) {
+        return false;
+    }
+    const std::string_view name(native.data() + separator + 1, native.size() - separator - 1);
+    return name.starts_with(kTruncatedFixturePrefix) && name.ends_with(".f32");
+}
+
+void RemoveOwnedTruncatedFixture(const std::filesystem::path& path) noexcept {
+    if (!IsOwnedTruncatedFixture(path)) {
+        return;
+    }
+    std::error_code error;
+    std::filesystem::remove(path, error);
+}
+
+class TruncatedFixtureFile {
+public:
+    TruncatedFixtureFile() {
+        const std::filesystem::path temp = std::filesystem::temp_directory_path();
+        const std::string pid = std::to_string(static_cast<long>(::getpid()));
+        for (int attempt = 0; attempt < kTruncatedFixtureAttempts; ++attempt) {
+            const std::uint64_t id = TruncatedFixtureIds().fetch_add(1, std::memory_order_relaxed);
+            const std::filesystem::path candidate =
+                temp /
+                (std::string{kTruncatedFixturePrefix} + pid + "-" + std::to_string(id) + ".f32");
+            const int fd = ::open(candidate.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+            if (fd < 0) {
+                continue;
+            }
+            const char bytes[8] = {};
+            const ssize_t written = ::write(fd, bytes, sizeof(bytes));
+            const int write_error = errno;
+            ::close(fd);
+            if (written != static_cast<ssize_t>(sizeof(bytes))) {
+                RemoveOwnedTruncatedFixture(candidate);
+                throw std::system_error(write_error, std::generic_category(),
+                                        "truncated fixture write failed");
+            }
+            path_ = candidate;
+            owned_ = true;
+            return;
+        }
+        throw std::runtime_error("could not create a unique truncated fixture file");
+    }
+
+    ~TruncatedFixtureFile() noexcept {
+        if (!owned_) {
+            return;
+        }
+        owned_ = false;
+        RemoveOwnedTruncatedFixture(path_);
+    }
+
+    TruncatedFixtureFile(const TruncatedFixtureFile&) = delete;
+    TruncatedFixtureFile& operator=(const TruncatedFixtureFile&) = delete;
+    TruncatedFixtureFile(TruncatedFixtureFile&&) = delete;
+    TruncatedFixtureFile& operator=(TruncatedFixtureFile&&) = delete;
+
+    const std::filesystem::path& path() const { return path_; }
+
+private:
+    std::filesystem::path path_;
+    bool owned_{false};
+};
+
+} // namespace
+
+TEST_F(MnistInferenceTest, RejectsATruncatedFixtureFile) {
+    const TruncatedFixtureFile truncated;
+    const FloatFile file = ReadLittleEndianFloat32(truncated.path(), kInputCount);
     EXPECT_FALSE(file.error.empty());
     EXPECT_TRUE(file.values.empty());
+    std::error_code error;
+    EXPECT_TRUE(std::filesystem::is_regular_file(truncated.path(), error));
 }

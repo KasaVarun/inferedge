@@ -1,5 +1,6 @@
 #include "inferedge/benchmark_cli.hpp"
 
+#include <atomic>
 #include <bit>
 #include <cerrno>
 #include <charconv>
@@ -13,6 +14,7 @@
 #include <gtest/gtest.h>
 #include <poll.h>
 #include <spawn.h>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <sys/wait.h>
@@ -63,23 +65,86 @@ protected:
     void SetUp() override { ASSERT_EQ(::setenv("ORT_DISABLE_TELEMETRY", "1", 1), 0); }
 };
 
+// One directory per object. An existing candidate is left untouched.
+constexpr std::string_view kFixtureDirectoryPrefix = "inferedge-bench-fixture-";
+constexpr int kFixtureDirectoryAttempts = 32;
+
+std::atomic<std::uint64_t>& FixtureDirectoryIds() {
+    static std::atomic<std::uint64_t> next{0};
+    return next;
+}
+
+// native() and string_view do not allocate. parent_path() and filename().string()
+// can throw, so the destructor must not call them.
+bool IsOwnedFixtureDirectory(const std::filesystem::path& root) noexcept {
+    const std::filesystem::path::string_type& native = root.native();
+    if (native.size() < 2 || native.front() != '/') {
+        return false;
+    }
+    const auto separator = native.find_last_of('/');
+    if (separator == std::filesystem::path::string_type::npos || separator == 0 ||
+        separator + 1 >= native.size()) {
+        return false;
+    }
+    const std::string_view name(native.data() + separator + 1, native.size() - separator - 1);
+    return name.starts_with(kFixtureDirectoryPrefix);
+}
+
+void RemoveOwnedFixtureDirectory(const std::filesystem::path& root) noexcept {
+    if (!IsOwnedFixtureDirectory(root)) {
+        return;
+    }
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
+}
+
+std::filesystem::path CreateExclusiveFixtureRoot() {
+    const std::filesystem::path temp = std::filesystem::temp_directory_path();
+    const std::string pid = std::to_string(static_cast<long>(::getpid()));
+    for (int attempt = 0; attempt < kFixtureDirectoryAttempts; ++attempt) {
+        const std::uint64_t id = FixtureDirectoryIds().fetch_add(1, std::memory_order_relaxed);
+        const std::filesystem::path candidate =
+            temp / (std::string{kFixtureDirectoryPrefix} + pid + "-" + std::to_string(id));
+        std::error_code error;
+        if (!std::filesystem::create_directory(candidate, error) || error) {
+            continue;
+        }
+        std::error_code inputs_error;
+        const bool inputs = std::filesystem::create_directory(candidate / "inputs", inputs_error);
+        std::error_code onnx_error;
+        const bool onnx = inputs && !inputs_error &&
+                          std::filesystem::create_directory(candidate / "onnx", onnx_error);
+        if (!inputs || inputs_error || !onnx || onnx_error) {
+            RemoveOwnedFixtureDirectory(candidate);
+            throw std::runtime_error("fixture subdirectory creation failed");
+        }
+        return candidate;
+    }
+    throw std::runtime_error("could not create a unique fixture directory");
+}
+
 class TempTree {
 public:
-    TempTree() : root_(std::filesystem::temp_directory_path() / "inferedge-bench-fixture") {
-        std::filesystem::remove_all(root_);
-        std::filesystem::create_directories(root_ / "inputs");
-        std::filesystem::create_directories(root_ / "onnx");
-    }
+    TempTree() : root_(CreateExclusiveFixtureRoot()), owned_(true) {}
 
-    ~TempTree() { std::filesystem::remove_all(root_); }
+    ~TempTree() noexcept {
+        if (!owned_) {
+            return;
+        }
+        owned_ = false;
+        RemoveOwnedFixtureDirectory(root_);
+    }
 
     TempTree(const TempTree&) = delete;
     TempTree& operator=(const TempTree&) = delete;
+    TempTree(TempTree&&) = delete;
+    TempTree& operator=(TempTree&&) = delete;
 
     const std::filesystem::path& root() const { return root_; }
 
 private:
     std::filesystem::path root_;
+    bool owned_{false};
 };
 
 BenchmarkCliResult run_words(const std::vector<std::string>& args) {
@@ -610,6 +675,35 @@ TEST_F(BenchmarkCommandTest, RejectsIncompatibleModelMetadata) {
     expect_failure(rank2, 6, "does not match the add workload");
     expect_failure(add_as_mnist, 6, "does not match the mnist workload");
     expect_failure(mnist_as_add, 6, "does not match the add workload");
+}
+
+TEST_F(BenchmarkCommandTest, TempTreesOwnDistinctDirectories) {
+    std::filesystem::path removed;
+    std::filesystem::path surviving;
+    {
+        const TempTree second;
+        surviving = second.root();
+        const std::filesystem::path second_marker = surviving / "inputs" / "marker.f32";
+        write_f32(second_marker, {2.F});
+        {
+            const TempTree first;
+            removed = first.root();
+            ASSERT_NE(removed, surviving);
+            EXPECT_TRUE(removed.filename().string().starts_with(kFixtureDirectoryPrefix));
+            EXPECT_TRUE(surviving.filename().string().starts_with(kFixtureDirectoryPrefix));
+            write_f32(removed / "inputs" / "marker.f32", {1.F});
+            std::error_code error;
+            EXPECT_TRUE(std::filesystem::is_regular_file(removed / "inputs" / "marker.f32", error));
+            EXPECT_TRUE(std::filesystem::is_regular_file(second_marker, error));
+        }
+        std::error_code error;
+        EXPECT_FALSE(std::filesystem::exists(removed, error));
+        EXPECT_TRUE(std::filesystem::is_regular_file(second_marker, error));
+        EXPECT_TRUE(std::filesystem::is_directory(surviving / "onnx", error));
+    }
+    std::error_code error;
+    EXPECT_FALSE(std::filesystem::exists(surviving, error));
+    EXPECT_FALSE(std::filesystem::exists(removed, error));
 }
 
 TEST_F(BenchmarkCommandTest, RejectsAMissingFixture) {
