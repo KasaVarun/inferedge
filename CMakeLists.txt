@@ -462,6 +462,7 @@ if(INFEREDGE_ENABLE_LONG_STRESS)
         inferedge_scheduler_stress
         PRIVATE
             "INFEREDGE_ADD_MODEL_PATH=\"${INFEREDGE_ADD_MODEL}\""
+            "INFEREDGE_BATCH_ADD_MODEL_PATH=\"${INFEREDGE_BATCH_ADD_MODEL}\""
     )
     set_target_properties(
         inferedge_scheduler_stress
