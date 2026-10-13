@@ -22,11 +22,11 @@ namespace inferedge {
 inline constexpr std::uint32_t kMaxSchedulerWorkers = 64;
 inline constexpr std::size_t kMaxSchedulerQueueCapacity = 1024;
 
-// enable_batching asks start() to require a dynamic batch axis on every model
-// input and output. The bounds below are checked either way. Worker-local
-// batch execution is not implemented: a started worker still runs one request
-// at a time. max_batch_size is 1 through 32. max_batch_delay is 0 through
-// 1000 milliseconds.
+// enable_batching selects worker-local dynamic batching. When it is false,
+// each popped request is executed alone. When it is true, start() requires a
+// dynamic batch axis, and a worker may run several validated requests in one
+// InferenceEngine::run(). max_batch_size is 1 through 32. max_batch_delay is
+// 0 through 1000 milliseconds. Both bounds are checked either way.
 struct SchedulerConfig {
     std::filesystem::path model_path;
     std::uint32_t worker_count{1};
@@ -186,6 +186,22 @@ public:
     static void SetBeforeLoop(InferenceScheduler& scheduler, std::function<void()> hook);
     static void SetReachedRun(InferenceScheduler& scheduler, std::shared_ptr<std::latch> latch);
     static void SetBeforeRun(InferenceScheduler& scheduler, std::shared_ptr<std::latch> latch);
+    // Called on the worker thread immediately before a sealed batch calls
+    // InferenceEngine::run, with the number of requests in that run. Set it
+    // before start(). It must not call back into the scheduler. The unbatched
+    // path does not call it.
+    static void SetOnBatchRun(InferenceScheduler& scheduler,
+                              std::function<void(std::size_t)> callback);
+    // Counted down when a batching worker is about to block in wait_pop_until.
+    // Set it before start().
+    static void SetReachedBatchWait(InferenceScheduler& scheduler,
+                                    std::shared_ptr<std::latch> latch);
+    // Holds that worker before wait_pop_until. A null latch does not wait.
+    static void SetBeforeBatchWait(InferenceScheduler& scheduler,
+                                   std::shared_ptr<std::latch> latch);
+    // Runs the startup batch-metadata check on caller-supplied signatures.
+    static SchedulerError CheckBatchMetadata(const std::vector<TensorMetadata>& inputs,
+                                             const std::vector<TensorMetadata>& outputs);
     static void SetAfterPublish(InferenceScheduler& scheduler, std::shared_ptr<std::latch> latch);
     static void SetHoldOtherWorkers(InferenceScheduler& scheduler,
                                     std::shared_ptr<std::latch> latch);

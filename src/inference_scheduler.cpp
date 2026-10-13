@@ -2,13 +2,17 @@
 
 #include "inferedge/bounded_queue.hpp"
 #include "inferedge/concurrent_inference.hpp"
+#include "inferedge/tensor_batch.hpp"
 
 #include <array>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <new>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -119,6 +123,26 @@ SchedulerError ValidateConfig(const SchedulerConfig& config) {
     return {};
 }
 
+bool CheckedMultiply(std::size_t left, std::size_t right, std::size_t& product) {
+    if (left != 0 && right > std::numeric_limits<std::size_t>::max() / left) {
+        return false;
+    }
+    product = left * right;
+    return true;
+}
+
+bool FitsSize(std::int64_t value, std::size_t& converted) {
+    if (value < 0) {
+        return false;
+    }
+    const auto unsigned_value = static_cast<std::uint64_t>(value);
+    if (unsigned_value > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        return false;
+    }
+    converted = static_cast<std::size_t>(unsigned_value);
+    return true;
+}
+
 SchedulerError MakeModelLoad(std::string message) {
     SchedulerError error;
     error.kind = SchedulerErrorKind::kModelLoad;
@@ -127,8 +151,9 @@ SchedulerError MakeModelLoad(std::string message) {
     return error;
 }
 
-// Same shape contract the batch helper will require. Checked here so start()
-// can fail before any worker thread exists.
+// Same shape contract the batch helper will require, including a static
+// dimension product that fits in std::size_t. Checked here so start() can
+// fail before any worker thread exists.
 SchedulerError ValidateBatchSignature(const std::vector<TensorMetadata>& metadata,
                                       const char* role) {
     if (metadata.empty()) {
@@ -154,6 +179,7 @@ SchedulerError ValidateBatchSignature(const std::vector<TensorMetadata>& metadat
         if (tensor.dimensions[0] >= 0) {
             return MakeModelLoad(std::string{role} + " " + tensor.name + " axis 0 is not dynamic");
         }
+        std::size_t row = 1;
         for (std::size_t axis = 1; axis < tensor.dimensions.size(); ++axis) {
             const std::int64_t dimension = tensor.dimensions[axis];
             if (dimension < 0) {
@@ -163,6 +189,11 @@ SchedulerError ValidateBatchSignature(const std::vector<TensorMetadata>& metadat
             if (dimension == 0) {
                 return MakeModelLoad(std::string{role} + " " + tensor.name +
                                      " has a non-positive dimension");
+            }
+            std::size_t converted = 0;
+            if (!FitsSize(dimension, converted) || !CheckedMultiply(row, converted, row)) {
+                return MakeModelLoad(std::string{role} + " " + tensor.name +
+                                     " shape product overflows");
             }
         }
     }
@@ -184,6 +215,12 @@ std::string WorkerFailureMessage(std::string_view text) {
     return "worker error";
 }
 
+enum class BatchStep {
+    kContinue,
+    kClosed,
+    kFault,
+};
+
 struct ExecutingGuard {
     std::atomic<std::uint64_t>& executing;
 
@@ -193,6 +230,119 @@ struct ExecutingGuard {
 
     ~ExecutingGuard() { executing.fetch_sub(1, std::memory_order_relaxed); }
 };
+
+const TensorMetadata* FindModelTensor(const std::vector<TensorMetadata>& metadata,
+                                      const std::string& name) {
+    for (const TensorMetadata& tensor : metadata) {
+        if (tensor.name == name) {
+            return &tensor;
+        }
+    }
+    return nullptr;
+}
+
+const NamedTensor* FindNamedTensor(const std::vector<NamedTensor>& tensors,
+                                   const std::string& name) {
+    for (const NamedTensor& tensor : tensors) {
+        if (tensor.name == name) {
+            return &tensor;
+        }
+    }
+    return nullptr;
+}
+
+InferenceError InputError(InferenceErrorKind kind, std::string message) {
+    return InferenceError{kind, std::move(message)};
+}
+
+// Per-request check used before assembly. A failure here completes only that
+// request. The rules match the batch helper's single-request checks.
+std::optional<InferenceError> ValidateQueuedRequest(const InferenceEngine& engine,
+                                                    const RequestEntry& entry) {
+    const std::vector<TensorMetadata>& model = engine.inputs();
+    const std::vector<NamedTensor>& tensors = entry.inputs;
+    for (std::size_t index = 0; index < tensors.size(); ++index) {
+        const std::string& name = tensors[index].name;
+        if (name.empty()) {
+            return InputError(InferenceErrorKind::kEmptyName, "input name is empty");
+        }
+        for (std::size_t earlier = 0; earlier < index; ++earlier) {
+            if (tensors[earlier].name == name) {
+                return InputError(InferenceErrorKind::kDuplicateInput,
+                                  "duplicate input name: " + name);
+            }
+        }
+        if (FindModelTensor(model, name) == nullptr) {
+            return InputError(InferenceErrorKind::kUnexpectedInput,
+                              "unexpected input name: " + name);
+        }
+    }
+    for (const TensorMetadata& expected : model) {
+        if (FindNamedTensor(tensors, expected.name) == nullptr) {
+            return InputError(InferenceErrorKind::kMissingInput,
+                              "missing input name: " + expected.name);
+        }
+    }
+    for (const TensorMetadata& expected : model) {
+        const NamedTensor* tensor = FindNamedTensor(tensors, expected.name);
+        const std::string where = "input tensor " + tensor->name;
+        if (tensor->shape.size() != expected.dimensions.size()) {
+            return InputError(InferenceErrorKind::kShapeMismatch,
+                              where + " rank does not match metadata");
+        }
+        if (tensor->shape[0] != 1) {
+            return InputError(InferenceErrorKind::kShapeMismatch, where + " batch axis is not 1");
+        }
+        for (std::size_t axis = 1; axis < expected.dimensions.size(); ++axis) {
+            if (tensor->shape[axis] != expected.dimensions[axis]) {
+                return InputError(InferenceErrorKind::kShapeMismatch,
+                                  where + " static dimension does not match metadata");
+            }
+        }
+        std::size_t count = 1;
+        for (const std::int64_t dimension : tensor->shape) {
+            if (dimension < 0) {
+                return InputError(InferenceErrorKind::kShapeMismatch,
+                                  where + " dimension is negative");
+            }
+            std::size_t converted = 0;
+            if (!FitsSize(dimension, converted) || !CheckedMultiply(count, converted, count)) {
+                return InputError(InferenceErrorKind::kElementCountMismatch,
+                                  where + " shape product overflows");
+            }
+        }
+        if (tensor->values.size() != count) {
+            return InputError(InferenceErrorKind::kElementCountMismatch,
+                              where + " element count does not match its shape");
+        }
+    }
+    return std::nullopt;
+}
+
+InferenceError FromBatchError(const TensorBatchError& error) {
+    InferenceError mapped;
+    mapped.message = error.message;
+    switch (error.kind) {
+    case TensorBatchErrorKind::kRankMismatch:
+    case TensorBatchErrorKind::kBatchAxisMismatch:
+    case TensorBatchErrorKind::kShapeMismatch:
+        mapped.kind = InferenceErrorKind::kShapeMismatch;
+        break;
+    case TensorBatchErrorKind::kElementCountMismatch:
+        mapped.kind = InferenceErrorKind::kElementCountMismatch;
+        break;
+    case TensorBatchErrorKind::kEmptyName:
+        mapped.kind = InferenceErrorKind::kEmptyName;
+        break;
+    case TensorBatchErrorKind::kUnsupportedType:
+        mapped.kind = InferenceErrorKind::kUnsupportedType;
+        break;
+    default:
+        mapped.kind = InferenceErrorKind::kExecution;
+        break;
+    }
+    return mapped;
+}
 
 } // namespace
 
@@ -210,6 +360,11 @@ struct InferenceScheduler::Impl {
     bool WaitForStart();
     bool GateIsStart() const;
     void WorkerMain(std::uint32_t index, InferenceEngine* engine) noexcept;
+    BatchStep RunBatch(std::uint32_t index, InferenceEngine& engine);
+    bool PublishInferenceFailure(RequestEntry& entry, InferenceError error);
+    bool PublishBatchSuccess(RequestEntry& entry, std::vector<NamedTensor> outputs);
+    void NotePublished(CompletionStatus status);
+    void FailUnpublished(std::vector<RequestEntry>& owned, std::string_view text);
     bool ConsumeThrow(std::uint32_t index);
     CompletionStatus Execute(InferenceEngine& engine, RequestEntry& entry);
     bool PublishWorkerFailure(RequestEntry& entry, std::string_view text);
@@ -257,6 +412,9 @@ struct InferenceScheduler::Impl {
     std::function<void()> before_loop_hook_;
     std::shared_ptr<std::latch> reached_run_;
     std::shared_ptr<std::latch> before_run_;
+    std::function<void(std::size_t)> on_batch_run_;
+    std::shared_ptr<std::latch> reached_batch_wait_;
+    std::shared_ptr<std::latch> before_batch_wait_;
     std::shared_ptr<std::latch> after_publish_;
     std::shared_ptr<std::latch> hold_other_workers_;
     std::shared_ptr<std::latch> after_drain_closed_;
@@ -405,6 +563,303 @@ SchedulerError InferenceScheduler::Impl::AbortStart(SchedulerError error) {
     return error;
 }
 
+bool InferenceScheduler::Impl::PublishInferenceFailure(RequestEntry& entry, InferenceError error) {
+    SchedulerCompletion completion;
+    completion.request_id = entry.request_id;
+    completion.sequence = entry.sequence;
+    completion.status = CompletionStatus::kInferenceFailed;
+    completion.inference_error = std::move(error);
+    try {
+        entry.completion.set_value(std::move(completion));
+    } catch (const std::future_error&) {
+        entry.backstop = false;
+        return false;
+    }
+    entry.backstop = false;
+    return true;
+}
+
+bool InferenceScheduler::Impl::PublishBatchSuccess(RequestEntry& entry,
+                                                   std::vector<NamedTensor> outputs) {
+    SchedulerCompletion completion;
+    completion.request_id = entry.request_id;
+    completion.sequence = entry.sequence;
+    completion.status = CompletionStatus::kSucceeded;
+    completion.outputs = std::move(outputs);
+    try {
+        entry.completion.set_value(std::move(completion));
+    } catch (const std::future_error&) {
+        entry.backstop = false;
+        return false;
+    }
+    entry.backstop = false;
+    return true;
+}
+
+void InferenceScheduler::Impl::NotePublished(CompletionStatus status) {
+    if (const std::shared_ptr<std::latch> after_publish = after_publish_;
+        after_publish != nullptr) {
+        after_publish->count_down();
+    }
+    try {
+        std::lock_guard<std::mutex> lock(admission_);
+        RecordLocked(status);
+    } catch (...) {
+    }
+}
+
+void InferenceScheduler::Impl::FailUnpublished(std::vector<RequestEntry>& owned,
+                                               std::string_view text) {
+    for (RequestEntry& entry : owned) {
+        if (!entry.backstop) {
+            continue;
+        }
+        // One entry's publication failure must not skip the entries after it.
+        // A promise that is still armed keeps the destructor backstop.
+        try {
+            if (PublishWorkerFailure(entry, text)) {
+                NotePublished(CompletionStatus::kWorkerFailed);
+            }
+        } catch (...) {
+        }
+    }
+}
+
+BatchStep InferenceScheduler::Impl::RunBatch(std::uint32_t index, InferenceEngine& engine) {
+    // Guards are declared first so a still-armed entry's destructor runs while
+    // its executing count is still held.
+    std::vector<std::unique_ptr<ExecutingGuard>> guards;
+    std::vector<RequestEntry> owned;
+    // The request most recently removed from the queue, until it is published
+    // or moved into owned. The catch below can still see it.
+    std::optional<RequestEntry> incoming;
+
+    auto fail_parked = [&](std::string_view text) {
+        try {
+            if (incoming.has_value() && incoming->backstop &&
+                PublishWorkerFailure(*incoming, text)) {
+                NotePublished(CompletionStatus::kWorkerFailed);
+            }
+        } catch (...) {
+        }
+        FailUnpublished(owned, text);
+    };
+
+    try {
+        // Reserve before any pop. A throw here owns no request. Later
+        // insertions of a nothrow move cannot allocate.
+        const std::size_t limit = static_cast<std::size_t>(config_.max_batch_size);
+        owned.reserve(limit);
+        guards.reserve(limit);
+
+        QueuePop<RequestEntry> popped = queue_->wait_pop();
+        if (popped.result != QueuePopResult::kReady || !popped.value.has_value()) {
+            return BatchStep::kClosed;
+        }
+        incoming.emplace(std::move(*popped.value));
+        popped.value.reset();
+
+        const bool wait_for_more = config_.max_batch_delay > std::chrono::milliseconds::zero();
+        const std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::now() + config_.max_batch_delay;
+        bool signaled_wait = false;
+
+        // false means this worker must retire. incoming stays the owner until
+        // the entry is published or moved into owned.
+        auto adopt = [&]() -> bool {
+            std::unique_ptr<ExecutingGuard> guard;
+            try {
+                guard = std::make_unique<ExecutingGuard>(executing_);
+            } catch (const std::bad_alloc&) {
+                fail_parked("alloc failed");
+                return false;
+            }
+
+            std::optional<InferenceError> invalid;
+            try {
+                invalid = ValidateQueuedRequest(engine, *incoming);
+            } catch (const std::bad_alloc&) {
+                fail_parked("alloc failed");
+                return false;
+            } catch (const std::length_error&) {
+                fail_parked("length error");
+                return false;
+            } catch (const std::exception& ex) {
+                fail_parked(ex.what());
+                return false;
+            } catch (...) {
+                fail_parked("worker error");
+                return false;
+            }
+            if (invalid.has_value()) {
+                // The local guard stays alive through this publication and is
+                // released when adopt returns. It does not cover the neighbors.
+                try {
+                    if (PublishInferenceFailure(*incoming, std::move(*invalid))) {
+                        NotePublished(CompletionStatus::kInferenceFailed);
+                    }
+                } catch (const std::bad_alloc&) {
+                    fail_parked("alloc failed");
+                    return false;
+                } catch (const std::length_error&) {
+                    fail_parked("length error");
+                    return false;
+                } catch (const std::exception& ex) {
+                    fail_parked(ex.what());
+                    return false;
+                } catch (...) {
+                    fail_parked("worker error");
+                    return false;
+                }
+                incoming.reset();
+                return true;
+            }
+            // The guard joins the vector before the entry moves, so the
+            // increment outlives a throw from that move.
+            guards.push_back(std::move(guard));
+            owned.push_back(std::move(*incoming));
+            incoming.reset();
+            return true;
+        };
+
+        if (!adopt()) {
+            return BatchStep::kFault;
+        }
+
+        while (owned.size() < limit) {
+            // A drain-closed queue still returns kReady while items remain.
+            // kClosed means closed and empty, so the group seals without
+            // waiting out the deadline. An open empty queue is the only
+            // path into wait_pop_until.
+            QueueTake<RequestEntry> taken = queue_->try_pop();
+            if (taken.result == QueueTakeResult::kReady && taken.value.has_value()) {
+                incoming.emplace(std::move(*taken.value));
+                taken.value.reset();
+                if (!adopt()) {
+                    return BatchStep::kFault;
+                }
+                continue;
+            }
+            if (taken.result == QueueTakeResult::kClosed) {
+                break;
+            }
+            if (!wait_for_more || std::chrono::steady_clock::now() >= deadline) {
+                break;
+            }
+            if (!signaled_wait) {
+                signaled_wait = true;
+                if (const std::shared_ptr<std::latch> reached = reached_batch_wait_;
+                    reached != nullptr) {
+                    reached->count_down();
+                }
+                if (const std::shared_ptr<std::latch> hold = before_batch_wait_; hold != nullptr) {
+                    hold->wait();
+                }
+            }
+            QueueWait<RequestEntry> waited = queue_->wait_pop_until(deadline);
+            if (waited.result == QueueWaitResult::kReady && waited.value.has_value()) {
+                incoming.emplace(std::move(*waited.value));
+                waited.value.reset();
+                if (!adopt()) {
+                    return BatchStep::kFault;
+                }
+                continue;
+            }
+            break;
+        }
+
+        if (owned.empty()) {
+            return BatchStep::kContinue;
+        }
+
+        std::vector<std::span<const NamedTensor>> requests;
+        requests.reserve(owned.size());
+        for (const RequestEntry& entry : owned) {
+            requests.emplace_back(entry.inputs.data(), entry.inputs.size());
+        }
+        const TensorBatchAssembly assembled = AssembleBatchInputs(engine.inputs(), requests);
+        if (assembled.error.kind != TensorBatchErrorKind::kNone) {
+            FailUnpublished(owned, assembled.error.kind == TensorBatchErrorKind::kOverflow
+                                       ? "shape overflow"
+                                       : "batch failed");
+            return BatchStep::kFault;
+        }
+
+        std::vector<NamedTensorView> views;
+        views.reserve(assembled.inputs.size());
+        for (const NamedTensor& input : assembled.inputs) {
+            views.push_back(
+                NamedTensorView{input.name, input.shape, std::span<const float>{input.values}});
+        }
+        if (on_batch_run_) {
+            on_batch_run_(owned.size());
+        }
+        if (const std::shared_ptr<std::latch> reached = reached_run_; reached != nullptr) {
+            reached->count_down();
+        }
+        if (const std::shared_ptr<std::latch> before_run = before_run_; before_run != nullptr) {
+            before_run->wait();
+        }
+        if (ConsumeThrow(index)) {
+            FailUnpublished(owned, "injected");
+            return BatchStep::kFault;
+        }
+
+        const InferenceResult result = engine.run(views);
+        if (result.error.kind != InferenceErrorKind::kNone) {
+            for (RequestEntry& entry : owned) {
+                if (PublishInferenceFailure(entry, result.error)) {
+                    NotePublished(CompletionStatus::kInferenceFailed);
+                }
+            }
+            return BatchStep::kContinue;
+        }
+
+        TensorBatchSplit split = SplitBatchOutputs(engine.outputs(), result.outputs, owned.size());
+        if (split.error.kind == TensorBatchErrorKind::kOverflow) {
+            FailUnpublished(owned, "shape overflow");
+            return BatchStep::kFault;
+        }
+        if (split.error.kind != TensorBatchErrorKind::kNone ||
+            split.requests.size() != owned.size()) {
+            if (split.error.kind == TensorBatchErrorKind::kNone) {
+                FailUnpublished(owned, "batch failed");
+                return BatchStep::kFault;
+            }
+            const InferenceError mapped = FromBatchError(split.error);
+            for (RequestEntry& entry : owned) {
+                if (PublishInferenceFailure(entry, mapped)) {
+                    NotePublished(CompletionStatus::kInferenceFailed);
+                }
+            }
+            return BatchStep::kContinue;
+        }
+        // A throw after some successes leaves those promises satisfied and
+        // their backstops clear. The catch publishes only the entries that
+        // are still armed, so a published request is not completed twice
+        // and is not counted twice.
+        for (std::size_t request_index = 0; request_index < owned.size(); ++request_index) {
+            if (PublishBatchSuccess(owned[request_index],
+                                    std::move(split.requests[request_index]))) {
+                NotePublished(CompletionStatus::kSucceeded);
+            }
+        }
+        return BatchStep::kContinue;
+    } catch (const std::bad_alloc&) {
+        fail_parked("alloc failed");
+        return BatchStep::kFault;
+    } catch (const std::length_error&) {
+        fail_parked("length error");
+        return BatchStep::kFault;
+    } catch (const std::exception& ex) {
+        fail_parked(ex.what());
+        return BatchStep::kFault;
+    } catch (...) {
+        fail_parked("worker error");
+        return BatchStep::kFault;
+    }
+}
+
 bool InferenceScheduler::Impl::WaitForStart() {
     std::unique_lock<std::mutex> lock(gate_mu_);
     gate_cv_.wait(lock, [this] { return gate_ != StartupSignal::kPending; });
@@ -441,6 +896,18 @@ void InferenceScheduler::Impl::WorkerMain(std::uint32_t index, InferenceEngine* 
             }
             if (const std::shared_ptr<std::latch> before_pop = before_pop_; before_pop != nullptr) {
                 before_pop->wait();
+            }
+
+            if (config_.enable_batching) {
+                const BatchStep step = RunBatch(index, *engine);
+                if (step == BatchStep::kClosed) {
+                    break;
+                }
+                if (step == BatchStep::kFault) {
+                    faulted = true;
+                    break;
+                }
+                continue;
             }
 
             QueuePop<RequestEntry> popped = queue_->wait_pop();
@@ -1181,6 +1648,30 @@ void SchedulerTestAccess::SetReachedRun(InferenceScheduler& scheduler,
 void SchedulerTestAccess::SetBeforeRun(InferenceScheduler& scheduler,
                                        std::shared_ptr<std::latch> latch) {
     scheduler.impl_->before_run_ = std::move(latch);
+}
+
+void SchedulerTestAccess::SetOnBatchRun(InferenceScheduler& scheduler,
+                                        std::function<void(std::size_t)> callback) {
+    scheduler.impl_->on_batch_run_ = std::move(callback);
+}
+
+void SchedulerTestAccess::SetReachedBatchWait(InferenceScheduler& scheduler,
+                                              std::shared_ptr<std::latch> latch) {
+    scheduler.impl_->reached_batch_wait_ = std::move(latch);
+}
+
+void SchedulerTestAccess::SetBeforeBatchWait(InferenceScheduler& scheduler,
+                                             std::shared_ptr<std::latch> latch) {
+    scheduler.impl_->before_batch_wait_ = std::move(latch);
+}
+
+SchedulerError SchedulerTestAccess::CheckBatchMetadata(const std::vector<TensorMetadata>& inputs,
+                                                       const std::vector<TensorMetadata>& outputs) {
+    if (SchedulerError error = ValidateBatchSignature(inputs, "input");
+        error.kind != SchedulerErrorKind::kNone) {
+        return error;
+    }
+    return ValidateBatchSignature(outputs, "output");
 }
 
 void SchedulerTestAccess::SetAfterPublish(InferenceScheduler& scheduler,
