@@ -40,7 +40,7 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
       - name: Run Python benchmark tooling tests
-        run: python3 -m unittest benchmarks.test_collect_baseline benchmarks.test_analyze_baseline benchmarks.test_collect_concurrent benchmarks.test_analyze_concurrent
+        run: python3 -m unittest benchmarks.test_collect_baseline benchmarks.test_analyze_baseline benchmarks.test_collect_concurrent benchmarks.test_analyze_concurrent benchmarks.test_collect_scheduler benchmarks.test_analyze_scheduler
 
       - name: Check formatting
         run: |
