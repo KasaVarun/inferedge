@@ -84,10 +84,20 @@ enum class StartupSignal {
     kAbort,
 };
 
+struct WorkerMetrics {
+    std::uint64_t engine_run_count{0};
+    std::uint64_t requests_entered_engine_runs{0};
+    std::array<std::uint64_t, kSchedulerMetricsHistogramSize> batch_size_histogram{};
+    std::uint64_t total_assembly_nanoseconds{0};
+    std::uint64_t total_engine_run_nanoseconds{0};
+    std::uint64_t total_split_nanoseconds{0};
+};
+
 struct WorkerSlot {
     std::unique_ptr<InferenceEngine> engine;
     std::jthread thread;
     bool retired{false};
+    WorkerMetrics metrics;
 };
 
 namespace {
@@ -213,6 +223,48 @@ std::string WorkerFailureMessage(std::string_view text) {
         return std::string{text};
     }
     return "worker error";
+}
+
+void SaturatingAdd(std::uint64_t& total, std::uint64_t add) noexcept {
+    if (add > std::numeric_limits<std::uint64_t>::max() - total) {
+        total = std::numeric_limits<std::uint64_t>::max();
+        return;
+    }
+    total += add;
+}
+
+void AddElapsed(std::uint64_t& total, std::chrono::steady_clock::time_point start,
+                std::chrono::steady_clock::time_point stop) noexcept {
+    if (stop < start) {
+        return;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start);
+    if (elapsed.count() < 0) {
+        return;
+    }
+    SaturatingAdd(total, static_cast<std::uint64_t>(elapsed.count()));
+}
+
+void RecordEngineInvocation(WorkerMetrics& metrics, std::size_t batch_size,
+                            std::chrono::steady_clock::time_point start,
+                            std::chrono::steady_clock::time_point stop) noexcept {
+    SaturatingAdd(metrics.engine_run_count, 1);
+    SaturatingAdd(metrics.requests_entered_engine_runs, static_cast<std::uint64_t>(batch_size));
+    if (batch_size >= 1 && batch_size <= kSchedulerMetricsMaxBatchSize) {
+        SaturatingAdd(metrics.batch_size_histogram[batch_size], 1);
+    }
+    AddElapsed(metrics.total_engine_run_nanoseconds, start, stop);
+}
+
+void MergeWorkerMetrics(WorkerMetrics& dest, const WorkerMetrics& src) noexcept {
+    SaturatingAdd(dest.engine_run_count, src.engine_run_count);
+    SaturatingAdd(dest.requests_entered_engine_runs, src.requests_entered_engine_runs);
+    for (std::size_t index = 0; index < dest.batch_size_histogram.size(); ++index) {
+        SaturatingAdd(dest.batch_size_histogram[index], src.batch_size_histogram[index]);
+    }
+    SaturatingAdd(dest.total_assembly_nanoseconds, src.total_assembly_nanoseconds);
+    SaturatingAdd(dest.total_engine_run_nanoseconds, src.total_engine_run_nanoseconds);
+    SaturatingAdd(dest.total_split_nanoseconds, src.total_split_nanoseconds);
 }
 
 enum class BatchStep {
@@ -356,6 +408,7 @@ struct InferenceScheduler::Impl {
     Admission Submit(std::vector<NamedTensor> inputs);
     ShutdownResult Shutdown(ShutdownPolicy policy);
     SchedulerStats Stats() const;
+    SchedulerMetrics Metrics() const;
 
     SchedulerError StartWorkers();
     SchedulerError AbortStart(SchedulerError error);
@@ -368,7 +421,7 @@ struct InferenceScheduler::Impl {
     void NotePublished(CompletionStatus status);
     void FailUnpublished(std::vector<RequestEntry>& owned, std::string_view text);
     bool ConsumeThrow(std::uint32_t index);
-    CompletionStatus Execute(InferenceEngine& engine, RequestEntry& entry);
+    CompletionStatus Execute(InferenceEngine& engine, RequestEntry& entry, WorkerMetrics* metrics);
     bool PublishWorkerFailure(RequestEntry& entry, std::string_view text);
     void PublishSchedulerFailure(RequestEntry& entry) noexcept;
     void PublishCanceled(RequestEntry& entry) noexcept;
@@ -439,6 +492,11 @@ struct InferenceScheduler::Impl {
     std::uint64_t canceled_{0};
     std::atomic<std::uint64_t> executing_{0};
     std::atomic<std::uint32_t> live_workers_{0};
+
+    // Written only after every joinable worker thread joined successfully.
+    // metrics() copies it under admission_ only when metrics_merged_ is true.
+    WorkerMetrics published_metrics_{};
+    bool metrics_merged_{false};
 
     // queue_ is declared before workers_ so a joined jthread is destroyed
     // before the queue it waited on.
@@ -797,12 +855,31 @@ BatchStep InferenceScheduler::Impl::RunBatch(std::uint32_t index, InferenceEngin
             return BatchStep::kContinue;
         }
 
+        WorkerMetrics* metrics = nullptr;
+        if (config_.enable_metrics && index < workers_.size()) {
+            metrics = &workers_[index].metrics;
+        }
+
         std::vector<std::span<const NamedTensor>> requests;
         requests.reserve(owned.size());
         for (const RequestEntry& entry : owned) {
             requests.emplace_back(entry.inputs.data(), entry.inputs.size());
         }
-        const TensorBatchAssembly assembled = AssembleBatchInputs(engine.inputs(), requests);
+        TensorBatchAssembly assembled;
+        if (metrics == nullptr) {
+            assembled = AssembleBatchInputs(engine.inputs(), requests);
+        } else {
+            const auto assembly_start = std::chrono::steady_clock::now();
+            try {
+                assembled = AssembleBatchInputs(engine.inputs(), requests);
+            } catch (...) {
+                AddElapsed(metrics->total_assembly_nanoseconds, assembly_start,
+                           std::chrono::steady_clock::now());
+                throw;
+            }
+            AddElapsed(metrics->total_assembly_nanoseconds, assembly_start,
+                       std::chrono::steady_clock::now());
+        }
         if (assembled.error.kind != TensorBatchErrorKind::kNone) {
             FailUnpublished(owned, assembled.error.kind == TensorBatchErrorKind::kOverflow
                                        ? "shape overflow"
@@ -830,7 +907,22 @@ BatchStep InferenceScheduler::Impl::RunBatch(std::uint32_t index, InferenceEngin
             return BatchStep::kFault;
         }
 
-        const InferenceResult result = engine.run(views);
+        InferenceResult result;
+        if (metrics == nullptr) {
+            result = engine.run(views);
+        } else {
+            const std::size_t batch_size = owned.size();
+            const auto run_start = std::chrono::steady_clock::now();
+            try {
+                result = engine.run(views);
+            } catch (...) {
+                RecordEngineInvocation(*metrics, batch_size, run_start,
+                                       std::chrono::steady_clock::now());
+                throw;
+            }
+            RecordEngineInvocation(*metrics, batch_size, run_start,
+                                   std::chrono::steady_clock::now());
+        }
         if (result.error.kind != InferenceErrorKind::kNone) {
             for (RequestEntry& entry : owned) {
                 if (PublishInferenceFailure(entry, result.error)) {
@@ -840,7 +932,21 @@ BatchStep InferenceScheduler::Impl::RunBatch(std::uint32_t index, InferenceEngin
             return BatchStep::kContinue;
         }
 
-        TensorBatchSplit split = SplitBatchOutputs(engine.outputs(), result.outputs, owned.size());
+        TensorBatchSplit split;
+        if (metrics == nullptr) {
+            split = SplitBatchOutputs(engine.outputs(), result.outputs, owned.size());
+        } else {
+            const auto split_start = std::chrono::steady_clock::now();
+            try {
+                split = SplitBatchOutputs(engine.outputs(), result.outputs, owned.size());
+            } catch (...) {
+                AddElapsed(metrics->total_split_nanoseconds, split_start,
+                           std::chrono::steady_clock::now());
+                throw;
+            }
+            AddElapsed(metrics->total_split_nanoseconds, split_start,
+                       std::chrono::steady_clock::now());
+        }
         if (split.error.kind == TensorBatchErrorKind::kOverflow) {
             FailUnpublished(owned, "shape overflow");
             return BatchStep::kFault;
@@ -965,7 +1071,11 @@ void InferenceScheduler::Impl::WorkerMain(std::uint32_t index, InferenceEngine* 
                     retire_now = true;
                     throw std::runtime_error("injected");
                 }
-                status = Execute(*engine, entry);
+                WorkerMetrics* metrics = nullptr;
+                if (config_.enable_metrics && index < workers_.size()) {
+                    metrics = &workers_[index].metrics;
+                }
+                status = Execute(*engine, entry, metrics);
                 published = true;
             } catch (const std::exception& ex) {
                 if (!published && PublishWorkerFailure(entry, ex.what())) {
@@ -1022,7 +1132,8 @@ bool InferenceScheduler::Impl::ConsumeThrow(std::uint32_t index) {
     return throw_armed_[index].compare_exchange_strong(expected, false, std::memory_order_acq_rel);
 }
 
-CompletionStatus InferenceScheduler::Impl::Execute(InferenceEngine& engine, RequestEntry& entry) {
+CompletionStatus InferenceScheduler::Impl::Execute(InferenceEngine& engine, RequestEntry& entry,
+                                                   WorkerMetrics* metrics) {
     InferenceResult result;
     {
         // Views borrow entry.inputs and die before entry is destroyed.
@@ -1032,7 +1143,18 @@ CompletionStatus InferenceScheduler::Impl::Execute(InferenceEngine& engine, Requ
             views.push_back(
                 NamedTensorView{input.name, input.shape, std::span<const float>{input.values}});
         }
-        result = engine.run(views);
+        if (metrics == nullptr) {
+            result = engine.run(views);
+        } else {
+            const auto run_start = std::chrono::steady_clock::now();
+            try {
+                result = engine.run(views);
+            } catch (...) {
+                RecordEngineInvocation(*metrics, 1, run_start, std::chrono::steady_clock::now());
+                throw;
+            }
+            RecordEngineInvocation(*metrics, 1, run_start, std::chrono::steady_clock::now());
+        }
     }
 
     SchedulerCompletion completion;
@@ -1282,13 +1404,52 @@ std::uint64_t InferenceScheduler::Impl::PublishQueuedFailures() noexcept {
 }
 
 void InferenceScheduler::Impl::JoinWorkers() noexcept {
+    bool all_joined = true;
     for (WorkerSlot& worker : workers_) {
         try {
             if (worker.thread.joinable()) {
                 worker.thread.join();
             }
         } catch (...) {
+            all_joined = false;
         }
+    }
+    // A failed join leaves that thread potentially live. Do not merge
+    // worker-local counters, do not claim a finalized snapshot, and do
+    // not destroy slots while a worker may still be executing.
+    if (!all_joined) {
+        return;
+    }
+
+    bool published = !config_.enable_metrics;
+    if (config_.enable_metrics) {
+        if (!metrics_merged_) {
+            WorkerMetrics merged;
+            for (const WorkerSlot& worker : workers_) {
+                MergeWorkerMetrics(merged, worker.metrics);
+            }
+            auto publish = [this, &merged, &published] {
+                std::lock_guard<std::mutex> lock(admission_);
+                if (!metrics_merged_) {
+                    published_metrics_ = merged;
+                    metrics_merged_ = true;
+                }
+                published = metrics_merged_;
+            };
+            try {
+                publish();
+            } catch (...) {
+                try {
+                    publish();
+                } catch (...) {
+                }
+            }
+        } else {
+            published = true;
+        }
+    }
+    if (!published) {
+        return;
     }
     try {
         workers_.clear();
@@ -1608,6 +1769,32 @@ ShutdownResult InferenceScheduler::Impl::Shutdown(ShutdownPolicy policy) {
     return result;
 }
 
+SchedulerMetrics InferenceScheduler::Impl::Metrics() const {
+    SchedulerMetrics snapshot;
+    snapshot.enabled = config_.enable_metrics;
+    std::lock_guard<std::mutex> lock(admission_);
+    if (state_ == State::kIdle) {
+        snapshot.finalized = true;
+        return snapshot;
+    }
+    if (!snapshot.enabled) {
+        snapshot.finalized = joined_ || state_ == State::kStopped || state_ == State::kFailed;
+        return snapshot;
+    }
+    if (metrics_merged_) {
+        snapshot.finalized = true;
+        snapshot.engine_run_count = published_metrics_.engine_run_count;
+        snapshot.requests_entered_engine_runs = published_metrics_.requests_entered_engine_runs;
+        snapshot.batch_size_histogram = published_metrics_.batch_size_histogram;
+        snapshot.total_assembly_nanoseconds = published_metrics_.total_assembly_nanoseconds;
+        snapshot.total_engine_run_nanoseconds = published_metrics_.total_engine_run_nanoseconds;
+        snapshot.total_split_nanoseconds = published_metrics_.total_split_nanoseconds;
+        return snapshot;
+    }
+    snapshot.finalized = false;
+    return snapshot;
+}
+
 SchedulerStats InferenceScheduler::Impl::Stats() const {
     std::lock_guard<std::mutex> lock(admission_);
     SchedulerStats stats;
@@ -1647,6 +1834,10 @@ ShutdownResult InferenceScheduler::shutdown(ShutdownPolicy policy) {
 
 SchedulerStats InferenceScheduler::stats() const {
     return impl_->Stats();
+}
+
+SchedulerMetrics InferenceScheduler::metrics() const {
+    return impl_->Metrics();
 }
 
 void SchedulerTestAccess::SetStopAfterStartingWorkers(InferenceScheduler& scheduler,

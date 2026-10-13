@@ -1,6 +1,7 @@
 #pragma once
 
 #include "inferedge/inference_engine.hpp"
+#include "inferedge/scheduler_metrics.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -27,6 +28,9 @@ inline constexpr std::size_t kMaxSchedulerQueueCapacity = 1024;
 // dynamic batch axis, and a worker may run several validated requests in one
 // InferenceEngine::run(). max_batch_size is 1 through 32. max_batch_delay is
 // 0 through 1000 milliseconds. Both bounds are checked either way.
+// enable_metrics collects worker-local engine-run counts, batch-size
+// histogram bins, and assembly/run/split duration totals. The default is
+// false: workers do not read a clock and do not update metric storage.
 struct SchedulerConfig {
     std::filesystem::path model_path;
     std::uint32_t worker_count{1};
@@ -34,6 +38,7 @@ struct SchedulerConfig {
     bool enable_batching{false};
     std::uint32_t max_batch_size{1};
     std::chrono::milliseconds max_batch_delay{0};
+    bool enable_metrics{false};
 };
 
 enum class SchedulerErrorKind {
@@ -144,7 +149,7 @@ class SchedulerTestAccess;
 // interrupt an ONNX Runtime call that has already entered run().
 //
 // Callers must not destroy a scheduler concurrently with start, submit,
-// shutdown, or stats on that same object.
+// shutdown, stats, or metrics on that same object.
 class InferenceScheduler {
 public:
     explicit InferenceScheduler(SchedulerConfig config);
@@ -158,6 +163,16 @@ public:
     [[nodiscard]] Admission submit(std::vector<NamedTensor> inputs);
     [[nodiscard]] ShutdownResult shutdown(ShutdownPolicy policy);
     [[nodiscard]] SchedulerStats stats() const;
+    // Copies the cumulative metrics snapshot. The copy does not mutate
+    // counters. Meaningful totals require a finalized snapshot after every
+    // worker thread has joined successfully, or before start() when no
+    // worker exists. Failed or Stopped alone does not finalize enabled
+    // metrics. A call while workers may still be running, or after a join
+    // failure, returns enabled from the config and zeros with finalized
+    // false. Disabled metrics return enabled false and zeros; they become
+    // finalized once Idle or after a terminal state because they have no
+    // worker-local data. See SchedulerMetrics.
+    [[nodiscard]] SchedulerMetrics metrics() const;
 
 private:
     struct Impl;
