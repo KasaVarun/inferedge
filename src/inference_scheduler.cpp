@@ -221,6 +221,8 @@ enum class BatchStep {
     kFault,
 };
 
+inline constexpr std::size_t kNoFault = std::numeric_limits<std::size_t>::max();
+
 struct ExecutingGuard {
     std::atomic<std::uint64_t>& executing;
 
@@ -403,6 +405,11 @@ struct InferenceScheduler::Impl {
     // Each armed worker consumes its own flag once, after it has popped.
     std::atomic<bool> any_throw_armed_{false};
     std::array<std::atomic<bool>, kMaxSchedulerWorkers> throw_armed_{};
+    std::atomic<bool> fail_batch_guard_creation_{false};
+    std::atomic<std::size_t> throw_after_batch_collect_{kNoFault};
+    std::atomic<std::size_t> throw_before_batch_publish_{kNoFault};
+    std::atomic<std::size_t> fail_worker_failure_publication_at_{kNoFault};
+    std::atomic<std::size_t> worker_failure_publication_attempt_{0};
     std::optional<std::uint32_t> stop_after_;
     std::shared_ptr<std::latch> before_pop_;
     // Test-only per-worker pause before wait_pop. The flag stays false unless
@@ -669,6 +676,9 @@ BatchStep InferenceScheduler::Impl::RunBatch(std::uint32_t index, InferenceEngin
         auto adopt = [&]() -> bool {
             std::unique_ptr<ExecutingGuard> guard;
             try {
+                if (fail_batch_guard_creation_.exchange(false, std::memory_order_acq_rel)) {
+                    throw std::bad_alloc();
+                }
                 guard = std::make_unique<ExecutingGuard>(executing_);
             } catch (const std::bad_alloc&) {
                 fail_parked("alloc failed");
@@ -725,6 +735,11 @@ BatchStep InferenceScheduler::Impl::RunBatch(std::uint32_t index, InferenceEngin
         if (!adopt()) {
             return BatchStep::kFault;
         }
+        std::size_t collect_fault = owned.size();
+        if (throw_after_batch_collect_.compare_exchange_strong(collect_fault, kNoFault,
+                                                               std::memory_order_acq_rel)) {
+            throw std::runtime_error("collect failed");
+        }
 
         while (owned.size() < limit) {
             // A drain-closed queue still returns kReady while items remain.
@@ -737,6 +752,11 @@ BatchStep InferenceScheduler::Impl::RunBatch(std::uint32_t index, InferenceEngin
                 taken.value.reset();
                 if (!adopt()) {
                     return BatchStep::kFault;
+                }
+                collect_fault = owned.size();
+                if (throw_after_batch_collect_.compare_exchange_strong(collect_fault, kNoFault,
+                                                                       std::memory_order_acq_rel)) {
+                    throw std::runtime_error("collect failed");
                 }
                 continue;
             }
@@ -762,6 +782,11 @@ BatchStep InferenceScheduler::Impl::RunBatch(std::uint32_t index, InferenceEngin
                 waited.value.reset();
                 if (!adopt()) {
                     return BatchStep::kFault;
+                }
+                collect_fault = owned.size();
+                if (throw_after_batch_collect_.compare_exchange_strong(collect_fault, kNoFault,
+                                                                       std::memory_order_acq_rel)) {
+                    throw std::runtime_error("collect failed");
                 }
                 continue;
             }
@@ -839,6 +864,11 @@ BatchStep InferenceScheduler::Impl::RunBatch(std::uint32_t index, InferenceEngin
         // are still armed, so a published request is not completed twice
         // and is not counted twice.
         for (std::size_t request_index = 0; request_index < owned.size(); ++request_index) {
+            std::size_t expected = request_index;
+            if (throw_before_batch_publish_.compare_exchange_strong(expected, kNoFault,
+                                                                    std::memory_order_acq_rel)) {
+                throw std::runtime_error("publish failed");
+            }
             if (PublishBatchSuccess(owned[request_index],
                                     std::move(split.requests[request_index]))) {
                 NotePublished(CompletionStatus::kSucceeded);
@@ -1023,6 +1053,16 @@ CompletionStatus InferenceScheduler::Impl::Execute(InferenceEngine& engine, Requ
 }
 
 bool InferenceScheduler::Impl::PublishWorkerFailure(RequestEntry& entry, std::string_view text) {
+    if (fail_worker_failure_publication_at_.load(std::memory_order_acquire) != kNoFault) {
+        const std::size_t attempt =
+            worker_failure_publication_attempt_.fetch_add(1, std::memory_order_acq_rel);
+        std::size_t expected = attempt;
+        if (fail_worker_failure_publication_at_.compare_exchange_strong(
+                expected, kNoFault, std::memory_order_acq_rel)) {
+            // Test-only pre-publication fault. The promise remains armed.
+            throw std::bad_alloc();
+        }
+    }
     try {
         SchedulerCompletion completion;
         completion.request_id = entry.request_id;
@@ -1620,6 +1660,27 @@ void SchedulerTestAccess::SetThrowInWorker(InferenceScheduler& scheduler, std::u
     }
     scheduler.impl_->throw_armed_[index].store(true, std::memory_order_release);
     scheduler.impl_->any_throw_armed_.store(true, std::memory_order_release);
+}
+
+void SchedulerTestAccess::SetFailNextBatchGuardCreation(InferenceScheduler& scheduler) {
+    scheduler.impl_->fail_batch_guard_creation_.store(true, std::memory_order_release);
+}
+
+void SchedulerTestAccess::SetThrowAfterBatchCollect(InferenceScheduler& scheduler,
+                                                    std::size_t request_count) {
+    scheduler.impl_->throw_after_batch_collect_.store(request_count, std::memory_order_release);
+}
+
+void SchedulerTestAccess::SetThrowBeforeBatchPublish(InferenceScheduler& scheduler,
+                                                     std::size_t request_index) {
+    scheduler.impl_->throw_before_batch_publish_.store(request_index, std::memory_order_release);
+}
+
+void SchedulerTestAccess::SetFailWorkerFailurePublication(InferenceScheduler& scheduler,
+                                                          std::size_t attempt_index) {
+    scheduler.impl_->worker_failure_publication_attempt_.store(0, std::memory_order_release);
+    scheduler.impl_->fail_worker_failure_publication_at_.store(attempt_index,
+                                                               std::memory_order_release);
 }
 
 void SchedulerTestAccess::SetBeforePopForWorker(InferenceScheduler& scheduler, std::uint32_t index,

@@ -176,6 +176,20 @@ public:
     // Calling it for several indices arms each worker independently. An unarmed
     // worker does not throw. Production runs leave every flag false.
     static void SetThrowInWorker(InferenceScheduler& scheduler, std::uint32_t index);
+    // The next batching request throws std::bad_alloc immediately before its
+    // ExecutingGuard allocation. The popped request is already worker-owned.
+    static void SetFailNextBatchGuardCreation(InferenceScheduler& scheduler);
+    // Throws once after this many valid requests have joined a worker-local
+    // batch and before the worker performs another queue pop.
+    static void SetThrowAfterBatchCollect(InferenceScheduler& scheduler, std::size_t request_count);
+    // Throws once before publishing the zero-based request in a successfully
+    // executed and split batch.
+    static void SetThrowBeforeBatchPublish(InferenceScheduler& scheduler,
+                                           std::size_t request_index);
+    // Throws std::bad_alloc before set_value() on the zero-based worker-failure
+    // publication attempt. This does not simulate std::promise internals.
+    static void SetFailWorkerFailurePublication(InferenceScheduler& scheduler,
+                                                std::size_t attempt_index);
     static void SetBeforePop(InferenceScheduler& scheduler, std::shared_ptr<std::latch> latch);
     // Holds one worker before wait_pop. Set it before start(). A null slot
     // does not wait. This is how a test chooses which worker pops.

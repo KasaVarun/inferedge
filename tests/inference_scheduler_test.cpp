@@ -2502,8 +2502,186 @@ TEST_F(InferenceSchedulerTest, ThrowsBeforeBatchRunFailsTheGroup) {
     EXPECT_TRUE(failed_first.outputs.empty());
     EXPECT_TRUE(failed_second.outputs.empty());
     EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
-    EXPECT_TRUE(SchedulerTestAccess::IsFailed(*scheduler));
     EXPECT_EQ(runs.Snapshot(), (std::vector<std::size_t>{2}));
+    ExpectQuiescent(*scheduler, 0, 0, 2, 0);
+}
+
+TEST_F(InferenceSchedulerTest, BatchFaultGuardCreationKeepsPoppedRequestOwned) {
+    auto scheduler = MakeBatch(4, std::chrono::milliseconds{0}, 2);
+    SchedulerTestAccess::SetFailNextBatchGuardCreation(*scheduler);
+    RequireStart(*scheduler);
+
+    const SchedulerCompletion completion =
+        TakeBounded(scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F)));
+    EXPECT_EQ(completion.request_id, 1U);
+    EXPECT_EQ(completion.sequence, 1U);
+    EXPECT_EQ(completion.status, CompletionStatus::kWorkerFailed);
+    EXPECT_EQ(completion.inference_error.kind, InferenceErrorKind::kExecution);
+    EXPECT_EQ(completion.inference_error.message, "alloc failed");
+    EXPECT_TRUE(completion.outputs.empty());
+
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    ExpectQuiescent(*scheduler, 0, 0, 1, 0);
+}
+
+TEST_F(InferenceSchedulerTest, BatchFaultDuringCollectionSeparatesOwnedAndQueuedRequests) {
+    auto scheduler = MakeBatch(4, std::chrono::milliseconds{0}, 4);
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetThrowAfterBatchCollect(*scheduler, 1);
+    RequireStart(*scheduler);
+
+    Admission owned = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission queued = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    release.release();
+
+    const SchedulerCompletion failed = TakeBounded(std::move(owned));
+    const SchedulerCompletion swept = TakeBounded(std::move(queued));
+    EXPECT_EQ(failed.request_id, 1U);
+    EXPECT_EQ(failed.status, CompletionStatus::kWorkerFailed);
+    EXPECT_EQ(failed.inference_error.message, "collect failed");
+    EXPECT_EQ(swept.request_id, 2U);
+    EXPECT_EQ(swept.status, CompletionStatus::kSchedulerFailed);
+    EXPECT_EQ(swept.inference_error.message, "no worker");
+
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_TRUE(SchedulerTestAccess::IsFailed(*scheduler));
+    ExpectQuiescent(*scheduler, 0, 0, 1, 1);
+}
+
+TEST_F(InferenceSchedulerTest, BatchFaultPartialPublicationPreservesPublishedResults) {
+    BatchRuns runs;
+    auto scheduler = MakeBatch(4, std::chrono::milliseconds{0}, 4);
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetThrowBeforeBatchPublish(*scheduler, 2);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler,
+                                       [&runs](std::size_t count) { runs.Record(count); });
+    RequireStart(*scheduler);
+
+    std::vector<Admission> admissions;
+    admissions.push_back(scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F)));
+    admissions.push_back(scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F)));
+    admissions.push_back(scheduler->submit(DynamicAddInputs(9.F, 0.F, 1.F, 1.F)));
+    admissions.push_back(scheduler->submit(DynamicAddInputs(-1.F, 4.F, 2.F, -3.F)));
+    release.release();
+
+    std::vector<SchedulerCompletion> completions;
+    for (Admission& admission : admissions) {
+        completions.push_back(TakeBounded(std::move(admission)));
+    }
+    ExpectDynamicSum(completions[0], 4.F, 6.F);
+    ExpectDynamicSum(completions[1], 12.F, 14.F);
+    for (std::size_t index = 2; index < completions.size(); ++index) {
+        EXPECT_EQ(completions[index].status, CompletionStatus::kWorkerFailed);
+        EXPECT_EQ(completions[index].inference_error.kind, InferenceErrorKind::kExecution);
+        EXPECT_EQ(completions[index].inference_error.message, "publish failed");
+        EXPECT_TRUE(completions[index].outputs.empty());
+    }
+    for (std::size_t index = 0; index < completions.size(); ++index) {
+        EXPECT_EQ(completions[index].request_id, index + 1);
+        EXPECT_EQ(completions[index].sequence, index + 1);
+    }
+
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(runs.Snapshot(), (std::vector<std::size_t>{4}));
+    ExpectQuiescent(*scheduler, 2, 0, 2, 0);
+    scheduler.reset();
+    EXPECT_FLOAT_EQ(completions[0].outputs[0].values[0], 4.F);
+    EXPECT_FLOAT_EQ(completions[1].outputs[0].values[0], 12.F);
+}
+
+TEST_F(InferenceSchedulerTest, BatchFaultFailurePublicationContinuesAfterOneAttemptThrows) {
+    BatchRuns runs;
+    auto scheduler = MakeBatch(4, std::chrono::milliseconds{0}, 4);
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetThrowInWorker(*scheduler, 0);
+    SchedulerTestAccess::SetFailWorkerFailurePublication(*scheduler, 1);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler,
+                                       [&runs](std::size_t count) { runs.Record(count); });
+    RequireStart(*scheduler);
+
+    std::vector<Admission> admissions;
+    admissions.push_back(scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F)));
+    admissions.push_back(scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F)));
+    admissions.push_back(scheduler->submit(DynamicAddInputs(9.F, 0.F, 1.F, 1.F)));
+    admissions.push_back(scheduler->submit(DynamicAddInputs(-1.F, 4.F, 2.F, -3.F)));
+    release.release();
+
+    std::vector<SchedulerCompletion> completions;
+    for (Admission& admission : admissions) {
+        completions.push_back(TakeBounded(std::move(admission)));
+    }
+    EXPECT_EQ(completions[0].status, CompletionStatus::kWorkerFailed);
+    EXPECT_EQ(completions[0].inference_error.message, "injected");
+    EXPECT_EQ(completions[1].status, CompletionStatus::kSchedulerFailed);
+    EXPECT_EQ(completions[1].inference_error.message, "unsettled");
+    EXPECT_EQ(completions[2].status, CompletionStatus::kWorkerFailed);
+    EXPECT_EQ(completions[2].inference_error.message, "injected");
+    EXPECT_EQ(completions[3].status, CompletionStatus::kWorkerFailed);
+    EXPECT_EQ(completions[3].inference_error.message, "injected");
+    for (std::size_t index = 0; index < completions.size(); ++index) {
+        EXPECT_EQ(completions[index].request_id, index + 1);
+        EXPECT_EQ(completions[index].sequence, index + 1);
+        EXPECT_TRUE(completions[index].outputs.empty());
+    }
+
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(runs.Snapshot(), (std::vector<std::size_t>{4}));
+    const SchedulerStats stats = scheduler->stats();
+    EXPECT_EQ(stats.accepted, 4U);
+    EXPECT_EQ(stats.succeeded, 0U);
+    EXPECT_EQ(stats.failed_inference, 0U);
+    EXPECT_EQ(stats.failed_worker, 3U);
+    // The second completion came from RequestEntry's destructor backstop.
+    EXPECT_EQ(stats.failed_scheduler, 0U);
+    EXPECT_EQ(stats.canceled, 0U);
+    EXPECT_EQ(stats.queue_depth, 0U);
+    EXPECT_EQ(stats.executing, 0U);
+    EXPECT_EQ(stats.live_workers, 0U);
+}
+
+TEST_F(InferenceSchedulerTest, BatchFaultCancelDuringSealedFailureKeepsOwnedRequests) {
+    BatchRuns runs;
+    auto scheduler = MakeBatch(2, std::chrono::milliseconds{0}, 4);
+    auto before_pop = std::make_shared<std::latch>(1);
+    auto before_run = std::make_shared<std::latch>(1);
+    auto reached_run = std::make_shared<std::latch>(1);
+    LatchRelease pop_release{before_pop};
+    LatchRelease run_release{before_run};
+    SchedulerTestAccess::SetBeforePop(*scheduler, before_pop);
+    SchedulerTestAccess::SetBeforeRun(*scheduler, before_run);
+    SchedulerTestAccess::SetReachedRun(*scheduler, reached_run);
+    SchedulerTestAccess::SetThrowInWorker(*scheduler, 0);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler,
+                                       [&runs](std::size_t count) { runs.Record(count); });
+    RequireStart(*scheduler);
+
+    Admission first = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission second = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    pop_release.release();
+    reached_run->wait();
+    const ShutdownResult shutdown =
+        ShutdownWhileBlocked(*scheduler, run_release, ShutdownPolicy::kCancelPending);
+
+    ExpectWinner(shutdown, ShutdownPolicy::kCancelPending, true);
+    const SchedulerCompletion failed_first = TakeBounded(std::move(first));
+    const SchedulerCompletion failed_second = TakeBounded(std::move(second));
+    EXPECT_EQ(failed_first.status, CompletionStatus::kWorkerFailed);
+    EXPECT_EQ(failed_second.status, CompletionStatus::kWorkerFailed);
+    EXPECT_EQ(failed_first.request_id, 1U);
+    EXPECT_EQ(failed_second.request_id, 2U);
+    EXPECT_EQ(failed_first.inference_error.message, "injected");
+    EXPECT_EQ(failed_second.inference_error.message, "injected");
+    EXPECT_TRUE(failed_first.outputs.empty());
+    EXPECT_TRUE(failed_second.outputs.empty());
+    EXPECT_EQ(runs.Snapshot(), (std::vector<std::size_t>{2}));
+    EXPECT_TRUE(SchedulerTestAccess::ClosedForCancel(*scheduler));
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
     ExpectQuiescent(*scheduler, 0, 0, 2, 0);
 }
 
