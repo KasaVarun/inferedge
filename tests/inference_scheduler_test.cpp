@@ -3539,6 +3539,7 @@ TEST_F(InferenceSchedulerTest, ThrowBeforeBatchRunDoesNotCountEngineRun) {
     const SchedulerMetrics metrics = scheduler->metrics();
     EXPECT_EQ(metrics.engine_run_count, 0U);
     EXPECT_EQ(metrics.requests_entered_engine_runs, 0U);
+    EXPECT_GE(metrics.total_assembly_nanoseconds, 0U);
     EXPECT_EQ(metrics.total_engine_run_nanoseconds, 0U);
     EXPECT_EQ(metrics.total_split_nanoseconds, 0U);
     ExpectHistogramInvariants(metrics);
@@ -3572,6 +3573,291 @@ TEST_F(InferenceSchedulerTest, MetricsStayUnfinalizedUntilJoinAfterWorkerFailure
     EXPECT_FALSE(before_join.finalized);
     EXPECT_EQ(before_join.engine_run_count, 0U);
     EXPECT_EQ(before_join.requests_entered_engine_runs, 0U);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    ExpectQuiescent(*scheduler, 1, 0, 1, 0);
+    const SchedulerMetrics metrics = scheduler->metrics();
+    EXPECT_TRUE(metrics.finalized);
+    EXPECT_EQ(metrics.engine_run_count, 1U);
+    EXPECT_EQ(metrics.requests_entered_engine_runs, 1U);
+    EXPECT_EQ(metrics.batch_size_histogram[1], 1U);
+    ExpectHistogramInvariants(metrics);
+}
+
+TEST_F(InferenceSchedulerTest, CapOneBatchingRecordsSizeOnePerRequest) {
+    BatchRuns runs;
+    auto scheduler = MakeMetricsBatch(1, std::chrono::milliseconds{0}, 2);
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler,
+                                       [&runs](std::size_t count) { runs.Record(count); });
+    RequireStart(*scheduler);
+    Admission first = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission second = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    release.release();
+    ExpectDynamicSum(Take(std::move(first)), 4.F, 6.F);
+    ExpectDynamicSum(Take(std::move(second)), 12.F, 14.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(runs.Snapshot(), (std::vector<std::size_t>{1, 1}));
+    ExpectQuiescent(*scheduler, 2, 0, 0, 0);
+    const SchedulerMetrics first_read = scheduler->metrics();
+    const SchedulerMetrics second_read = scheduler->metrics();
+    EXPECT_TRUE(first_read.finalized);
+    EXPECT_EQ(first_read.engine_run_count, 2U);
+    EXPECT_EQ(first_read.requests_entered_engine_runs, 2U);
+    EXPECT_EQ(first_read.batch_size_histogram[1], 2U);
+    EXPECT_EQ(first_read.batch_size_histogram[2], 0U);
+    EXPECT_GE(first_read.total_assembly_nanoseconds, 0U);
+    EXPECT_GE(first_read.total_engine_run_nanoseconds, 0U);
+    EXPECT_GE(first_read.total_split_nanoseconds, 0U);
+    ExpectHistogramInvariants(first_read);
+    EXPECT_EQ(second_read.enabled, first_read.enabled);
+    EXPECT_EQ(second_read.finalized, first_read.finalized);
+    EXPECT_EQ(second_read.engine_run_count, first_read.engine_run_count);
+    EXPECT_EQ(second_read.requests_entered_engine_runs, first_read.requests_entered_engine_runs);
+    EXPECT_EQ(second_read.batch_size_histogram, first_read.batch_size_histogram);
+    EXPECT_EQ(second_read.total_assembly_nanoseconds, first_read.total_assembly_nanoseconds);
+    EXPECT_EQ(second_read.total_engine_run_nanoseconds, first_read.total_engine_run_nanoseconds);
+    EXPECT_EQ(second_read.total_split_nanoseconds, first_read.total_split_nanoseconds);
+}
+
+TEST_F(InferenceSchedulerTest, TimedPartialBatchRecordsTheSingleOwnedRequest) {
+    BatchRuns runs;
+    auto scheduler = MakeMetricsBatch(4, std::chrono::milliseconds{30}, 2);
+    auto reached = std::make_shared<std::latch>(1);
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, reached);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler,
+                                       [&runs](std::size_t count) { runs.Record(count); });
+    RequireStart(*scheduler);
+    Admission admission = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    reached->wait();
+    ExpectDynamicSum(TakeBounded(std::move(admission)), 4.F, 6.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(runs.Snapshot(), (std::vector<std::size_t>{1}));
+    ExpectQuiescent(*scheduler, 1, 0, 0, 0);
+    const SchedulerMetrics metrics = scheduler->metrics();
+    EXPECT_TRUE(metrics.finalized);
+    EXPECT_EQ(metrics.engine_run_count, 1U);
+    EXPECT_EQ(metrics.requests_entered_engine_runs, 1U);
+    EXPECT_EQ(metrics.batch_size_histogram[1], 1U);
+    EXPECT_EQ(metrics.batch_size_histogram[4], 0U);
+    EXPECT_GE(metrics.total_assembly_nanoseconds, 0U);
+    EXPECT_GE(metrics.total_engine_run_nanoseconds, 0U);
+    EXPECT_GE(metrics.total_split_nanoseconds, 0U);
+    ExpectHistogramInvariants(metrics);
+}
+
+TEST_F(InferenceSchedulerTest, DrainDuringBatchWaitFinalizesOnlyTheOwnedRun) {
+    BatchRuns runs;
+    auto hold = std::make_shared<std::latch>(1);
+    auto scheduler = MakeMetricsBatch(4, std::chrono::milliseconds{1000}, 2);
+    ShutdownResult shutdown;
+    JoinThread stopper;
+    auto reached = std::make_shared<std::latch>(1);
+    LatchRelease release{hold};
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, reached);
+    SchedulerTestAccess::SetBeforeBatchWait(*scheduler, hold);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler,
+                                       [&runs](std::size_t count) { runs.Record(count); });
+    RequireStart(*scheduler);
+    Admission admission = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    reached->wait();
+    auto closed = std::make_shared<std::latch>(1);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    stopper.thread = std::thread([&] { shutdown = scheduler->shutdown(ShutdownPolicy::kDrain); });
+    closed->wait();
+    ExpectEmptyMetrics(scheduler->metrics(), true, false);
+    release.release();
+    stopper.thread.join();
+    ExpectWinner(shutdown, ShutdownPolicy::kDrain, true);
+    ExpectDynamicSum(Take(std::move(admission)), 4.F, 6.F);
+    EXPECT_EQ(runs.Snapshot(), (std::vector<std::size_t>{1}));
+    ExpectQuiescent(*scheduler, 1, 0, 0, 0);
+    const SchedulerMetrics metrics = scheduler->metrics();
+    EXPECT_TRUE(metrics.finalized);
+    EXPECT_EQ(metrics.engine_run_count, 1U);
+    EXPECT_EQ(metrics.requests_entered_engine_runs, 1U);
+    EXPECT_EQ(metrics.batch_size_histogram[1], 1U);
+    ExpectHistogramInvariants(metrics);
+}
+
+TEST_F(InferenceSchedulerTest, CancelPendingMetricsStayUnfinalizedUntilJoin) {
+    auto blocked = std::make_shared<std::latch>(1);
+    auto scheduler = MakeScheduler(MetricsAddConfig(1, 1));
+    ShutdownResult shutdown;
+    JoinThread stopper;
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    RequireStart(*scheduler);
+    Admission admission = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    auto closed = std::make_shared<std::latch>(1);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    stopper.thread =
+        std::thread([&] { shutdown = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    closed->wait();
+    ExpectEmptyMetrics(scheduler->metrics(), true, false);
+    release.release();
+    stopper.thread.join();
+    ExpectWinner(shutdown, ShutdownPolicy::kCancelPending, true);
+    ExpectCanceled(TakeBounded(std::move(admission)), 1);
+    ExpectQuiescent(*scheduler, 0, 0, 0, 0, 1);
+    ExpectEmptyMetrics(scheduler->metrics(), true, true);
+}
+
+TEST_F(InferenceSchedulerTest, UnbatchedInferenceErrorIsAnEngineRun) {
+    const auto scheduler = MakeScheduler(MetricsAddConfig(1, 4));
+    RequireStart(*scheduler);
+    const SchedulerCompletion missing =
+        Take(scheduler->submit({NamedTensor{"A", {2}, {1.F, 2.F}}}));
+    EXPECT_EQ(missing.status, CompletionStatus::kInferenceFailed);
+    EXPECT_EQ(missing.inference_error.kind, InferenceErrorKind::kMissingInput);
+    const SchedulerCompletion shape = Take(scheduler->submit(
+        {NamedTensor{"A", {3}, {1.F, 2.F, 3.F}}, NamedTensor{"B", {2}, {3.F, 4.F}}}));
+    EXPECT_EQ(shape.status, CompletionStatus::kInferenceFailed);
+    EXPECT_EQ(shape.inference_error.kind, InferenceErrorKind::kShapeMismatch);
+    ExpectSum(Take(scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F))), 4.F, 6.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    ExpectQuiescent(*scheduler, 1, 2, 0, 0);
+    const SchedulerMetrics metrics = scheduler->metrics();
+    EXPECT_TRUE(metrics.finalized);
+    EXPECT_EQ(metrics.engine_run_count, 3U);
+    EXPECT_EQ(metrics.requests_entered_engine_runs, 3U);
+    EXPECT_EQ(metrics.batch_size_histogram[1], 3U);
+    EXPECT_EQ(metrics.total_assembly_nanoseconds, 0U);
+    EXPECT_EQ(metrics.total_split_nanoseconds, 0U);
+    EXPECT_GE(metrics.total_engine_run_nanoseconds, 0U);
+    ExpectHistogramInvariants(metrics);
+}
+
+TEST_F(InferenceSchedulerTest, DisabledMetricsSkipABatchedRun) {
+    BatchRuns runs;
+    auto blocked = std::make_shared<std::latch>(1);
+    auto scheduler = MakeBatch(4, std::chrono::milliseconds{0}, 4);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler,
+                                       [&runs](std::size_t count) { runs.Record(count); });
+    RequireStart(*scheduler);
+    ExpectEmptyMetrics(scheduler->metrics(), false, false);
+    Admission first = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission second = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    release.release();
+    ExpectDynamicSum(Take(std::move(first)), 4.F, 6.F);
+    ExpectDynamicSum(Take(std::move(second)), 12.F, 14.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(runs.Snapshot(), (std::vector<std::size_t>{2}));
+    ExpectQuiescent(*scheduler, 2, 0, 0, 0);
+    ExpectEmptyMetrics(scheduler->metrics(), false, true);
+}
+
+TEST_F(InferenceSchedulerTest, RejectionAfterShutdownDoesNotCreateAnEngineRun) {
+    const auto scheduler = MakeScheduler(MetricsAddConfig(1, 1));
+    RequireStart(*scheduler);
+    ExpectSum(Take(scheduler->submit(AddInputs(8.F, 0.F, 1.F, 0.F))), 9.F, 0.F);
+    ExpectWinner(scheduler->shutdown(ShutdownPolicy::kDrain), ShutdownPolicy::kDrain, true);
+    const SchedulerMetrics before = scheduler->metrics();
+    EXPECT_TRUE(before.finalized);
+    EXPECT_EQ(before.engine_run_count, 1U);
+    EXPECT_EQ(before.batch_size_histogram[1], 1U);
+    ExpectHistogramInvariants(before);
+    const Admission rejected = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    EXPECT_EQ(rejected.status, AdmissionStatus::kRejectedClosed);
+    EXPECT_FALSE(rejected.completion.has_value());
+    ASSERT_TRUE(rejected.inputs.has_value());
+    ASSERT_EQ(rejected.inputs->size(), 2U);
+    EXPECT_EQ(rejected.inputs->front().name, "A");
+    ASSERT_EQ(rejected.inputs->front().values.size(), 2U);
+    EXPECT_FLOAT_EQ(rejected.inputs->front().values[0], 1.F);
+    EXPECT_FLOAT_EQ(rejected.inputs->front().values[1], 2.F);
+    EXPECT_EQ(rejected.inputs->back().name, "B");
+    ASSERT_EQ(rejected.inputs->back().values.size(), 2U);
+    EXPECT_FLOAT_EQ(rejected.inputs->back().values[0], 3.F);
+    EXPECT_FLOAT_EQ(rejected.inputs->back().values[1], 4.F);
+    EXPECT_EQ(scheduler->stats().accepted, 1U);
+    EXPECT_EQ(scheduler->stats().rejected_closed, 1U);
+    ExpectQuiescent(*scheduler, 1, 0, 0, 0);
+    const SchedulerMetrics after = scheduler->metrics();
+    EXPECT_EQ(after.enabled, before.enabled);
+    EXPECT_EQ(after.finalized, before.finalized);
+    EXPECT_EQ(after.engine_run_count, before.engine_run_count);
+    EXPECT_EQ(after.requests_entered_engine_runs, before.requests_entered_engine_runs);
+    EXPECT_EQ(after.batch_size_histogram, before.batch_size_histogram);
+    EXPECT_EQ(after.total_assembly_nanoseconds, before.total_assembly_nanoseconds);
+    EXPECT_EQ(after.total_engine_run_nanoseconds, before.total_engine_run_nanoseconds);
+    EXPECT_EQ(after.total_split_nanoseconds, before.total_split_nanoseconds);
+}
+
+TEST_F(InferenceSchedulerTest, IdleSiblingLeavesCompletedRunUnfinalizedUntilJoin) {
+    std::atomic<bool> saw_published{false};
+    auto hold_sibling = std::make_shared<std::latch>(1);
+    auto scheduler = MakeScheduler(MetricsAddConfig(2, 1));
+    JoinThread reader;
+    LatchRelease release_sibling{hold_sibling};
+    SchedulerTestAccess::SetHoldOtherWorkers(*scheduler, hold_sibling);
+    RequireStart(*scheduler);
+    ExpectSum(Take(scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F))), 4.F, 6.F);
+    reader.thread = std::thread([&] {
+        for (int sample = 0; sample < 100; ++sample) {
+            const SchedulerMetrics snapshot = scheduler->metrics();
+            if (!snapshot.enabled || snapshot.finalized || snapshot.engine_run_count != 0 ||
+                snapshot.requests_entered_engine_runs != 0 ||
+                snapshot.total_assembly_nanoseconds != 0 ||
+                snapshot.total_engine_run_nanoseconds != 0 ||
+                snapshot.total_split_nanoseconds != 0) {
+                saw_published.store(true, std::memory_order_relaxed);
+            }
+            for (const std::uint64_t bin : snapshot.batch_size_histogram) {
+                if (bin != 0) {
+                    saw_published.store(true, std::memory_order_relaxed);
+                }
+            }
+        }
+    });
+    reader.thread.join();
+    EXPECT_FALSE(saw_published.load());
+    ExpectEmptyMetrics(scheduler->metrics(), true, false);
+    release_sibling.release();
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    ExpectQuiescent(*scheduler, 1, 0, 0, 0);
+    const SchedulerMetrics metrics = scheduler->metrics();
+    EXPECT_TRUE(metrics.finalized);
+    EXPECT_EQ(metrics.engine_run_count, 1U);
+    EXPECT_EQ(metrics.requests_entered_engine_runs, 1U);
+    EXPECT_EQ(metrics.batch_size_histogram[1], 1U);
+    ExpectHistogramInvariants(metrics);
+}
+
+TEST_F(InferenceSchedulerTest, FailedSiblingKeepsTheOtherWorkersEngineRun) {
+    auto both_entered = std::make_shared<std::latch>(2);
+    auto success_held = std::make_shared<std::latch>(1);
+    auto hold_sibling = std::make_shared<std::latch>(1);
+    auto hold_success_worker = std::make_shared<std::latch>(1);
+    std::atomic<int> entries{0};
+    auto scheduler = MakeScheduler(MetricsAddConfig(2, 1));
+    LatchRelease release_sibling{hold_sibling};
+    LatchRelease release_success{hold_success_worker};
+    SchedulerTestAccess::SetHoldOtherWorkers(*scheduler, hold_sibling);
+    SchedulerTestAccess::SetBeforeLoop(*scheduler, [&] {
+        const int seen = entries.fetch_add(1);
+        if (seen < 2) {
+            both_entered->count_down();
+            return;
+        }
+        if (seen == 2) {
+            success_held->count_down();
+        }
+        hold_success_worker->wait();
+    });
+    RequireStart(*scheduler);
+    both_entered->wait();
+    ExpectSum(Take(scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F))), 4.F, 6.F);
+    success_held->wait();
+    SchedulerTestAccess::SetThrowInWorker(*scheduler, 1);
+    release_sibling.release();
+    const SchedulerCompletion failed = Take(scheduler->submit(AddInputs(5.F, 6.F, 7.F, 8.F)));
+    EXPECT_EQ(failed.status, CompletionStatus::kWorkerFailed);
+    ExpectEmptyMetrics(scheduler->metrics(), true, false);
+    release_success.release();
     EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
     ExpectQuiescent(*scheduler, 1, 0, 1, 0);
     const SchedulerMetrics metrics = scheduler->metrics();
