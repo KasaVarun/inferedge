@@ -1,0 +1,575 @@
+#include "inferedge/scheduler_benchmark_cli.hpp"
+#include "inferedge/scheduler_benchmark_json.hpp"
+
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
+#include <future>
+#include <gtest/gtest.h>
+#include <limits>
+#include <spawn.h>
+#include <string>
+#include <string_view>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <utility>
+#include <vector>
+
+#ifndef INFEREDGE_BENCH_SCHEDULER_EXECUTABLE
+#error "CMake must define INFEREDGE_BENCH_SCHEDULER_EXECUTABLE"
+#endif
+
+#ifndef INFEREDGE_BATCH_ADD_MODEL_PATH
+#error "CMake must define INFEREDGE_BATCH_ADD_MODEL_PATH"
+#endif
+
+#ifndef INFEREDGE_INVALID_MODEL_PATH
+#error "CMake must define INFEREDGE_INVALID_MODEL_PATH"
+#endif
+
+extern "C" char** environ;
+
+namespace {
+
+using namespace std::chrono_literals;
+using inferedge::SchedulerBenchmarkCliAction;
+using inferedge::SchedulerBenchmarkConfig;
+using inferedge::SchedulerBenchmarkErrorKind;
+using inferedge::SchedulerBenchmarkPlanError;
+using inferedge::SchedulerBenchmarkReport;
+using inferedge::SchedulerBenchmarkRun;
+using inferedge::SchedulerWorkloadKind;
+
+SchedulerBenchmarkConfig MeasuredConfig() {
+    SchedulerBenchmarkConfig config;
+    config.model_path = INFEREDGE_BATCH_ADD_MODEL_PATH;
+    config.worker_count = 1;
+    config.queue_capacity = 8;
+    config.enable_batching = false;
+    config.max_batch_size = 1;
+    config.max_batch_delay = 0ms;
+    config.enable_metrics = true;
+    config.workload = SchedulerWorkloadKind::kOpenLoopConstant;
+    config.target_requests_per_second = 1000000.0;
+    config.producer_count = 1;
+    config.max_offered = 4;
+    config.max_outstanding = 4;
+    config.duration = 1000ms;
+    config.completion_timeout = 5000ms;
+    config.lag_tolerance = 5000ms;
+    config.check_interval = 1;
+    return config;
+}
+
+void ExpectAccounting(const SchedulerBenchmarkReport& report) {
+    const std::uint64_t rejections =
+        report.rejections.full + report.rejections.closed + report.rejections.not_running;
+    const std::uint64_t terminals = report.succeeded + report.failed_inference +
+                                    report.failed_worker + report.failed_scheduler +
+                                    report.canceled + report.timeouts;
+    EXPECT_EQ(report.scheduled_opportunities, report.submit_attempts +
+                                                  report.generator_skips_outstanding +
+                                                  report.generator_skips_lag);
+    EXPECT_EQ(report.submit_attempts, report.accepted + rejections);
+    EXPECT_EQ(report.accepted, terminals);
+}
+
+void ExpectHistogram(const SchedulerBenchmarkReport& report) {
+    ASSERT_EQ(report.metrics.batch_size_histogram.size(), 33U);
+    EXPECT_EQ(report.metrics.batch_size_histogram[0], 0U);
+    std::uint64_t runs = 0;
+    std::uint64_t weighted = 0;
+    for (std::size_t size = 1; size < report.metrics.batch_size_histogram.size(); ++size) {
+        const std::uint64_t bin = report.metrics.batch_size_histogram[size];
+        runs += bin;
+        weighted += static_cast<std::uint64_t>(size) * bin;
+    }
+    EXPECT_EQ(runs, report.metrics.engine_run_count);
+    EXPECT_EQ(weighted, report.metrics.requests_entered_engine_runs);
+    EXPECT_TRUE(report.metrics.enabled);
+    EXPECT_TRUE(report.metrics.finalized);
+    EXPECT_FALSE(report.histogram_saturated);
+}
+
+struct ProcessOutput {
+    int status{0};
+    std::string output;
+    std::string error;
+};
+
+std::string ReadPipe(int fd) {
+    std::string text;
+    char buffer[256];
+    while (true) {
+        const ssize_t count = ::read(fd, buffer, sizeof(buffer));
+        if (count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (count == 0) {
+            break;
+        }
+        text.append(buffer, static_cast<std::size_t>(count));
+    }
+    return text;
+}
+
+ProcessOutput RunProcess(const std::vector<std::string>& args) {
+    int output_pipe[2] = {-1, -1};
+    int error_pipe[2] = {-1, -1};
+    EXPECT_EQ(::pipe(output_pipe), 0);
+    EXPECT_EQ(::pipe(error_pipe), 0);
+    posix_spawn_file_actions_t actions;
+    EXPECT_EQ(::posix_spawn_file_actions_init(&actions), 0);
+    EXPECT_EQ(::posix_spawn_file_actions_adddup2(&actions, output_pipe[1], STDOUT_FILENO), 0);
+    EXPECT_EQ(::posix_spawn_file_actions_adddup2(&actions, error_pipe[1], STDERR_FILENO), 0);
+    EXPECT_EQ(::posix_spawn_file_actions_addclose(&actions, output_pipe[0]), 0);
+    EXPECT_EQ(::posix_spawn_file_actions_addclose(&actions, error_pipe[0]), 0);
+    EXPECT_EQ(::posix_spawn_file_actions_addclose(&actions, output_pipe[1]), 0);
+    EXPECT_EQ(::posix_spawn_file_actions_addclose(&actions, error_pipe[1]), 0);
+    std::vector<std::string> storage = args;
+    std::vector<char*> argv;
+    argv.reserve(storage.size() + 1);
+    for (std::string& arg : storage) {
+        argv.push_back(arg.data());
+    }
+    argv.push_back(nullptr);
+    pid_t pid = 0;
+    const int spawned = ::posix_spawnp(&pid, argv[0], &actions, nullptr, argv.data(), environ);
+    EXPECT_EQ(spawned, 0);
+    ::posix_spawn_file_actions_destroy(&actions);
+    ::close(output_pipe[1]);
+    ::close(error_pipe[1]);
+    ProcessOutput captured;
+    captured.output = ReadPipe(output_pipe[0]);
+    captured.error = ReadPipe(error_pipe[0]);
+    ::close(output_pipe[0]);
+    ::close(error_pipe[0]);
+    int status = 0;
+    EXPECT_EQ(::waitpid(pid, &status, 0), pid);
+    captured.status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    return captured;
+}
+
+} // namespace
+
+TEST(SchedulerBenchmarkCliTest, HelpShowsUsage) {
+    const auto parsed = inferedge::parse_scheduler_benchmark_cli({});
+    EXPECT_EQ(parsed.action, SchedulerBenchmarkCliAction::kHelp);
+    EXPECT_EQ(parsed.exit_code, 0);
+    EXPECT_NE(parsed.message.find("Usage: inferedge-bench-scheduler"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkCliTest, VersionShowsToolName) {
+    const auto parsed = inferedge::parse_scheduler_benchmark_cli({"--version"});
+    EXPECT_EQ(parsed.action, SchedulerBenchmarkCliAction::kVersion);
+    EXPECT_NE(parsed.message.find("inferedge-bench-scheduler 0.1.0"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkCliTest, RejectsUnknownOption) {
+    const auto parsed = inferedge::parse_scheduler_benchmark_cli({"--not-a-flag"});
+    EXPECT_EQ(parsed.action, SchedulerBenchmarkCliAction::kError);
+    EXPECT_EQ(parsed.exit_code, 2);
+}
+
+TEST(SchedulerBenchmarkCliTest, RejectsMissingRequiredOption) {
+    const auto parsed =
+        inferedge::parse_scheduler_benchmark_cli({"--model", "model.onnx", "--workers", "1"});
+    EXPECT_EQ(parsed.action, SchedulerBenchmarkCliAction::kError);
+    EXPECT_EQ(parsed.exit_code, 2);
+}
+
+TEST(SchedulerBenchmarkCliTest, RejectsInvalidInteger) {
+    const auto parsed = inferedge::parse_scheduler_benchmark_cli(
+        {"--model", "model.onnx", "--workers", "-1", "--queue-capacity", "1", "--workload",
+         "closed_loop", "--max-offered", "1", "--max-outstanding", "1", "--duration-ms", "10",
+         "--completion-timeout-ms", "10"});
+    EXPECT_EQ(parsed.action, SchedulerBenchmarkCliAction::kError);
+    EXPECT_NE(parsed.message.find("invalid integer"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkCliTest, RejectsUnsupportedWorkload) {
+    const auto parsed = inferedge::parse_scheduler_benchmark_cli(
+        {"--model", "model.onnx", "--workers", "1", "--queue-capacity", "1", "--workload", "batch",
+         "--max-offered", "1", "--max-outstanding", "1", "--duration-ms", "10",
+         "--completion-timeout-ms", "10"});
+    EXPECT_EQ(parsed.action, SchedulerBenchmarkCliAction::kError);
+    EXPECT_NE(parsed.message.find("unsupported workload"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkCliTest, RejectsBatchSizeOutOfRange) {
+    const auto parsed = inferedge::parse_scheduler_benchmark_cli(
+        {"--model", "model.onnx", "--workers", "1", "--queue-capacity", "1", "--workload",
+         "closed_loop", "--max-offered", "1", "--max-outstanding", "1", "--duration-ms", "10",
+         "--completion-timeout-ms", "10", "--max-batch-size", "33"});
+    EXPECT_EQ(parsed.action, SchedulerBenchmarkCliAction::kError);
+}
+
+TEST(SchedulerBenchmarkCliTest, RejectsOutstandingAboveOffered) {
+    const auto parsed = inferedge::parse_scheduler_benchmark_cli(
+        {"--model", "model.onnx", "--workers", "1", "--queue-capacity", "1", "--workload",
+         "closed_loop", "--max-offered", "1", "--max-outstanding", "2", "--duration-ms", "10",
+         "--completion-timeout-ms", "10"});
+    EXPECT_EQ(parsed.action, SchedulerBenchmarkCliAction::kError);
+    EXPECT_EQ(parsed.exit_code, 2);
+}
+
+TEST(SchedulerBenchmarkCliTest, RejectsClosedLoopSchedule) {
+    const auto parsed = inferedge::parse_scheduler_benchmark_cli(
+        {"--model", "model.onnx", "--workers", "1", "--queue-capacity", "1", "--workload",
+         "closed_loop", "--target-rps", "10", "--max-offered", "1", "--max-outstanding", "1",
+         "--duration-ms", "10", "--completion-timeout-ms", "10"});
+    EXPECT_EQ(parsed.action, SchedulerBenchmarkCliAction::kError);
+}
+
+TEST(SchedulerBenchmarkPlanTest, ConstantScheduleIsSpaced) {
+    const auto planned = inferedge::plan_constant_arrivals(100.0, 50ms, 10);
+    ASSERT_EQ(planned.error, SchedulerBenchmarkPlanError::kNone);
+    ASSERT_EQ(planned.plan.arrivals.size(), 5U);
+    EXPECT_EQ(planned.plan.arrivals[0].offset, 0ms);
+    EXPECT_EQ(planned.plan.arrivals[1].offset, 10ms);
+    EXPECT_EQ(planned.plan.arrivals[4].offset, 40ms);
+    ASSERT_EQ(planned.plan.phases.size(), 1U);
+    EXPECT_EQ(planned.plan.phases[0].scheduled_opportunities, 5U);
+}
+
+TEST(SchedulerBenchmarkPlanTest, BurstScheduleRecordsPhaseBoundaries) {
+    const auto planned = inferedge::plan_burst_arrivals(100.0, 50.0, 50ms, 50ms, 100ms, 20);
+    ASSERT_EQ(planned.error, SchedulerBenchmarkPlanError::kNone);
+    ASSERT_EQ(planned.plan.phases.size(), 2U);
+    EXPECT_EQ(planned.plan.phases[0].scheduled_opportunities, 5U);
+    EXPECT_EQ(planned.plan.phases[1].scheduled_opportunities, 3U);
+    ASSERT_EQ(planned.plan.arrivals.size(), 8U);
+    EXPECT_EQ(planned.plan.arrivals[5].offset, 50ms);
+    EXPECT_EQ(planned.plan.arrivals[5].phase_index, 1U);
+    EXPECT_EQ(planned.plan.arrivals[7].offset, 90ms);
+}
+
+TEST(SchedulerBenchmarkPlanTest, LagAboveToleranceIsLate) {
+    const auto scheduled = std::chrono::steady_clock::time_point{10ms};
+    const auto actual = scheduled + 5ms;
+    const auto lag = inferedge::measure_generator_lag(scheduled, actual, 1ms);
+    EXPECT_EQ(lag.lag, 5ms);
+    EXPECT_TRUE(lag.exceeds_tolerance);
+}
+
+TEST(SchedulerBenchmarkPlanTest, EarlyLagDoesNotExceedTolerance) {
+    const auto scheduled = std::chrono::steady_clock::time_point{10ms};
+    const auto actual = scheduled - 1ms;
+    const auto lag = inferedge::measure_generator_lag(scheduled, actual, 1ms);
+    EXPECT_EQ(lag.lag, -1ms);
+    EXPECT_FALSE(lag.exceeds_tolerance);
+}
+
+TEST(SchedulerBenchmarkPlanTest, FutureReadyDoesNotBlock) {
+    std::promise<inferedge::SchedulerCompletion> pending;
+    std::future<inferedge::SchedulerCompletion> waiting = pending.get_future();
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_FALSE(inferedge::scheduler_benchmark_future_ready(waiting));
+    EXPECT_LT(std::chrono::steady_clock::now() - started, 50ms);
+    std::promise<inferedge::SchedulerCompletion> ready_promise;
+    std::future<inferedge::SchedulerCompletion> ready = ready_promise.get_future();
+    ready_promise.set_value(inferedge::SchedulerCompletion{});
+    EXPECT_TRUE(inferedge::scheduler_benchmark_future_ready(ready));
+}
+
+TEST(SchedulerBenchmarkPlanTest, RequestTensorMatchesAttempt) {
+    const auto request = inferedge::scheduler_benchmark_request(1001);
+    ASSERT_EQ(request.inputs.size(), 2U);
+    EXPECT_EQ(request.inputs[0].shape, (std::vector<std::int64_t>{1, 2}));
+    EXPECT_FLOAT_EQ(request.inputs[0].values[0], 1.F);
+    EXPECT_FLOAT_EQ(request.inputs[0].values[1], 1.F);
+    EXPECT_FLOAT_EQ(request.expected_c0, 2.F);
+    EXPECT_FLOAT_EQ(request.expected_c1, 3.F);
+    EXPECT_FALSE(inferedge::scheduler_benchmark_should_check(1, 2, false));
+    EXPECT_TRUE(inferedge::scheduler_benchmark_should_check(2, 2, false));
+    EXPECT_TRUE(inferedge::scheduler_benchmark_should_check(1, 2, true));
+}
+
+TEST(SchedulerBenchmarkTest, OpenLoopConstantCompletes) {
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(MeasuredConfig());
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.valid) << (run.report.invalid_reasons.empty()
+                                          ? std::string{}
+                                          : run.report.invalid_reasons.front());
+    EXPECT_EQ(run.report.workload, "open_loop_constant");
+    EXPECT_EQ(run.report.succeeded, 4U);
+    EXPECT_EQ(run.report.correctness_mismatches, 0U);
+    EXPECT_EQ(run.report.correctness_checked, 4U);
+    EXPECT_EQ(run.report.completion_observation, "open_loop_poll");
+    EXPECT_GT(run.report.latency.sample_count, 0U);
+    EXPECT_TRUE(run.report.latency.percentiles_reported);
+    EXPECT_FALSE(run.report.latency.precise_tail);
+    EXPECT_GT(run.report.throughput.total_trial_seconds, 0.0);
+    EXPECT_EQ(run.report.queue_depth, 0U);
+    EXPECT_EQ(run.report.live_workers, 0U);
+    ExpectAccounting(run.report);
+    ExpectHistogram(run.report);
+    EXPECT_EQ(inferedge::scheduler_benchmark_status(run), 0);
+}
+
+TEST(SchedulerBenchmarkTest, BurstTrialRunsBothPhases) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.workload = SchedulerWorkloadKind::kOpenLoopBurst;
+    config.burst_high_requests_per_second = 200.0;
+    config.burst_low_requests_per_second = 100.0;
+    config.burst_high = 20ms;
+    config.burst_low = 20ms;
+    config.duration = 40ms;
+    config.max_offered = 20;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.valid);
+    ASSERT_GE(run.report.phases.size(), 2U);
+    EXPECT_GT(run.report.phases[0].scheduled_opportunities, 0U);
+    EXPECT_GT(run.report.phases[1].scheduled_opportunities, 0U);
+    ExpectAccounting(run.report);
+    ExpectHistogram(run.report);
+}
+
+TEST(SchedulerBenchmarkTest, ClosedLoopStaysBounded) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.workload = SchedulerWorkloadKind::kClosedLoop;
+    config.producer_count = 2;
+    config.max_outstanding = 2;
+    config.max_offered = 4;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.valid);
+    EXPECT_EQ(run.report.succeeded, 4U);
+    EXPECT_EQ(run.report.generator_skips_outstanding, 0U);
+    EXPECT_EQ(run.report.completion_observation, "closed_loop_producer_wait");
+    ExpectAccounting(run.report);
+    ExpectHistogram(run.report);
+}
+
+TEST(SchedulerBenchmarkTest, RejectionAfterShutdownReturnsInputs) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.max_offered = 1;
+    config.max_outstanding = 1;
+    config.test_submit_after_shutdown = true;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_FALSE(run.report.valid);
+    EXPECT_EQ(run.report.succeeded, 1U);
+    EXPECT_EQ(run.report.rejections.closed, 1U);
+    EXPECT_EQ(run.report.rejections.full, 0U);
+    EXPECT_EQ(run.report.generator_skips_outstanding, 0U);
+    EXPECT_EQ(run.report.error_count, 0U);
+    EXPECT_EQ(run.report.metrics.engine_run_count, 1U);
+    ExpectAccounting(run.report);
+    ExpectHistogram(run.report);
+}
+
+TEST(SchedulerBenchmarkTest, OutstandingCapSkipsWithoutSubmitting) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.hold_collector = true;
+    config.max_outstanding = 1;
+    config.max_offered = 4;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_FALSE(run.report.valid);
+    EXPECT_EQ(run.report.submit_attempts, 1U);
+    EXPECT_EQ(run.report.generator_skips_outstanding, 3U);
+    EXPECT_NE(std::find(run.report.invalid_reasons.begin(), run.report.invalid_reasons.end(),
+                        "outstanding_cap_suppressed_schedule"),
+              run.report.invalid_reasons.end());
+    EXPECT_EQ(run.report.rejections.full, 0U);
+    EXPECT_EQ(run.report.succeeded, 1U);
+    ExpectAccounting(run.report);
+}
+
+TEST(SchedulerBenchmarkTest, WarmupUsesASeparateScheduler) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.warmup_requests = 2;
+    config.max_offered = 1;
+    config.max_outstanding = 1;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.valid);
+    EXPECT_EQ(run.report.succeeded, 1U);
+    EXPECT_EQ(run.report.metrics.engine_run_count, 1U);
+    EXPECT_EQ(run.report.warmup_requests, 2U);
+    EXPECT_TRUE(run.report.warmup_uses_separate_scheduler);
+    ExpectHistogram(run.report);
+}
+
+TEST(SchedulerBenchmarkTest, CapOneHistogramIsSizeOne) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.enable_batching = true;
+    config.max_batch_size = 1;
+    config.max_offered = 2;
+    config.max_outstanding = 2;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.valid);
+    EXPECT_EQ(run.report.metrics.batch_size_histogram[1], 2U);
+    EXPECT_EQ(run.report.metrics.engine_run_count, 2U);
+    EXPECT_EQ(run.report.metrics.requests_entered_engine_runs, 2U);
+    ExpectHistogram(run.report);
+}
+
+TEST(SchedulerBenchmarkTest, CheckIntervalKeepsTheLastSuccess) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.check_interval = 2;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.valid);
+    EXPECT_EQ(run.report.succeeded, 4U);
+    EXPECT_EQ(run.report.correctness_checked, 2U);
+    EXPECT_EQ(run.report.correctness_mismatches, 0U);
+}
+
+TEST(SchedulerBenchmarkTest, MissingModelReturnsNonzero) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.model_path = INFEREDGE_INVALID_MODEL_PATH;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    EXPECT_EQ(run.kind, SchedulerBenchmarkErrorKind::kModelLoad);
+    EXPECT_EQ(inferedge::scheduler_benchmark_status(run), 1);
+}
+
+TEST(SchedulerBenchmarkTest, MalformedConfigIsRejected) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.worker_count = 0;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    EXPECT_EQ(run.kind, SchedulerBenchmarkErrorKind::kInvalidConfig);
+    EXPECT_EQ(inferedge::scheduler_benchmark_status(run), 2);
+}
+
+TEST(SchedulerBenchmarkTest, EarlyMaxOfferedStopIsNotTheConfiguredDuration) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.max_offered = 2;
+    config.max_outstanding = 2;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.valid);
+    EXPECT_EQ(run.report.arrival_stop_reason, "max_offered");
+    EXPECT_EQ(run.report.succeeded, 2U);
+    EXPECT_LT(run.report.scheduled_span, run.report.configured_duration);
+    EXPECT_LT(run.report.arrival_window, run.report.configured_duration);
+    EXPECT_GT(run.report.throughput.arrival_window_seconds, 0.0);
+    EXPECT_EQ(run.report.generator_skips_outstanding, 0U);
+}
+
+TEST(SchedulerBenchmarkTest, JsonSchemaIsVersionThree) {
+    SchedulerBenchmarkReport report;
+    report.valid = true;
+    report.model = "models/batch_add_f32.onnx";
+    report.workload = "closed_loop";
+    report.completion_observation = "closed_loop_producer_wait";
+    report.metrics.enabled = true;
+    report.metrics.finalized = true;
+    report.warmup_uses_separate_scheduler = true;
+    const auto json = inferedge::write_scheduler_benchmark_json(report, "0.1.0");
+    EXPECT_TRUE(json.error.empty());
+    EXPECT_NE(json.text.find("\"schema_version\": 3"), std::string::npos);
+    EXPECT_NE(json.text.find("\"arrival_stop_reason\""), std::string::npos);
+    EXPECT_NE(json.text.find("\"completion_timeout_bound\": \"future_observation_only\""),
+              std::string::npos);
+    EXPECT_NE(json.text.find("\"scheduled_span_nanoseconds\""), std::string::npos);
+    EXPECT_EQ(json.text.back(), '\n');
+    report.throughput.successful_per_total_trial_second = std::numeric_limits<double>::infinity();
+    const auto rejected = inferedge::write_scheduler_benchmark_json(report, "0.1.0");
+    EXPECT_FALSE(rejected.error.empty());
+    EXPECT_TRUE(rejected.text.empty());
+}
+
+TEST(SchedulerBenchmarkTest, InjectedCheckFailureExitsNonzero) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.max_offered = 1;
+    config.max_outstanding = 1;
+    config.test_fail_checked_successes = 1;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_FALSE(run.report.valid);
+    EXPECT_GT(run.report.correctness_mismatches, 0U);
+    EXPECT_EQ(inferedge::scheduler_benchmark_status(run), 1);
+}
+
+TEST(SchedulerBenchmarkTest, LagStopDoesNotSubmitTheTail) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.max_offered = 3;
+    config.max_outstanding = 3;
+    config.lag_tolerance = 1ms;
+    config.test_submit_delay = 20ms;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_FALSE(run.report.valid);
+    EXPECT_EQ(run.report.submit_attempts, 0U);
+    EXPECT_EQ(run.report.generator_skips_lag, 3U);
+    EXPECT_EQ(run.report.arrival_stop_reason, "generator_lag");
+    EXPECT_EQ(run.report.metrics.engine_run_count, 0U);
+    ExpectAccounting(run.report);
+}
+
+TEST(SchedulerBenchmarkProcessTest, HelpProcessExitsZero) {
+    const ProcessOutput process = RunProcess({INFEREDGE_BENCH_SCHEDULER_EXECUTABLE, "--help"});
+    EXPECT_EQ(process.status, 0);
+    EXPECT_NE(process.output.find("Usage: inferedge-bench-scheduler"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkProcessTest, UsageErrorExitsNonzero) {
+    const ProcessOutput process =
+        RunProcess({INFEREDGE_BENCH_SCHEDULER_EXECUTABLE, "--workers", "0"});
+    EXPECT_EQ(process.status, 2);
+    EXPECT_NE(process.error.find("error:"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkProcessTest, MissingModelProcessExitsNonzero) {
+    const ProcessOutput process = RunProcess({INFEREDGE_BENCH_SCHEDULER_EXECUTABLE,
+                                              "--model",
+                                              INFEREDGE_INVALID_MODEL_PATH,
+                                              "--workers",
+                                              "1",
+                                              "--queue-capacity",
+                                              "1",
+                                              "--workload",
+                                              "closed_loop",
+                                              "--producer-count",
+                                              "1",
+                                              "--max-offered",
+                                              "1",
+                                              "--max-outstanding",
+                                              "1",
+                                              "--duration-ms",
+                                              "50",
+                                              "--completion-timeout-ms",
+                                              "1000",
+                                              "--format",
+                                              "json"});
+    EXPECT_EQ(process.status, 1);
+    EXPECT_NE(process.output.find("\"schema_version\": 3"), std::string::npos);
+    EXPECT_NE(process.output.find("\"error\": \"model_load\""), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkProcessTest, JsonTrialExitsZero) {
+    const ProcessOutput process = RunProcess({INFEREDGE_BENCH_SCHEDULER_EXECUTABLE,
+                                              "--model",
+                                              INFEREDGE_BATCH_ADD_MODEL_PATH,
+                                              "--workers",
+                                              "1",
+                                              "--queue-capacity",
+                                              "4",
+                                              "--workload",
+                                              "closed_loop",
+                                              "--producer-count",
+                                              "1",
+                                              "--max-offered",
+                                              "2",
+                                              "--max-outstanding",
+                                              "1",
+                                              "--duration-ms",
+                                              "1000",
+                                              "--completion-timeout-ms",
+                                              "5000",
+                                              "--format",
+                                              "json"});
+    EXPECT_EQ(process.status, 0) << process.error << process.output;
+    EXPECT_NE(process.output.find("\"schema_version\": 3"), std::string::npos);
+    EXPECT_NE(process.output.find("\"workload\": \"closed_loop\""), std::string::npos);
+    EXPECT_NE(process.output.find("\"valid\": true"), std::string::npos);
+    EXPECT_EQ(process.output.back(), '\n');
+}
