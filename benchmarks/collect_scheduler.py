@@ -3,10 +3,12 @@
 
 This module does not run a neural network itself. It checks a Release build,
 the pinned batch-add model, and the repository, then starts one supervised
-inferedge-bench-scheduler process per trial. Exit status 0 is necessary and
-not sufficient: open-loop primary trials must also submit at least 99 percent
-of the scheduled opportunities. The collector does not write aggregate.json
-and does not retry a failed counted trial.
+inferedge-bench-scheduler process per trial. New collections use analysis
+protocol 2. A strict primary open-loop trial must submit every scheduled
+opportunity. Scheduler rejections remain admission outcomes. Protocol 1 is
+applied only when existing evidence has no protocol version or records
+version 1. The collector does not write aggregate.json and does not retry a
+failed counted trial.
 """
 
 from __future__ import annotations
@@ -68,7 +70,26 @@ HISTOGRAM_BINS = 33
 UINT64_MAX = 18446744073709551615
 OPEN_LOOP_QUANTUM_NS = 1_000_000
 MINIMUM_SUBMIT_FRACTION = 0.99
+ANALYSIS_PROTOCOL_VERSION = 2
+PUBLICATION_POLICY = "strict_generator_delivery"
+PROTOCOL1_PUBLICATION_POLICY = "submit_fraction_0_99"
 DEFAULT_COUNTED_RUNS = 5
+PROTOCOL2_DEFAULT_COUNTED_RUNS = 10
+PREFERRED_COUNTED_RUNS = 20
+MINIMUM_INTERVAL_BLOCKS = 10
+MAX_COUNTED_RUNS = 30
+BOOTSTRAP_SEED = 20261013
+BOOTSTRAP_REPLICATES = 10000
+CONFIDENCE_LEVEL = 0.95
+STATISTICAL_METHOD = "paired_block_bootstrap_mean"
+BLOCK_PROTOCOL = "within_profile_cyclic_rotation"
+TIMING_QUALITY = "submitted_lag_max_within_configured_tolerance"
+TIMING_QUALITY_NOTE = (
+    "Maximum submitted lag is within the configured tolerance. "
+    "The schema records count, minimum, maximum, and mean only. "
+    "This is not a percentile arrival distribution and does not certify "
+    "microsecond-level scheduling accuracy."
+)
 DEFAULT_DELAY_SECONDS = 5.0
 OBSERVATION_OPEN = "open_loop_poll"
 OBSERVATION_CLOSED = "closed_loop_producer_wait"
@@ -299,6 +320,41 @@ LIMITATIONS = (
     "half of the schedule. Primary publication requires a 99 percent submit fraction.",
 )
 
+PROTOCOL_2_LIMITATIONS = (
+    "The model is the tiny dynamic batch_add_f32 graph. Scheduler overhead may dominate.",
+    "ONNX Runtime is the pinned CPU build. This collector does not run a GPU provider.",
+    "Open-loop completion observation polls future readiness at 1 ms. "
+    "p50, p95, and p99 include that observation delay and are not pure engine latency "
+    "or precise service latency.",
+    "Test hooks remain compiled into inferedge-bench-scheduler and stay disabled on this CLI.",
+    "Scheduler metrics are enabled for every collected trial.",
+    "Analysis protocol 2 requires 100 percent generator delivery for a strict primary "
+    "open-loop trial. Scheduler rejections are delivered submissions, not generator skips.",
+    "The generator lag summary is submitted_lag_max_within_configured_tolerance. "
+    "It is not a percentile arrival distribution and does not certify microsecond-level accuracy. "
+    "Full generator delivery is not arrival-timing fidelity. "
+    "The default lag tolerance is 1000 ms, so zero skips do not certify the target rate, "
+    "zero jitter, or a calibrated arrival process.",
+    "A confidence interval requires at least 10 complete paired blocks. "
+    "Ten blocks are not a power guarantee. "
+    "Twenty counted blocks are the preferred publication count. "
+    "Fewer blocks stay descriptive and do not produce an interval.",
+    "Only one predeclared contrast per profile can carry a confirmatory interval. "
+    "Other cells stay descriptive. No multiplicity correction is applied.",
+    "A paired-block bootstrap interval describes the mean paired difference under this protocol. "
+    "It is not a claim of universal performance superiority.",
+    "Cell order rotates inside each profile. Rotation does not remove host contention, "
+    "thermal drift, or clock drift.",
+    "Requests inside one trial are not independent experimental blocks.",
+    "Completion drain is a measured outcome and may differ across batching cells.",
+    "The host may have competing load.",
+    "Linux opt-in stress tests are not part of this collection.",
+    "completion_timeout_ms bounds future observation only. "
+    "This collector adds an external process wall-clock timeout because shutdown(kDrain) "
+    "can block inside an InferenceEngine::run that has already started.",
+    "Declared rates are not calibrated capacity.",
+)
+
 
 class SupervisedResult(ProcessResult):
     def __init__(
@@ -373,14 +429,49 @@ def format_trial(cell_id: str, profile_id: str, run_number: int | None) -> str:
     return f"{cell_id}-{profile_id}-{run_number:02d}"
 
 
+def require_counted_runs(counted_runs: int) -> int:
+    if type(counted_runs) is not int or isinstance(counted_runs, bool):
+        raise CollectorError("counted runs must be an integer")
+    if counted_runs < 1 or counted_runs > MAX_COUNTED_RUNS:
+        raise CollectorError(
+            f"counted runs must be from 1 through {MAX_COUNTED_RUNS}, got {counted_runs}"
+        )
+    return counted_runs
+
+
 def execution_plan(
     cells: list[dict],
     profiles: list[dict],
     counted_runs: int,
+    protocol: int = 1,
 ) -> list[dict[str, object]]:
-    """One uncounted pilot per pair, then rotated counted rounds."""
-    if counted_runs < 1:
-        raise CollectorError("counted runs must be at least 1")
+    """One uncounted pilot per pair, then rotated counted rounds.
+
+    Protocol 1 rotates the full cell-by-profile list. Protocol 2 keeps each
+    counted block inside one workload profile and rotates cells inside that block.
+    """
+    require_counted_runs(counted_runs)
+    if protocol == 1:
+        plan = _protocol1_plan(cells, profiles, counted_runs)
+    elif protocol == 2:
+        plan = _protocol2_plan(cells, profiles, counted_runs)
+    else:
+        raise CollectorError(f"unsupported analysis protocol {protocol}")
+    identities = [str(trial["trial_id"]) for trial in plan]
+    if len(identities) != len(set(identities)):
+        raise CollectorError("execution plan contains a duplicate trial id")
+    for index, trial in enumerate(plan):
+        trial["execution_index"] = index
+        trial["counted_run_target"] = counted_runs
+        trial["configuration_id"] = trial["cell_id"]
+    return plan
+
+
+def _protocol1_plan(
+    cells: list[dict],
+    profiles: list[dict],
+    counted_runs: int,
+) -> list[dict[str, object]]:
     pairs = execution_pairs(cells, profiles)
     plan: list[dict[str, object]] = []
     for cell, profile in pairs:
@@ -391,26 +482,96 @@ def execution_plan(
         for slot in range(width):
             cell, profile = pairs[(slot + offset) % width]
             plan.append(_trial(cell, profile, run_number))
-    identities = [str(trial["trial_id"]) for trial in plan]
-    if len(identities) != len(set(identities)):
-        raise CollectorError("execution plan contains a duplicate trial id")
     return plan
 
 
-def _trial(cell: dict, profile: dict, run_number: int | None) -> dict[str, object]:
+def _protocol2_plan(
+    cells: list[dict],
+    profiles: list[dict],
+    counted_runs: int,
+) -> list[dict[str, object]]:
+    plan: list[dict[str, object]] = []
+    for profile in profiles:
+        for cell in cells:
+            plan.append(_trial(cell, profile, None))
+    width = len(cells)
+    for block_index in range(1, counted_runs + 1):
+        offset = block_index - 1
+        for profile in profiles:
+            for position in range(width):
+                cell = cells[(position + offset) % width]
+                plan.append(
+                    _trial(
+                        cell,
+                        profile,
+                        block_index,
+                        block_index=block_index,
+                        position_in_block=position,
+                    )
+                )
+    return plan
+
+
+def _trial(
+    cell: dict,
+    profile: dict,
+    run_number: int | None,
+    block_index: int | None = None,
+    position_in_block: int | None = None,
+) -> dict[str, object]:
     return {
         "trial_id": format_trial(str(cell["id"]), str(profile["id"]), run_number),
         "cell_id": cell["id"],
         "profile_id": profile["id"],
         "pilot": run_number is None,
         "run_number": run_number,
+        "block_index": block_index,
+        "position_in_block": position_in_block,
     }
 
 
-def trial_order(cells: list[dict], profiles: list[dict], counted_runs: int) -> list[str]:
+def trial_order(
+    cells: list[dict],
+    profiles: list[dict],
+    counted_runs: int,
+    protocol: int = 1,
+) -> list[str]:
     return [
-        str(trial["trial_id"]) for trial in execution_plan(cells, profiles, counted_runs)
+        str(trial["trial_id"])
+        for trial in execution_plan(cells, profiles, counted_runs, protocol)
     ]
+
+
+def resolve_contrast(
+    cells: list[dict],
+    baseline_cell: str | None,
+    alternative_cell: str | None,
+) -> dict[str, object]:
+    """Infer a contrast only when exactly two cells were selected."""
+    selected = [str(cell["id"]) for cell in cells]
+    if baseline_cell is None and alternative_cell is None:
+        if len(selected) == 2:
+            return {
+                "baseline_cell": selected[0],
+                "alternative_cell": selected[1],
+                "contrast_source": "inferred_two_cell_order",
+            }
+        return {
+            "baseline_cell": None,
+            "alternative_cell": None,
+            "contrast_source": "descriptive_only",
+        }
+    if baseline_cell is None or alternative_cell is None:
+        raise CollectorError("baseline_cell and alternative_cell must both be set")
+    if baseline_cell == alternative_cell:
+        raise CollectorError("baseline_cell and alternative_cell must differ")
+    if baseline_cell not in selected or alternative_cell not in selected:
+        raise CollectorError("the predeclared contrast must use selected cells")
+    return {
+        "baseline_cell": baseline_cell,
+        "alternative_cell": alternative_cell,
+        "contrast_source": "predeclared",
+    }
 
 
 def wall_timeout_seconds(measurement: dict) -> float:
@@ -678,12 +839,146 @@ def _bool(value: object, label: str, problems: list[str]) -> bool | None:
     return value
 
 
+def analysis_protocol_of(expected: dict) -> int:
+    value = expected.get("analysis_protocol_version", 1)
+    if value not in {1, 2}:
+        raise CollectorError(f"analysis_protocol_version {value!r} is not 1 or 2")
+    return int(value)
+
+
+def strict_arrival_window_problems(
+    configured: int,
+    span: int,
+    arrival: int,
+    tolerance_ns: int,
+) -> list[str]:
+    """Full-duration bounds. Completion drain is intentionally not compared."""
+    problems = []
+    if arrival < span:
+        problems.append("arrival window is shorter than the scheduled span")
+    if tolerance_ns < 0 or configured < 0:
+        problems.append("configured duration or lag tolerance is negative")
+        return problems
+    if configured > UINT64_MAX - tolerance_ns:
+        problems.append("configured duration plus lag tolerance overflows uint64")
+        return problems
+    if arrival > configured + tolerance_ns:
+        problems.append("arrival window exceeds configured duration plus lag tolerance")
+    return problems
+
+
+def _fraction_status(document: dict) -> dict[str, float | None]:
+    scheduled = document.get("scheduled_opportunities")
+    attempts = document.get("submit_attempts")
+    accepted = document.get("accepted")
+    delivery = None
+    rejection = None
+    acceptance = None
+    completion = None
+    succeeded = document.get("succeeded")
+    if type(scheduled) is int and scheduled > 0 and type(attempts) is int:
+        delivery = attempts / scheduled
+    rejections = document.get("rejections")
+    if type(attempts) is int and attempts > 0 and isinstance(rejections, dict):
+        if all(type(rejections.get(key)) is int for key in REJECTION_KEYS):
+            rejected = rejections["full"] + rejections["closed"] + rejections["not_running"]
+            rejection = rejected / attempts
+            if type(accepted) is int:
+                acceptance = accepted / attempts
+    if type(accepted) is int and accepted > 0 and type(succeeded) is int:
+        completion = succeeded / accepted
+    return {
+        "delivery_fraction": delivery,
+        "submission_fraction": delivery,
+        "scheduler_rejection_fraction": rejection,
+        "scheduler_acceptance_fraction": acceptance,
+        "successful_completion_fraction": completion,
+    }
+
+
+def _histogram_saturated(document: dict) -> bool:
+    metrics = document.get("metrics")
+    if not isinstance(metrics, dict):
+        return False
+    if metrics.get("histogram_saturated") is True:
+        return True
+    histogram = metrics.get("batch_size_histogram")
+    return isinstance(histogram, list) and any(value == UINT64_MAX for value in histogram)
+
+
+def _strict_lag_problems(document: dict, expected: dict) -> list[str]:
+    lag = document["generator_lag"]
+    problems = []
+    count = lag["count"]
+    minimum = lag["minimum_nanoseconds"]
+    maximum = lag["maximum_nanoseconds"]
+    mean = lag["mean_nanoseconds"]
+    if count != document["submit_attempts"]:
+        problems.append("generator lag count does not equal submit_attempts")
+    if isinstance(mean, bool) or type(mean) not in {int, float}:
+        problems.append("generator lag mean is not a number")
+    elif not math.isfinite(float(mean)):
+        problems.append("generator lag mean is not finite")
+    elif type(minimum) is int and type(maximum) is int and not minimum <= float(mean) <= maximum:
+        problems.append("generator lag mean is outside the recorded minimum and maximum")
+    tolerance = expected["lag_tolerance_ms"] * 1_000_000
+    if type(maximum) is int and maximum > tolerance:
+        problems.append("recorded generator lag exceeds the configured tolerance")
+    return problems
+
+
+def _protocol2_delivery(document: dict, expected: dict) -> tuple[str, list[str], str | None]:
+    """Classify one collector-valid trial. Precedence is fixed top to bottom."""
+    saturated = _histogram_saturated(document)
+    if document["workload"] == "closed_loop":
+        if saturated:
+            return "CLOSED_LOOP_INVALID", ["histogram counters are saturated"], None
+        return "CLOSED_LOOP_VALID", [], None
+    if saturated:
+        return "INVALID", ["histogram counters are saturated"], None
+    scheduled = document["scheduled_opportunities"]
+    attempts = document["submit_attempts"]
+    if scheduled <= 0:
+        return "INVALID", ["open-loop schedule is empty"], None
+    if (
+        attempts != scheduled
+        or document["generator_skips_outstanding"] != 0
+        or document["generator_skips_lag"] != 0
+    ):
+        return "EXPLORATORY_OVERLOAD", ["generator delivery is below 100 percent"], None
+    lag_problems = _strict_lag_problems(document, expected)
+    if lag_problems:
+        return "INVALID", lag_problems, None
+    reason = document["arrival_stop_reason"]
+    if reason == "max_offered":
+        return (
+            "BOUNDED_COMPLETE",
+            ["bounded opportunity horizon is not strict primary"],
+            TIMING_QUALITY,
+        )
+    if reason != "configured_duration":
+        return "INVALID", ["arrival stop is not a full-duration completion"], None
+    window_problems = strict_arrival_window_problems(
+        document["configured_duration_nanoseconds"],
+        document["scheduled_span_nanoseconds"],
+        document["arrival_window_nanoseconds"],
+        expected["lag_tolerance_ms"] * 1_000_000,
+    )
+    if window_problems:
+        return "INVALID", window_problems, None
+    return "STRICT_PRIMARY", [], TIMING_QUALITY
+
+
 def classify_report(
     text: str,
     *,
     expected: dict,
 ) -> tuple[dict | None, dict[str, object]]:
-    """Split runner validity, collector validity, and publication eligibility."""
+    """Split runner validity, collector validity, publication, and delivery class.
+
+    Missing analysis_protocol_version keeps the protocol-1 contract. Protocol 2
+    does not reinterpret that evidence.
+    """
     document, problems = parse_single_document(text)
     status: dict[str, object] = {
         "runner_valid": False,
@@ -691,31 +986,34 @@ def classify_report(
         "publication_eligible": False,
         "steady_state_eligible": False,
         "delivery_fraction": None,
+        "scheduler_rejection_fraction": None,
+        "scheduler_acceptance_fraction": None,
         "window_class": None,
+        "delivery_class": None,
+        "timing_quality": None,
+        "timing_quality_note": None,
+        "analysis_protocol_version": 1,
         "problems": problems,
         "publication_problems": [],
     }
     if document is None:
+        status["delivery_class"] = "INVALID"
         return None, status
+    protocol = analysis_protocol_of(expected)
+    status["analysis_protocol_version"] = protocol
     _check_document(document, expected, problems)
     publication: list[str] = []
-    runner_valid = document.get("valid") is True and not any(
-        item.startswith("valid is") for item in problems
-    )
-    # Schema and accounting problems override a true valid flag.
     collector_problems = [item for item in problems if item]
     if document.get("valid") is not True:
-        runner_valid = False
         collector_problems.append("runner valid flag is not true")
-    if runner_valid and collector_problems:
-        runner_valid = document.get("valid") is True
     status["runner_valid"] = document.get("valid") is True
     status["problems"] = collector_problems
     if collector_problems:
+        if protocol == 2:
+            status["delivery_class"] = "INVALID"
         return document, status
-    _publication_rules(document, expected, publication)
-    status["publication_problems"] = publication
     status["collector_valid"] = True
+    status.update(_fraction_status(document))
     reason = document.get("arrival_stop_reason")
     if reason == "max_offered":
         status["window_class"] = "bounded_max_offered"
@@ -723,15 +1021,27 @@ def classify_report(
         status["window_class"] = "configured_duration"
     else:
         status["window_class"] = "generator_lag"
-    eligible = not publication and expected["comparison_class"] == "primary"
+    if protocol == 1:
+        _publication_rules(document, expected, publication)
+        eligible = not publication and expected["comparison_class"] == "primary"
+        if expected["comparison_class"] != "primary":
+            publication.append("comparison_class is not primary")
+        status["publication_problems"] = publication
+        status["publication_eligible"] = eligible
+        status["steady_state_eligible"] = eligible and reason == "configured_duration"
+        return document, status
+    delivery_class, delivery_problems, timing = _protocol2_delivery(document, expected)
+    status["delivery_class"] = delivery_class
+    status["timing_quality"] = timing
+    if timing is not None:
+        status["timing_quality_note"] = TIMING_QUALITY_NOTE
+    publication.extend(delivery_problems)
     if expected["comparison_class"] != "primary":
         publication.append("comparison_class is not primary")
-        status["publication_problems"] = publication
+    eligible = expected["comparison_class"] == "primary" and delivery_class == "STRICT_PRIMARY"
+    status["publication_problems"] = publication
     status["publication_eligible"] = eligible
-    status["steady_state_eligible"] = eligible and reason == "configured_duration"
-    scheduled = document["scheduled_opportunities"]
-    if scheduled:
-        status["delivery_fraction"] = document["submit_attempts"] / scheduled
+    status["steady_state_eligible"] = eligible
     return document, status
 
 
@@ -1152,7 +1462,14 @@ def write_exclusive_text(path: pathlib.Path, text: str) -> None:
 
 
 def write_json(path: pathlib.Path, value: dict) -> None:
-    write_exclusive_text(path, json.dumps(value, indent=2) + "\n")
+    write_exclusive_text(path, json.dumps(value, indent=2, allow_nan=False) + "\n")
+
+
+def replace_json(path: pathlib.Path, value: dict) -> None:
+    """Write the replacement first. The previous file stays if that write fails."""
+    temporary = path.with_name(path.name + ".tmp")
+    write_json(temporary, value)
+    os.replace(temporary, path)
 
 
 def preflight(
@@ -1166,12 +1483,21 @@ def preflight(
     counted_runs: int,
     delay_seconds: float,
     comparison_class: str,
+    analysis_protocol_version: int = ANALYSIS_PROTOCOL_VERSION,
+    baseline_cell: str | None = None,
+    alternative_cell: str | None = None,
     runner=query_text,
     blob_sha256=git_blob_sha256,
 ) -> dict:
     commit = require_commit_sha(expected_commit)
     if comparison_class not in {"primary", "exploratory"}:
         raise CollectorError("comparison_class must be primary or exploratory")
+    if analysis_protocol_version != ANALYSIS_PROTOCOL_VERSION:
+        raise CollectorError(
+            "new collections use analysis protocol 2; protocol 1 is reserved for existing evidence"
+        )
+    require_counted_runs(counted_runs)
+    contrast = resolve_contrast(cells, baseline_cell, alternative_cell)
     family = require_one_family(profiles)
     if not binary.is_file():
         raise CollectorError(f"benchmark binary does not exist: {binary}")
@@ -1245,7 +1571,7 @@ def preflight(
         raise CollectorError("; ".join(git_problems))
     host = hardware_metadata(runner)
     tools = compiler_and_cmake(runner, cache["CMAKE_CXX_COMPILER"])
-    plan = execution_plan(cells, profiles, counted_runs)
+    plan = execution_plan(cells, profiles, counted_runs, analysis_protocol_version)
     pilots = [str(trial["trial_id"]) for trial in plan if trial["pilot"]]
     return {
         "queried": {
@@ -1291,13 +1617,22 @@ def preflight(
             "graph_optimizations": GRAPH_OPTIMIZATIONS,
             "onnxruntime_version_pin": ONNXRUNTIME_VERSION,
             "schema_version": SCHEMA_VERSION,
-            "minimum_submit_fraction": MINIMUM_SUBMIT_FRACTION,
-            "minimum_submit_fraction_scope": "primary open-loop publication policy",
+            "analysis_protocol_version": analysis_protocol_version,
+            "publication_policy": PUBLICATION_POLICY,
+            "protocol_1_publication_policy": PROTOCOL1_PUBLICATION_POLICY,
+            "protocol_1_minimum_submit_fraction": MINIMUM_SUBMIT_FRACTION,
+            "minimum_submit_fraction": 1.0,
+            "minimum_submit_fraction_scope": "protocol 2 strict open-loop generator delivery",
+            "timing_quality": TIMING_QUALITY,
+            "timing_quality_note": TIMING_QUALITY_NOTE,
+            "calibration_status": "not_calibrated",
             "allowed_untracked_roots": list(ALLOWED_UNTRACKED),
-            "limitations": list(LIMITATIONS),
+            "limitations": list(PROTOCOL_2_LIMITATIONS),
             "rates_are_calibrated_capacity": False,
         },
         "collection_protocol": {
+            "analysis_protocol_version": analysis_protocol_version,
+            "publication_policy": PUBLICATION_POLICY,
             "comparison_class": comparison_class,
             "workload_family": family,
             "cells": [cell["id"] for cell in cells],
@@ -1306,10 +1641,21 @@ def preflight(
             "profile_definitions": profiles,
             "measurement": measurement,
             "counted_runs_per_cell": counted_runs,
+            "counted_run_target": counted_runs,
+            "preferred_counted_runs": PREFERRED_COUNTED_RUNS,
+            "minimum_interval_blocks": MINIMUM_INTERVAL_BLOCKS,
             "pilot_count": len(pilots),
             "counted_trial_count": counted_runs * len(cells) * len(profiles),
             "pilots": pilots,
             "trial_order": [str(trial["trial_id"]) for trial in plan],
+            "block_protocol": BLOCK_PROTOCOL,
+            "baseline_cell": contrast["baseline_cell"],
+            "alternative_cell": contrast["alternative_cell"],
+            "contrast_source": contrast["contrast_source"],
+            "statistical_method": STATISTICAL_METHOD,
+            "bootstrap_seed": BOOTSTRAP_SEED,
+            "bootstrap_replicates": BOOTSTRAP_REPLICATES,
+            "confidence_level": CONFIDENCE_LEVEL,
             "inter_trial_delay_seconds": delay_seconds,
             "environment_variable": "ORT_DISABLE_TELEMETRY=1",
             "external_wall_timeout_seconds": wall_timeout_seconds(measurement),
@@ -1336,6 +1682,7 @@ def _expected_launch(checked: dict, cell: dict, profile: dict) -> dict:
         "duration_ms": measurement["duration_ms"],
         "lag_tolerance_ms": measurement["lag_tolerance_ms"],
         "comparison_class": checked["collection_protocol"]["comparison_class"],
+        "analysis_protocol_version": checked["collection_protocol"]["analysis_protocol_version"],
     }
 
 
@@ -1393,7 +1740,13 @@ def execute_trials(
             "publication_eligible": False,
             "steady_state_eligible": False,
             "delivery_fraction": None,
+            "submission_fraction": None,
+            "scheduler_rejection_fraction": None,
+            "scheduler_acceptance_fraction": None,
+            "successful_completion_fraction": None,
             "window_class": None,
+            "delivery_class": None,
+            "timing_quality": None,
         }
         try:
             write_exclusive_text(stdout_path, result.stdout)
@@ -1416,18 +1769,25 @@ def execute_trials(
             primary = checked["collection_protocol"]["comparison_class"] == "primary"
             if primary and publication:
                 problems.extend(publication)
-            if not problems:
-                try:
-                    write_exclusive_text(report_path, result.stdout)
-                except (OSError, CollectorError) as exc:
-                    problems.append(f"could not preserve accepted report: {exc}")
+            try:
+                write_exclusive_text(report_path, result.stdout)
+            except (OSError, CollectorError) as exc:
+                problems.append(f"could not preserve trial report: {exc}")
+        if problems and classification.get("delivery_class") is None:
+            classification["delivery_class"] = "INVALID"
         meta = {
             "trial_id": trial_id,
             "configuration_id": cell["id"],
             "workload_id": profile["id"],
             "workload": profile["workload"],
             "run_index": trial["run_number"],
+            "block_index": trial.get("block_index"),
+            "position_in_block": trial.get("position_in_block"),
+            "execution_index": trial.get("execution_index"),
+            "counted_run_target": trial.get("counted_run_target"),
             "pilot": bool(trial["pilot"]),
+            "analysis_protocol_version": checked["collection_protocol"]["analysis_protocol_version"],
+            "publication_policy": checked["collection_protocol"]["publication_policy"],
             "comparison_class": checked["collection_protocol"]["comparison_class"],
             "returncode": result.returncode,
             "execution_timeout": timed_out,
@@ -1440,8 +1800,15 @@ def execute_trials(
             "publication_eligible": classification["publication_eligible"] and not problems,
             "steady_state_eligible": classification["steady_state_eligible"] and not problems,
             "window_class": classification["window_class"],
+            "delivery_class": classification["delivery_class"],
+            "timing_quality": classification["timing_quality"],
+            "timing_quality_note": classification.get("timing_quality_note"),
             "delivery_fraction": classification["delivery_fraction"],
-            "minimum_submit_fraction": MINIMUM_SUBMIT_FRACTION,
+            "submission_fraction": classification.get("submission_fraction"),
+            "scheduler_rejection_fraction": classification["scheduler_rejection_fraction"],
+            "scheduler_acceptance_fraction": classification["scheduler_acceptance_fraction"],
+            "successful_completion_fraction": classification.get("successful_completion_fraction"),
+            "minimum_submit_fraction": 1.0,
             "publication_problems": publication,
             "problems": problems,
             "command": command,
@@ -1462,6 +1829,8 @@ def execute_trials(
                     "reason": "; ".join(problems),
                     "execution_timeout": timed_out,
                     "preserved_earlier_trials": True,
+                    "retried": False,
+                    "replaced": False,
                     "aggregate": None,
                 },
             )
@@ -1508,6 +1877,8 @@ def collect(
         counted_runs=args.counted_runs,
         delay_seconds=args.inter_trial_delay_seconds,
         comparison_class=args.comparison_class,
+        baseline_cell=args.baseline_cell,
+        alternative_cell=args.alternative_cell,
         runner=query_runner,
         blob_sha256=blob_sha256,
     )
@@ -1542,9 +1913,7 @@ def collect(
                 },
             )
         final = public_manifest(checked, run_set_id, "completed" if accepted else "failed")
-        environment_path = run_set / "environment.json"
-        environment_path.unlink()
-        write_json(environment_path, final)
+        replace_json(run_set / "environment.json", final)
     except CollectorError:
         raise
     except Exception as exc:
@@ -1571,8 +1940,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated profile ids. Do not mix open-loop and closed-loop.",
     )
     parser.add_argument("--comparison-class", choices=("primary", "exploratory"), default="primary")
+    parser.add_argument("--baseline-cell", default=None)
+    parser.add_argument("--alternative-cell", default=None)
     parser.add_argument("--output-root", default=None)
-    parser.add_argument("--counted-runs", type=int, default=DEFAULT_COUNTED_RUNS)
+    parser.add_argument(
+        "--counted-runs",
+        type=int,
+        default=PROTOCOL2_DEFAULT_COUNTED_RUNS,
+        help=(
+            "Counted blocks per cell, from 1 through 30. "
+            "Protocol 2 defaults to 10, the minimum that can support an interval. "
+            "The preferred publication count is 20. Smoke tests should pass 1."
+        ),
+    )
     parser.add_argument("--inter-trial-delay-seconds", type=float, default=DEFAULT_DELAY_SECONDS)
     parser.add_argument("--duration-ms", type=int)
     parser.add_argument("--max-offered", type=int)
@@ -1612,6 +1992,8 @@ def main(argv: list[str] | None = None, runner=None, sleep=time.sleep, blob_sha2
                 counted_runs=args.counted_runs,
                 delay_seconds=args.inter_trial_delay_seconds,
                 comparison_class=args.comparison_class,
+                baseline_cell=args.baseline_cell,
+                alternative_cell=args.alternative_cell,
                 runner=query_runner,
                 blob_sha256=blob_sha256,
             )

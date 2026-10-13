@@ -462,6 +462,7 @@ class World:
             document = sample_report(model=model, workload=workload)
             document["configured_duration_nanoseconds"] = duration_ms * 1_000_000
             document["arrival_window_nanoseconds"] = duration_ms * 1_000_000
+            document["scheduled_span_nanoseconds"] = max(0, duration_ms * 1_000_000 - 10_000_000)
             document["total_trial_nanoseconds"] = duration_ms * 1_000_000 + document["completion_nanoseconds"]
             document["generator"]["warmup_requests"] = warmup
             if document["burst_phases"]:
@@ -671,6 +672,294 @@ class SmokeCollectionTest(unittest.TestCase):
             self.assertNotIn("benchmarks/concurrent_runs", str(run_set))
             self.assertNotIn("models/experiments", str(run_set))
             self.assertEqual(len(world.trial_calls), 2)
+
+
+def protocol2(**overrides) -> dict:
+    value = expected_launch(analysis_protocol_version=2)
+    value.update(overrides)
+    return value
+
+
+def scale_report(
+    document: dict,
+    *,
+    scheduled: int,
+    attempts: int,
+    succeeded: int,
+    outstanding: int = 0,
+    lag_skips: int = 0,
+    rejected_full: int = 0,
+) -> dict:
+    accepted = attempts - rejected_full
+    document["scheduled_opportunities"] = scheduled
+    document["submit_attempts"] = attempts
+    document["generator_skips_outstanding"] = outstanding
+    document["generator_skips_lag"] = lag_skips
+    document["accepted"] = accepted
+    document["succeeded"] = succeeded
+    document["rejections"] = {"full": rejected_full, "closed": 0, "not_running": 0}
+    latency = document["successful_e2e_latency"]
+    latency["sample_count"] = succeeded
+    latency["percentiles_reported"] = succeeded > 0
+    latency["precise_tail"] = succeeded >= 100
+    document["metrics"]["engine_run_count"] = succeeded
+    document["metrics"]["requests_entered_engine_runs"] = succeeded
+    if succeeded:
+        document["metrics"]["batch_size_histogram"] = [0, succeeded] + [0] * 31
+    else:
+        document["metrics"]["batch_size_histogram"] = [0] * 33
+    document["correctness_checked"] = succeeded
+    document["generator_lag"]["count"] = attempts
+    if document["burst_phases"]:
+        document["burst_phases"][0]["scheduled_opportunities"] = scheduled
+    return document
+
+
+class StrictDeliveryTest(unittest.TestCase):
+    def test_full_delivery_is_strict_primary(self) -> None:
+        _report, status = classify_report(dump_report(sample_report()), expected=protocol2())
+        self.assertEqual(status["problems"], [])
+        self.assertEqual(status["delivery_class"], "STRICT_PRIMARY")
+        self.assertTrue(status["publication_eligible"])
+        self.assertTrue(status["steady_state_eligible"])
+        self.assertEqual(status["delivery_fraction"], 1.0)
+        self.assertEqual(status["timing_quality"], "submitted_lag_max_within_configured_tolerance")
+        self.assertIn("not a percentile", str(status["timing_quality_note"]))
+
+    def test_protocol1_keeps_the_ninety_nine_percent_boundary(self) -> None:
+        document = scale_report(sample_report(), scheduled=100, attempts=99, succeeded=99, outstanding=1)
+        _report, status = classify_report(dump_report(document), expected=expected_launch())
+        self.assertTrue(status["publication_eligible"])
+        self.assertIsNone(status["delivery_class"])
+        self.assertEqual(status["analysis_protocol_version"], 1)
+
+    def test_fraction_below_one_is_exploratory_overload(self) -> None:
+        document = scale_report(sample_report(), scheduled=1000, attempts=999, succeeded=999, outstanding=1)
+        _report, status = classify_report(dump_report(document), expected=protocol2())
+        self.assertEqual(status["delivery_class"], "EXPLORATORY_OVERLOAD")
+        self.assertFalse(status["publication_eligible"])
+        self.assertTrue(status["collector_valid"])
+
+    def test_one_outstanding_skip_is_exploratory_overload(self) -> None:
+        document = scale_report(sample_report(), scheduled=100, attempts=99, succeeded=99, outstanding=1)
+        _report, status = classify_report(dump_report(document), expected=protocol2())
+        self.assertEqual(status["delivery_class"], "EXPLORATORY_OVERLOAD")
+
+    def test_generator_lag_skip_is_invalid(self) -> None:
+        document = scale_report(
+            sample_report(valid=False, invalid_reasons=["generator_lag"], arrival_stop_reason="generator_lag"),
+            scheduled=100,
+            attempts=0,
+            succeeded=0,
+            lag_skips=100,
+        )
+        _report, status = classify_report(dump_report(document), expected=protocol2())
+        self.assertEqual(status["delivery_class"], "INVALID")
+        self.assertNotEqual(status["delivery_class"], "EXPLORATORY_OVERLOAD")
+
+    def test_scheduler_rejection_keeps_full_generator_delivery(self) -> None:
+        document = scale_report(
+            sample_report(),
+            scheduled=110,
+            attempts=110,
+            succeeded=100,
+            rejected_full=10,
+        )
+        _report, status = classify_report(dump_report(document), expected=protocol2())
+        self.assertEqual(status["delivery_class"], "STRICT_PRIMARY")
+        self.assertEqual(status["delivery_fraction"], 1.0)
+        self.assertEqual(status["submission_fraction"], 1.0)
+        self.assertAlmostEqual(status["scheduler_rejection_fraction"], 10 / 110)
+        self.assertAlmostEqual(status["scheduler_acceptance_fraction"], 100 / 110)
+        self.assertEqual(status["successful_completion_fraction"], 1.0)
+        self.assertEqual(document["successful_e2e_latency"]["sample_count"], 100)
+        self.assertNotEqual(document["successful_e2e_latency"]["sample_count"], document["submit_attempts"])
+
+    def test_closed_and_not_running_rejections_stay_separate(self) -> None:
+        document = scale_report(sample_report(), scheduled=100, attempts=100, succeeded=90, rejected_full=0)
+        document["accepted"] = 90
+        document["rejections"] = {"full": 4, "closed": 5, "not_running": 1}
+        document["generator_lag"]["count"] = 100
+        _report, status = classify_report(dump_report(document), expected=protocol2())
+        self.assertEqual(status["delivery_class"], "STRICT_PRIMARY")
+        self.assertAlmostEqual(status["scheduler_rejection_fraction"], 0.1)
+        self.assertEqual(document["rejections"]["closed"], 5)
+        self.assertEqual(document["rejections"]["not_running"], 1)
+        self.assertEqual(document["successful_e2e_latency"]["sample_count"], document["succeeded"])
+
+    def test_malformed_closed_loop_is_invalid_before_a_closed_loop_label(self) -> None:
+        document = sample_report(
+            schema_version=2,
+            workload="closed_loop",
+            scheduled_span_nanoseconds=0,
+            burst_phases=[],
+        )
+        _report, status = classify_report(
+            dump_report(document),
+            expected=protocol2(workload="closed_loop"),
+        )
+        self.assertEqual(status["delivery_class"], "INVALID")
+        self.assertNotEqual(status["delivery_class"], "CLOSED_LOOP_INVALID")
+
+    def test_zero_scheduled_opportunities_are_invalid(self) -> None:
+        document = scale_report(sample_report(), scheduled=0, attempts=0, succeeded=0)
+        _report, status = classify_report(dump_report(document), expected=protocol2())
+        self.assertEqual(status["delivery_class"], "INVALID")
+        self.assertTrue(any("empty" in item for item in status["publication_problems"]))
+
+    def test_early_max_offered_is_bounded_complete(self) -> None:
+        document = sample_report(arrival_stop_reason="max_offered", scheduled_span_nanoseconds=1000)
+        _report, status = classify_report(dump_report(document), expected=protocol2())
+        self.assertEqual(status["delivery_class"], "BOUNDED_COMPLETE")
+        self.assertFalse(status["publication_eligible"])
+        self.assertFalse(status["steady_state_eligible"])
+
+    def test_closed_loop_is_not_strict_primary(self) -> None:
+        document = sample_report(workload="closed_loop", scheduled_span_nanoseconds=0, burst_phases=[])
+        document["completion_observation"] = "closed_loop_producer_wait"
+        document["observation_quantum_nanoseconds"] = 0
+        _report, status = classify_report(
+            dump_report(document),
+            expected=protocol2(workload="closed_loop"),
+        )
+        self.assertEqual(status["delivery_class"], "CLOSED_LOOP_VALID")
+        self.assertNotEqual(status["delivery_class"], "STRICT_PRIMARY")
+        self.assertFalse(status["publication_eligible"])
+
+    def test_invalid_report_precedes_overload(self) -> None:
+        document = sample_report(schema_version=2)
+        _report, status = classify_report(dump_report(document), expected=protocol2())
+        self.assertEqual(status["delivery_class"], "INVALID")
+        self.assertFalse(status["collector_valid"])
+
+    def test_signed_early_lag_stays_negative(self) -> None:
+        document = sample_report()
+        document["generator_lag"]["minimum_nanoseconds"] = -50
+        document["generator_lag"]["mean_nanoseconds"] = -10.0
+        document["generator_lag"]["maximum_nanoseconds"] = -1
+        _report, status = classify_report(dump_report(document), expected=protocol2())
+        self.assertEqual(status["delivery_class"], "STRICT_PRIMARY")
+        self.assertEqual(status["timing_quality"], "submitted_lag_max_within_configured_tolerance")
+
+    def test_arrival_window_inside_and_outside_the_bound(self) -> None:
+        from benchmarks.collect_scheduler import UINT64_MAX, strict_arrival_window_problems
+
+        self.assertEqual(strict_arrival_window_problems(1_000_000_000, 990_000_000, 1_000_000_100, 1_000_000_000), [])
+        self.assertTrue(
+            any(
+                "exceeds" in item
+                for item in strict_arrival_window_problems(1_000_000_000, 990_000_000, 2_000_000_001, 1_000_000_000)
+            )
+        )
+        self.assertTrue(
+            any("shorter" in item for item in strict_arrival_window_problems(1_000_000_000, 990_000_000, 980_000_000, 1_000_000_000))
+        )
+        self.assertTrue(
+            any("overflow" in item for item in strict_arrival_window_problems(UINT64_MAX, 0, 1, 1))
+        )
+
+    def test_strict_failure_preserves_evidence_without_retry(self) -> None:
+        from benchmarks.collect_scheduler import build_parser
+
+        with tempfile.TemporaryDirectory() as temporary:
+            world = World(pathlib.Path(temporary))
+            world.build()
+
+            def once(args, cwd=None, env=None, timeout_seconds=None):
+                result = world.runner(args, cwd=cwd, env=env, timeout_seconds=timeout_seconds)
+                if pathlib.Path(args[0]).name == BINARY_NAME and "--format" in args:
+                    document = json.loads(result.stdout)
+                    scale_report(document, scheduled=100, attempts=99, succeeded=99, outstanding=1)
+                    return ProcessResult(0, dump_report(document), "")
+                return result
+
+            args = build_parser().parse_args(world.argv(counted_runs="1"))
+            with self.assertRaises(CollectorError):
+                collect(args, runner=once, sleep=lambda _seconds: None, blob_sha256=world.blob)
+            run_set = next((world.root / "scheduler-output").iterdir())
+            trial = run_set / "runs" / "pilot-A-low_open"
+            self.assertTrue(trial.with_suffix(".stdout").is_file())
+            self.assertTrue(trial.with_suffix(".stderr").is_file())
+            self.assertTrue(trial.with_suffix(".json").is_file())
+            self.assertTrue(trial.with_suffix(".meta.json").is_file())
+            failure = json.loads((run_set / "failure.json").read_text(encoding="utf-8"))
+            self.assertFalse(failure["retried"])
+            self.assertFalse(failure["replaced"])
+            self.assertEqual(len(world.trial_calls), 1)
+
+    def test_failure_metadata_error_keeps_trial_evidence(self) -> None:
+        from benchmarks.collect_scheduler import build_parser
+        import benchmarks.collect_scheduler as collector
+
+        with tempfile.TemporaryDirectory() as temporary:
+            world = World(pathlib.Path(temporary))
+            world.build()
+            original = collector.write_json
+
+            def fail_failure(path, value):
+                if path.name == "failure.json":
+                    raise collector.CollectorError("failure metadata could not be written")
+                return original(path, value)
+
+            collector.write_json = fail_failure
+            try:
+                args = build_parser().parse_args(world.argv(counted_runs="1"))
+                world.fail_timeout = True
+                with self.assertRaises(CollectorError):
+                    collect(args, runner=world.runner, sleep=lambda _seconds: None, blob_sha256=world.blob)
+            finally:
+                collector.write_json = original
+            run_set = next((world.root / "scheduler-output").iterdir())
+            self.assertTrue((run_set / "runs" / "pilot-A-low_open.stdout").is_file())
+            self.assertTrue((run_set / "runs" / "pilot-A-low_open.stderr").is_file())
+            self.assertTrue((run_set / "runs" / "pilot-A-low_open.meta.json").is_file())
+            self.assertTrue((run_set / "environment.json").is_file())
+            self.assertFalse((run_set / "aggregate.json").exists())
+
+
+class Protocol2PlanTest(unittest.TestCase):
+    def test_within_profile_rotation_keeps_profiles_apart(self) -> None:
+        from benchmarks.collect_scheduler import execution_plan as plan
+
+        cells = [CELL_BY_ID["A"], CELL_BY_ID["B"]]
+        profiles = [PROFILE_BY_ID["low_open"], PROFILE_BY_ID["high_open"]]
+        trials = plan(cells, profiles, 2, 2)
+        self.assertEqual(
+            [trial["trial_id"] for trial in trials],
+            [
+                "pilot-A-low_open",
+                "pilot-B-low_open",
+                "pilot-A-high_open",
+                "pilot-B-high_open",
+                "A-low_open-01",
+                "B-low_open-01",
+                "A-high_open-01",
+                "B-high_open-01",
+                "B-low_open-02",
+                "A-low_open-02",
+                "B-high_open-02",
+                "A-high_open-02",
+            ],
+        )
+        counted = [trial for trial in trials if not trial["pilot"]]
+        self.assertEqual([trial["block_index"] for trial in counted], [1, 1, 1, 1, 2, 2, 2, 2])
+        self.assertEqual([trial["position_in_block"] for trial in counted], [0, 1, 0, 1, 0, 1, 0, 1])
+        self.assertEqual(counted[0]["profile_id"], counted[1]["profile_id"])
+
+    def test_counted_runs_are_bounded_and_protocol2_is_the_default(self) -> None:
+        from benchmarks.collect_scheduler import (
+            ANALYSIS_PROTOCOL_VERSION,
+            MAX_COUNTED_RUNS,
+            build_parser,
+            require_counted_runs,
+        )
+
+        self.assertEqual(build_parser().get_default("counted_runs"), 10)
+        self.assertEqual(ANALYSIS_PROTOCOL_VERSION, 2)
+        with self.assertRaises(CollectorError):
+            require_counted_runs(0)
+        with self.assertRaises(CollectorError):
+            require_counted_runs(MAX_COUNTED_RUNS + 1)
 
 
 if __name__ == "__main__":
