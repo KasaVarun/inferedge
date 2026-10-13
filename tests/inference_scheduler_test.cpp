@@ -2033,6 +2033,11 @@ void ExpectDynamicSum(const SchedulerCompletion& completion, float c0, float c1)
     EXPECT_FLOAT_EQ(completion.outputs[0].values[1], c1);
 }
 
+void ExpectRequestIdentity(const SchedulerCompletion& completion, std::uint64_t expected) {
+    EXPECT_EQ(completion.request_id, expected);
+    EXPECT_EQ(completion.sequence, expected);
+}
+
 TEST_F(InferenceSchedulerTest, AggregateInitializationLeavesBatchingDisabled) {
     const SchedulerConfig config{INFEREDGE_ADD_MODEL_PATH, 1, 1};
     EXPECT_FALSE(config.enable_batching);
@@ -2126,9 +2131,10 @@ TEST_F(InferenceSchedulerTest, EnabledBatchingRejectsStaticMnist) {
     EXPECT_EQ(scheduler->stats().accepted, 0U);
 }
 
-std::unique_ptr<InferenceScheduler>
-MakeBatch(std::uint32_t batch_size, std::chrono::milliseconds delay, std::size_t capacity) {
-    SchedulerConfig config{INFEREDGE_BATCH_ADD_MODEL_PATH, 1, capacity};
+std::unique_ptr<InferenceScheduler> MakeBatch(std::uint32_t batch_size,
+                                              std::chrono::milliseconds delay, std::size_t capacity,
+                                              std::uint32_t workers = 1) {
+    SchedulerConfig config{INFEREDGE_BATCH_ADD_MODEL_PATH, workers, capacity};
     config.enable_batching = true;
     config.max_batch_size = batch_size;
     config.max_batch_delay = delay;
@@ -2683,6 +2689,422 @@ TEST_F(InferenceSchedulerTest, BatchFaultCancelDuringSealedFailureKeepsOwnedRequ
     EXPECT_TRUE(SchedulerTestAccess::ClosedForCancel(*scheduler));
     EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
     ExpectQuiescent(*scheduler, 0, 0, 2, 0);
+}
+
+TEST_F(InferenceSchedulerTest, MultiWorkerBatchDrainCompletesOwnedAndQueuedRequests) {
+    BatchRuns runs;
+    auto first_sealed = std::make_shared<std::latch>(1);
+    std::atomic<bool> signal_first{true};
+    auto gate0 = std::make_shared<std::latch>(1);
+    auto gate1 = std::make_shared<std::latch>(1);
+    auto reached_wait = std::make_shared<std::latch>(1);
+    auto before_wait = std::make_shared<std::latch>(1);
+    auto before_run = std::make_shared<std::latch>(1);
+    auto closed = std::make_shared<std::latch>(1);
+    auto scheduler = MakeBatch(2, std::chrono::milliseconds{1000}, 5, 2);
+    JoinThread stopper;
+    LatchRelease release0{gate0};
+    LatchRelease release1{gate1};
+    LatchRelease release_wait{before_wait};
+    LatchRelease release_run{before_run};
+    SchedulerTestAccess::SetBeforePopForWorker(*scheduler, 0, gate0);
+    SchedulerTestAccess::SetBeforePopForWorker(*scheduler, 1, gate1);
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, reached_wait);
+    SchedulerTestAccess::SetBeforeBatchWait(*scheduler, before_wait);
+    SchedulerTestAccess::SetBeforeRun(*scheduler, before_run);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler, [&](std::size_t count) {
+        runs.Record(count);
+        if (signal_first.exchange(false)) {
+            first_sealed->count_down();
+        }
+    });
+    RequireStart(*scheduler);
+
+    std::vector<Admission> admissions;
+    admissions.push_back(scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F)));
+    admissions.push_back(scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F)));
+    release0.release();
+    first_sealed->wait();
+
+    admissions.push_back(scheduler->submit(DynamicAddInputs(9.F, 0.F, 1.F, 1.F)));
+    release1.release();
+    reached_wait->wait();
+    // Worker 0 is held before run and worker 1 is held before its only timed
+    // wait. The fourth request seals worker 1's size-two batch after drain;
+    // the fifth is then popped from the closed queue without another wait.
+    admissions.push_back(scheduler->submit(DynamicAddInputs(-1.F, 4.F, 2.F, -3.F)));
+    admissions.push_back(scheduler->submit(DynamicAddInputs(3.F, 3.F, 4.F, 4.F)));
+
+    ShutdownResult shutdown;
+    stopper.thread = std::thread([&] { shutdown = scheduler->shutdown(ShutdownPolicy::kDrain); });
+    closed->wait();
+    release_wait.release();
+    release_run.release();
+    stopper.thread.join();
+
+    ExpectWinner(shutdown, ShutdownPolicy::kDrain, true);
+    const SchedulerCompletion first = TakeBounded(std::move(admissions[0]));
+    const SchedulerCompletion second = TakeBounded(std::move(admissions[1]));
+    const SchedulerCompletion third = TakeBounded(std::move(admissions[2]));
+    const SchedulerCompletion fourth = TakeBounded(std::move(admissions[3]));
+    const SchedulerCompletion fifth = TakeBounded(std::move(admissions[4]));
+    ExpectDynamicSum(first, 4.F, 6.F);
+    ExpectDynamicSum(second, 12.F, 14.F);
+    ExpectDynamicSum(third, 10.F, 1.F);
+    ExpectDynamicSum(fourth, 1.F, 1.F);
+    ExpectDynamicSum(fifth, 7.F, 7.F);
+    const std::vector<SchedulerCompletion> completions{first, second, third, fourth, fifth};
+    for (std::size_t index = 0; index < completions.size(); ++index) {
+        ExpectRequestIdentity(completions[index], index + 1);
+    }
+    const std::vector<std::size_t> sizes = runs.Snapshot();
+    ASSERT_EQ(sizes.size(), 3U);
+    std::size_t total = 0;
+    for (const std::size_t size : sizes) {
+        EXPECT_LE(size, 2U);
+        total += size;
+    }
+    EXPECT_EQ(total, 5U);
+    EXPECT_TRUE(SchedulerTestAccess::ClosedForDrain(*scheduler));
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+    ExpectQuiescent(*scheduler, 5, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, MultiWorkerBatchCancelSeparatesOwnedAndQueuedRequests) {
+    BatchRuns runs;
+    auto first_sealed = std::make_shared<std::latch>(1);
+    std::atomic<bool> signal_first{true};
+    auto gate0 = std::make_shared<std::latch>(1);
+    auto gate1 = std::make_shared<std::latch>(1);
+    auto reached_wait = std::make_shared<std::latch>(1);
+    auto before_wait = std::make_shared<std::latch>(1);
+    auto before_run = std::make_shared<std::latch>(1);
+    auto closed = std::make_shared<std::latch>(1);
+    auto scheduler = MakeBatch(2, std::chrono::milliseconds{1000}, 5, 2);
+    JoinThread stopper;
+    LatchRelease release0{gate0};
+    LatchRelease release1{gate1};
+    LatchRelease release_wait{before_wait};
+    LatchRelease release_run{before_run};
+    SchedulerTestAccess::SetBeforePopForWorker(*scheduler, 0, gate0);
+    SchedulerTestAccess::SetBeforePopForWorker(*scheduler, 1, gate1);
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, reached_wait);
+    SchedulerTestAccess::SetBeforeBatchWait(*scheduler, before_wait);
+    SchedulerTestAccess::SetBeforeRun(*scheduler, before_run);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler, [&](std::size_t count) {
+        runs.Record(count);
+        if (signal_first.exchange(false)) {
+            first_sealed->count_down();
+        }
+    });
+    RequireStart(*scheduler);
+
+    std::vector<Admission> admissions;
+    admissions.push_back(scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F)));
+    admissions.push_back(scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F)));
+    release0.release();
+    first_sealed->wait();
+
+    admissions.push_back(scheduler->submit(DynamicAddInputs(9.F, 0.F, 1.F, 1.F)));
+    release1.release();
+    reached_wait->wait();
+    // Both following requests remain queue-owned until cancel transfers them.
+    // Releasing the partial collector therefore cannot enter another timed wait.
+    admissions.push_back(scheduler->submit(DynamicAddInputs(-1.F, 4.F, 2.F, -3.F)));
+    admissions.push_back(scheduler->submit(DynamicAddInputs(3.F, 3.F, 4.F, 4.F)));
+
+    ShutdownResult shutdown;
+    stopper.thread =
+        std::thread([&] { shutdown = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    closed->wait();
+    release_wait.release();
+    release_run.release();
+    stopper.thread.join();
+
+    ExpectWinner(shutdown, ShutdownPolicy::kCancelPending, true);
+    const SchedulerCompletion first = TakeBounded(std::move(admissions[0]));
+    const SchedulerCompletion second = TakeBounded(std::move(admissions[1]));
+    const SchedulerCompletion third = TakeBounded(std::move(admissions[2]));
+    ExpectDynamicSum(first, 4.F, 6.F);
+    ExpectDynamicSum(second, 12.F, 14.F);
+    ExpectDynamicSum(third, 10.F, 1.F);
+    ExpectRequestIdentity(first, 1);
+    ExpectRequestIdentity(second, 2);
+    ExpectRequestIdentity(third, 3);
+    ExpectCanceled(TakeBounded(std::move(admissions[3])), 4);
+    ExpectCanceled(TakeBounded(std::move(admissions[4])), 5);
+    const std::vector<std::size_t> sizes = runs.Snapshot();
+    ASSERT_EQ(sizes.size(), 2U);
+    EXPECT_EQ(sizes[0] + sizes[1], 3U);
+    EXPECT_TRUE(SchedulerTestAccess::ClosedForCancel(*scheduler));
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+    ExpectQuiescent(*scheduler, 3, 0, 0, 0, 2);
+}
+
+TEST_F(InferenceSchedulerTest, BatchDrainWinsAgainstCancelAndRejectsLateSubmissions) {
+    auto reached_wait = std::make_shared<std::latch>(1);
+    auto before_wait = std::make_shared<std::latch>(1);
+    auto closed = std::make_shared<std::latch>(1);
+    auto follower = std::make_shared<std::latch>(1);
+    auto scheduler = MakeBatch(4, std::chrono::milliseconds{1000}, 4);
+    JoinThread drain_call;
+    JoinThread cancel_call;
+    LatchRelease release_wait{before_wait};
+    std::vector<JoinThread> producers(2);
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, reached_wait);
+    SchedulerTestAccess::SetBeforeBatchWait(*scheduler, before_wait);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    SchedulerTestAccess::SetShutdownFollowerEntered(*scheduler, follower);
+    RequireStart(*scheduler);
+
+    Admission owned = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    reached_wait->wait();
+    Admission queued = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    ShutdownResult drain;
+    ShutdownResult cancel;
+    drain_call.thread = std::thread([&] { drain = scheduler->shutdown(ShutdownPolicy::kDrain); });
+    closed->wait();
+    cancel_call.thread =
+        std::thread([&] { cancel = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    follower->wait();
+
+    std::vector<Admission> rejected(2);
+    for (std::size_t index = 0; index < producers.size(); ++index) {
+        producers[index].thread = std::thread([&, index] {
+            const float tag = 20.F + static_cast<float>(index);
+            rejected[index] = scheduler->submit(DynamicAddInputs(tag, 0.F, 1.F, 0.F));
+        });
+    }
+    for (JoinThread& producer : producers) {
+        producer.thread.join();
+    }
+    ExpectRejectedInputs(rejected[0], AdmissionStatus::kRejectedClosed, 20.F);
+    ExpectRejectedInputs(rejected[1], AdmissionStatus::kRejectedClosed, 21.F);
+
+    release_wait.release();
+    drain_call.thread.join();
+    cancel_call.thread.join();
+    ExpectWinner(drain, ShutdownPolicy::kDrain, true);
+    ExpectWinner(cancel, ShutdownPolicy::kDrain, false);
+    const SchedulerCompletion owned_completion = TakeBounded(std::move(owned));
+    const SchedulerCompletion queued_completion = TakeBounded(std::move(queued));
+    ExpectDynamicSum(owned_completion, 4.F, 6.F);
+    ExpectDynamicSum(queued_completion, 12.F, 14.F);
+    ExpectRequestIdentity(owned_completion, 1);
+    ExpectRequestIdentity(queued_completion, 2);
+    EXPECT_TRUE(SchedulerTestAccess::ClosedForDrain(*scheduler));
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+    ExpectQuiescent(*scheduler, 2, 0, 0, 0);
+    EXPECT_EQ(scheduler->stats().rejected_closed, 2U);
+}
+
+TEST_F(InferenceSchedulerTest, BatchCancelWinsAgainstDrain) {
+    auto reached_wait = std::make_shared<std::latch>(1);
+    auto before_wait = std::make_shared<std::latch>(1);
+    auto closed = std::make_shared<std::latch>(1);
+    auto follower = std::make_shared<std::latch>(1);
+    auto scheduler = MakeBatch(4, std::chrono::milliseconds{1000}, 2);
+    JoinThread cancel_call;
+    JoinThread drain_call;
+    LatchRelease release_wait{before_wait};
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, reached_wait);
+    SchedulerTestAccess::SetBeforeBatchWait(*scheduler, before_wait);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    SchedulerTestAccess::SetShutdownFollowerEntered(*scheduler, follower);
+    RequireStart(*scheduler);
+
+    Admission owned = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    reached_wait->wait();
+    Admission queued = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    ShutdownResult cancel;
+    ShutdownResult drain;
+    cancel_call.thread =
+        std::thread([&] { cancel = scheduler->shutdown(ShutdownPolicy::kCancelPending); });
+    closed->wait();
+    drain_call.thread = std::thread([&] { drain = scheduler->shutdown(ShutdownPolicy::kDrain); });
+    follower->wait();
+
+    release_wait.release();
+    cancel_call.thread.join();
+    drain_call.thread.join();
+    ExpectWinner(cancel, ShutdownPolicy::kCancelPending, true);
+    ExpectWinner(drain, ShutdownPolicy::kCancelPending, false);
+    const SchedulerCompletion owned_completion = TakeBounded(std::move(owned));
+    ExpectDynamicSum(owned_completion, 4.F, 6.F);
+    ExpectRequestIdentity(owned_completion, 1);
+    ExpectCanceled(TakeBounded(std::move(queued)), 2);
+    EXPECT_TRUE(SchedulerTestAccess::ClosedForCancel(*scheduler));
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+    ExpectQuiescent(*scheduler, 1, 0, 0, 0, 1);
+}
+
+TEST_F(InferenceSchedulerTest, BatchWorkerFaultDuringDrainLetsSiblingFinish) {
+    BatchRuns runs;
+    auto first_sealed = std::make_shared<std::latch>(1);
+    std::atomic<bool> signal_first{true};
+    auto gate0 = std::make_shared<std::latch>(1);
+    auto gate1 = std::make_shared<std::latch>(1);
+    auto before_run = std::make_shared<std::latch>(1);
+    auto closed = std::make_shared<std::latch>(1);
+    auto scheduler = MakeBatch(2, std::chrono::milliseconds{0}, 4, 2);
+    JoinThread stopper;
+    LatchRelease release0{gate0};
+    LatchRelease release1{gate1};
+    LatchRelease release_run{before_run};
+    SchedulerTestAccess::SetBeforePopForWorker(*scheduler, 0, gate0);
+    SchedulerTestAccess::SetBeforePopForWorker(*scheduler, 1, gate1);
+    SchedulerTestAccess::SetBeforeRun(*scheduler, before_run);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    SchedulerTestAccess::SetThrowInWorker(*scheduler, 0);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler, [&](std::size_t count) {
+        runs.Record(count);
+        if (signal_first.exchange(false)) {
+            first_sealed->count_down();
+        }
+    });
+    RequireStart(*scheduler);
+
+    Admission first = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission second = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    release0.release();
+    first_sealed->wait();
+    Admission third = scheduler->submit(DynamicAddInputs(9.F, 0.F, 1.F, 1.F));
+    Admission fourth = scheduler->submit(DynamicAddInputs(-1.F, 4.F, 2.F, -3.F));
+
+    ShutdownResult shutdown;
+    stopper.thread = std::thread([&] { shutdown = scheduler->shutdown(ShutdownPolicy::kDrain); });
+    closed->wait();
+    release1.release();
+    release_run.release();
+    stopper.thread.join();
+
+    ExpectWinner(shutdown, ShutdownPolicy::kDrain, true);
+    const SchedulerCompletion failed_first = TakeBounded(std::move(first));
+    const SchedulerCompletion failed_second = TakeBounded(std::move(second));
+    EXPECT_EQ(failed_first.status, CompletionStatus::kWorkerFailed);
+    EXPECT_EQ(failed_second.status, CompletionStatus::kWorkerFailed);
+    EXPECT_EQ(failed_first.inference_error.message, "injected");
+    EXPECT_EQ(failed_second.inference_error.message, "injected");
+    ExpectRequestIdentity(failed_first, 1);
+    ExpectRequestIdentity(failed_second, 2);
+    const SchedulerCompletion third_completion = TakeBounded(std::move(third));
+    const SchedulerCompletion fourth_completion = TakeBounded(std::move(fourth));
+    ExpectDynamicSum(third_completion, 10.F, 1.F);
+    ExpectDynamicSum(fourth_completion, 1.F, 1.F);
+    ExpectRequestIdentity(third_completion, 3);
+    ExpectRequestIdentity(fourth_completion, 4);
+    const std::vector<std::size_t> sizes = runs.Snapshot();
+    ASSERT_EQ(sizes.size(), 2U);
+    EXPECT_EQ(sizes[0] + sizes[1], 4U);
+    EXPECT_TRUE(SchedulerTestAccess::ClosedForDrain(*scheduler));
+    EXPECT_TRUE(SchedulerTestAccess::IsStopped(*scheduler));
+    ExpectQuiescent(*scheduler, 2, 0, 2, 0);
+}
+
+TEST_F(InferenceSchedulerTest, BatchLastWorkerFaultDuringDrainSweepsQueuedTail) {
+    auto sealed = std::make_shared<std::latch>(1);
+    auto before_pop = std::make_shared<std::latch>(1);
+    auto before_run = std::make_shared<std::latch>(1);
+    auto closed = std::make_shared<std::latch>(1);
+    auto scheduler = MakeBatch(2, std::chrono::milliseconds{0}, 3);
+    JoinThread stopper;
+    LatchRelease release_pop{before_pop};
+    LatchRelease release_run{before_run};
+    SchedulerTestAccess::SetBeforePop(*scheduler, before_pop);
+    SchedulerTestAccess::SetBeforeRun(*scheduler, before_run);
+    SchedulerTestAccess::SetAfterDrainClosed(*scheduler, closed);
+    SchedulerTestAccess::SetThrowInWorker(*scheduler, 0);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler, [sealed](std::size_t) { sealed->count_down(); });
+    RequireStart(*scheduler);
+
+    Admission first = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission second = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    Admission queued = scheduler->submit(DynamicAddInputs(9.F, 0.F, 1.F, 1.F));
+    release_pop.release();
+    sealed->wait();
+
+    ShutdownResult shutdown;
+    stopper.thread = std::thread([&] { shutdown = scheduler->shutdown(ShutdownPolicy::kDrain); });
+    closed->wait();
+    release_run.release();
+    stopper.thread.join();
+
+    ExpectWinner(shutdown, ShutdownPolicy::kDrain, true);
+    const SchedulerCompletion failed_first = TakeBounded(std::move(first));
+    const SchedulerCompletion failed_second = TakeBounded(std::move(second));
+    const SchedulerCompletion swept = TakeBounded(std::move(queued));
+    EXPECT_EQ(failed_first.status, CompletionStatus::kWorkerFailed);
+    EXPECT_EQ(failed_second.status, CompletionStatus::kWorkerFailed);
+    EXPECT_EQ(failed_first.inference_error.message, "injected");
+    EXPECT_EQ(failed_second.inference_error.message, "injected");
+    EXPECT_EQ(swept.status, CompletionStatus::kSchedulerFailed);
+    EXPECT_EQ(swept.inference_error.message, "no worker");
+    ExpectRequestIdentity(failed_first, 1);
+    ExpectRequestIdentity(failed_second, 2);
+    ExpectRequestIdentity(swept, 3);
+    EXPECT_TRUE(SchedulerTestAccess::ClosedForDrain(*scheduler));
+    EXPECT_TRUE(SchedulerTestAccess::IsFailed(*scheduler));
+    ExpectQuiescent(*scheduler, 0, 0, 2, 1);
+}
+
+TEST_F(InferenceSchedulerTest, RepeatedBatchSchedulerLifetimes) {
+    for (int cycle = 0; cycle < 9; ++cycle) {
+        SCOPED_TRACE(cycle);
+        const std::uint32_t workers = 1U + static_cast<std::uint32_t>(cycle % 2);
+        const std::uint32_t batch_size = 1U + static_cast<std::uint32_t>(cycle % 4);
+        const std::size_t capacity = 2U + static_cast<std::size_t>(cycle % 3);
+        const std::chrono::milliseconds delay =
+            cycle % 2 == 0 ? std::chrono::milliseconds{0} : std::chrono::milliseconds{1000};
+
+        if (cycle % 3 == 2) {
+            auto scheduler = MakeBatch(batch_size, delay, capacity, workers);
+            RequireStart(*scheduler);
+            Admission first = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+            Admission second = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+            ASSERT_TRUE(first.completion.has_value());
+            ASSERT_TRUE(second.completion.has_value());
+            std::future<SchedulerCompletion> left = std::move(*first.completion);
+            std::future<SchedulerCompletion> right = std::move(*second.completion);
+            scheduler.reset();
+            ASSERT_EQ(left.wait_for(std::chrono::seconds{0}), std::future_status::ready);
+            ASSERT_EQ(right.wait_for(std::chrono::seconds{0}), std::future_status::ready);
+            const SchedulerCompletion left_completion = left.get();
+            const SchedulerCompletion right_completion = right.get();
+            ExpectDynamicSum(left_completion, 4.F, 6.F);
+            ExpectDynamicSum(right_completion, 12.F, 14.F);
+            ExpectRequestIdentity(left_completion, 1);
+            ExpectRequestIdentity(right_completion, 2);
+            continue;
+        }
+
+        auto before_pop = std::make_shared<std::latch>(1);
+        auto scheduler = MakeBatch(batch_size, delay, capacity, workers);
+        LatchRelease release{before_pop};
+        SchedulerTestAccess::SetBeforePop(*scheduler, before_pop);
+        RequireStart(*scheduler);
+        Admission first = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+        Admission second = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+        const ShutdownPolicy policy =
+            cycle % 3 == 0 ? ShutdownPolicy::kDrain : ShutdownPolicy::kCancelPending;
+        const ShutdownResult shutdown = ShutdownWhileBlocked(*scheduler, release, policy);
+        ExpectWinner(shutdown, policy, true);
+        if (policy == ShutdownPolicy::kDrain) {
+            const SchedulerCompletion first_completion = TakeBounded(std::move(first));
+            const SchedulerCompletion second_completion = TakeBounded(std::move(second));
+            ExpectDynamicSum(first_completion, 4.F, 6.F);
+            ExpectDynamicSum(second_completion, 12.F, 14.F);
+            ExpectRequestIdentity(first_completion, 1);
+            ExpectRequestIdentity(second_completion, 2);
+            ExpectQuiescent(*scheduler, 2, 0, 0, 0);
+        } else {
+            ExpectCanceled(TakeBounded(std::move(first)), 1);
+            ExpectCanceled(TakeBounded(std::move(second)), 2);
+            ExpectQuiescent(*scheduler, 0, 0, 0, 0, 2);
+        }
+        scheduler.reset();
+    }
 }
 
 TEST_F(InferenceSchedulerTest, RejectsAMetadataShapeProductOverflow) {
