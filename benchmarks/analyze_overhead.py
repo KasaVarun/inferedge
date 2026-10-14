@@ -342,10 +342,65 @@ def _check_plan(plan: list[dict], counted_blocks: int) -> None:
         raise AnalyzerError("duplicate block or counted trial count does not match counted_blocks")
 
 
+# Matches collect_concurrent.hardware_metadata. Linux preflight leaves the model null.
+DARWIN_ONLY_HARDWARE_MODEL = "hw.model is queried only on Darwin"
+
+
 def _require_text(record: dict, key: str) -> None:
     value = record.get(key)
     if not isinstance(value, str) or value == "":
         raise AnalyzerError(f"{key} is missing")
+
+
+def _positive_int(record: dict, key: str) -> bool:
+    value = record.get(key)
+    return type(value) is int and value > 0
+
+
+def _require_hardware_identity(queried: dict) -> None:
+    """Require the portable host identity. A Darwin model is additional.
+
+    Two null hardware_model values are not evidence of equality. Linux may
+    leave the model null only with the preflight explanation, and only after
+    the OS, platform, architecture, and CPU-count fields are present.
+    """
+    for key in ("operating_system", "os_version", "platform", "cpu_architecture"):
+        _require_text(queried, key)
+    system = queried["operating_system"]
+    platform_text = queried["platform"]
+    architecture = queried["cpu_architecture"]
+    if architecture not in platform_text:
+        raise AnalyzerError("cpu_architecture does not match platform")
+    if system == "Darwin":
+        if "macOS" not in platform_text and "Darwin" not in platform_text:
+            raise AnalyzerError("operating_system does not match platform")
+    elif system == "Linux":
+        if not platform_text.startswith("Linux"):
+            raise AnalyzerError("operating_system does not match platform")
+    else:
+        raise AnalyzerError(f"operating_system {system!r} has no overhead hardware contract")
+    if not _positive_int(queried, "logical_cpu_count"):
+        raise AnalyzerError("logical_cpu_count is missing")
+    model = queried.get("hardware_model", None)
+    error = queried.get("hardware_model_error", None)
+    model_present = isinstance(model, str) and model != ""
+    error_present = isinstance(error, str) and error != ""
+    if model is not None and not model_present:
+        raise AnalyzerError("hardware_model is not null or a nonempty string")
+    if model_present and error_present:
+        raise AnalyzerError("hardware_model and hardware_model_error conflict")
+    if system == "Darwin":
+        if not model_present or error is not None:
+            raise AnalyzerError("Darwin hardware_model is missing")
+        if not _positive_int(queried, "hw_physicalcpu"):
+            raise AnalyzerError("hw_physicalcpu is missing")
+        return
+    if model is None and error != DARWIN_ONLY_HARDWARE_MODEL:
+        raise AnalyzerError("hardware_model is null without the Darwin-only explanation")
+    if model_present and error is not None:
+        raise AnalyzerError("hardware_model and hardware_model_error conflict")
+    if not _positive_int(queried, "nproc_cpu_count"):
+        raise AnalyzerError("nproc_cpu_count is missing")
 
 
 def _load_trials(run_set: pathlib.Path, plan: list[dict]) -> dict[str, dict]:
@@ -427,9 +482,9 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
         "onnxruntime_resolved_library",
         "operating_system",
         "cpu_architecture",
-        "hardware_model",
     ):
         _require_text(queried, key)
+    _require_hardware_identity(queried)
     _require_text(verified, "model_path")
     _require_text(verified, "model_sha256")
     if verified.get("cmake_build_type") != "Release":
@@ -579,8 +634,14 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
             "onnxruntime_version": queried["onnxruntime_version"],
             "onnxruntime_resolved_library": queried["onnxruntime_resolved_library"],
             "operating_system": queried["operating_system"],
+            "os_version": queried["os_version"],
+            "platform": queried["platform"],
             "cpu_architecture": queried["cpu_architecture"],
-            "hardware_model": queried["hardware_model"],
+            "logical_cpu_count": queried["logical_cpu_count"],
+            "hardware_model": queried.get("hardware_model"),
+            "hardware_model_error": queried.get("hardware_model_error"),
+            "hw_physicalcpu": queried.get("hw_physicalcpu"),
+            "nproc_cpu_count": queried.get("nproc_cpu_count"),
             "model_sha256": verified["model_sha256"],
             "ort_disable_telemetry": queried["ort_disable_telemetry"],
         },

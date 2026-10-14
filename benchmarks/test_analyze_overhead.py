@@ -85,8 +85,13 @@ def _write_run(root: pathlib.Path, counted_blocks: int) -> pathlib.Path:
             "onnxruntime_version": "1.31.0",
             "onnxruntime_resolved_library": "/tmp/libonnxruntime.dylib",
             "operating_system": "Darwin",
+            "os_version": "24.0.0",
+            "platform": "macOS-15.0-arm64-arm-64bit",
             "cpu_architecture": "arm64",
+            "logical_cpu_count": 8,
             "hardware_model": "synthetic",
+            "hardware_model_error": None,
+            "hw_physicalcpu": 8,
             "ort_disable_telemetry": "1",
         },
         "verified_configuration": {
@@ -566,6 +571,109 @@ class AuditGapTest(unittest.TestCase):
             with self.assertRaises(AnalyzerError) as raised:
                 analyze(run_set)
             self.assertIn("does not match trial id", str(raised.exception))
+
+
+def _linux_identity(environment: dict) -> None:
+    queried = environment["queried"]
+    queried["operating_system"] = "Linux"
+    queried["os_version"] = "6.8.0-1019-azure"
+    queried["platform"] = "Linux-6.8.0-1019-azure-x86_64-with-glibc2.39"
+    queried["cpu_architecture"] = "x86_64"
+    queried["logical_cpu_count"] = 4
+    queried["hardware_model"] = None
+    queried["hardware_model_error"] = "hw.model is queried only on Darwin"
+    queried["hw_physicalcpu"] = None
+    queried["nproc_cpu_count"] = 4
+
+
+class HardwareIdentityTest(unittest.TestCase):
+    def test_darwin_hardware_model_passes_when_it_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_set = _write_run(pathlib.Path(directory), 1)
+            aggregate = json.loads(analyze(run_set).read_text(encoding="utf-8"))
+            self.assertEqual(aggregate["queried"]["hardware_model"], "synthetic")
+            self.assertEqual(aggregate["queried"]["operating_system"], "Darwin")
+            self.assertIsNone(aggregate["queried"]["hardware_model_error"])
+
+    def test_linux_null_hardware_model_passes_with_portable_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_set = _write_run(pathlib.Path(directory), 0)
+            environment = json.loads((run_set / "environment.json").read_text(encoding="utf-8"))
+            _linux_identity(environment)
+            (run_set / "environment.json").write_text(json.dumps(environment) + "\n", encoding="utf-8")
+            aggregate = json.loads(analyze(run_set).read_text(encoding="utf-8"))
+            self.assertIsNone(aggregate["queried"]["hardware_model"])
+            self.assertEqual(aggregate["queried"]["operating_system"], "Linux")
+            self.assertEqual(aggregate["queried"]["cpu_architecture"], "x86_64")
+            self.assertEqual(aggregate["queried"]["nproc_cpu_count"], 4)
+            self.assertEqual(aggregate["evidence_class"], "correctness")
+            self.assertFalse(aggregate["bootstrap"]["computed"])
+
+    def test_linux_missing_cpu_count_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_set = _write_run(pathlib.Path(directory), 1)
+            environment = json.loads((run_set / "environment.json").read_text(encoding="utf-8"))
+            _linux_identity(environment)
+            environment["queried"]["nproc_cpu_count"] = None
+            (run_set / "environment.json").write_text(json.dumps(environment) + "\n", encoding="utf-8")
+            with self.assertRaises(AnalyzerError) as raised:
+                analyze(run_set)
+            self.assertIn("nproc_cpu_count", str(raised.exception))
+
+    def test_mismatched_operating_system_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_set = _write_run(pathlib.Path(directory), 1)
+            environment = json.loads((run_set / "environment.json").read_text(encoding="utf-8"))
+            _linux_identity(environment)
+            environment["queried"]["operating_system"] = "Darwin"
+            (run_set / "environment.json").write_text(json.dumps(environment) + "\n", encoding="utf-8")
+            with self.assertRaises(AnalyzerError) as raised:
+                analyze(run_set)
+            self.assertIn("operating_system", str(raised.exception))
+
+    def test_mismatched_architecture_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_set = _write_run(pathlib.Path(directory), 1)
+            environment = json.loads((run_set / "environment.json").read_text(encoding="utf-8"))
+            _linux_identity(environment)
+            environment["queried"]["cpu_architecture"] = "aarch64"
+            (run_set / "environment.json").write_text(json.dumps(environment) + "\n", encoding="utf-8")
+            with self.assertRaises(AnalyzerError) as raised:
+                analyze(run_set)
+            self.assertIn("cpu_architecture", str(raised.exception))
+
+    def test_missing_portable_identity_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_set = _write_run(pathlib.Path(directory), 1)
+            environment = json.loads((run_set / "environment.json").read_text(encoding="utf-8"))
+            _linux_identity(environment)
+            del environment["queried"]["logical_cpu_count"]
+            (run_set / "environment.json").write_text(json.dumps(environment) + "\n", encoding="utf-8")
+            with self.assertRaises(AnalyzerError) as raised:
+                analyze(run_set)
+            self.assertIn("logical_cpu_count", str(raised.exception))
+
+    def test_darwin_missing_hardware_model_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_set = _write_run(pathlib.Path(directory), 1)
+            environment = json.loads((run_set / "environment.json").read_text(encoding="utf-8"))
+            environment["queried"]["hardware_model"] = None
+            environment["queried"]["hardware_model_error"] = "sysctl -n hw.model failed: exit 1"
+            (run_set / "environment.json").write_text(json.dumps(environment) + "\n", encoding="utf-8")
+            with self.assertRaises(AnalyzerError) as raised:
+                analyze(run_set)
+            self.assertIn("Darwin hardware_model", str(raised.exception))
+
+    def test_conflicting_hardware_model_presence_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_set = _write_run(pathlib.Path(directory), 1)
+            environment = json.loads((run_set / "environment.json").read_text(encoding="utf-8"))
+            _linux_identity(environment)
+            environment["queried"]["hardware_model"] = "Mac17,8"
+            (run_set / "environment.json").write_text(json.dumps(environment) + "\n", encoding="utf-8")
+            with self.assertRaises(AnalyzerError) as raised:
+                analyze(run_set)
+            self.assertIn("conflict", str(raised.exception))
 
 
 if __name__ == "__main__":
