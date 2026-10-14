@@ -88,6 +88,16 @@ REPORTABLE_CELLS = ("A", "C")
 REPORTABLE_BASELINE = "A"
 REPORTABLE_ALTERNATIVE = "C"
 
+# Neural-local delay probes. Not part of the historical Add CELL_BY_ID registry.
+# Distinct from shared cell G (max_batch_size 8, delay 1) and H (max 16, delay 1).
+NEURAL_LOCAL_CELLS = (
+    {"id": "G1", "enable_batching": True, "max_batch_size": 4, "max_batch_delay_ms": 1},
+    {"id": "G2", "enable_batching": True, "max_batch_size": 4, "max_batch_delay_ms": 2},
+)
+NEURAL_LOCAL_CELL_BY_ID = {cell["id"]: cell for cell in NEURAL_LOCAL_CELLS}
+CALIBRATION_ONLY_NEURAL_CELLS = frozenset(NEURAL_LOCAL_CELL_BY_ID)
+CALIBRATION_VARIANT_NONZERO_BATCH_DELAY_V1 = "nonzero_batch_delay_v1"
+
 NEURAL_MODELS = {
     "mlp_small_f32": {
         "model_relative": "models/mlp_small_f32.onnx",
@@ -134,6 +144,48 @@ def model_contract(model_id: str) -> dict:
     except KeyError as exc:
         known = ", ".join(sorted(NEURAL_MODELS))
         raise NeuralCollectorError(f"unsupported model_id {model_id!r}; known: {known}") from exc
+
+
+def resolve_neural_cell(cell_id: str) -> dict:
+    """Resolve one cell id to an independent dict copy.
+
+    G1/G2 come from neural-local definitions. All other ids come from the
+    shared Add CELL_BY_ID registry. The shared registry is never mutated.
+    """
+    if cell_id in NEURAL_LOCAL_CELL_BY_ID:
+        return dict(NEURAL_LOCAL_CELL_BY_ID[cell_id])
+    if cell_id in CELL_BY_ID:
+        return dict(CELL_BY_ID[cell_id])
+    known_shared = ", ".join(CELL_BY_ID)
+    known_local = ", ".join(NEURAL_LOCAL_CELL_BY_ID)
+    raise NeuralCollectorError(
+        f"unknown cell {cell_id!r}; shared cells are {known_shared}; "
+        f"neural-local calibration cells are {known_local}"
+    )
+
+
+def resolve_neural_cells(cell_ids: list[str], mode: str) -> list[dict]:
+    """Resolve ordered cell ids for the neural collector.
+
+    Neural-local G1/G2 are calibration-only. Duplicates are rejected.
+    """
+    if not cell_ids:
+        raise NeuralCollectorError("cells are required")
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for cell_id in cell_ids:
+        if cell_id in seen:
+            duplicates.append(cell_id)
+        seen.add(cell_id)
+    if duplicates:
+        raise NeuralCollectorError(f"duplicate cell id(s): {', '.join(duplicates)}")
+    local_requested = [cell_id for cell_id in cell_ids if cell_id in CALIBRATION_ONLY_NEURAL_CELLS]
+    if local_requested and mode != "calibration":
+        raise NeuralCollectorError(
+            f"neural-local cells {', '.join(local_requested)} are calibration-only; "
+            f"refusing mode {mode!r}"
+        )
+    return [resolve_neural_cell(cell_id) for cell_id in cell_ids]
 
 
 def evidence_class_for(mode: str) -> str:
@@ -450,6 +502,9 @@ def neural_preflight(
     plan = build_plan(cells, profiles, counted_runs)
     pilots = [str(trial["trial_id"]) for trial in plan if trial["pilot"]]
     profile = profiles[0]
+    uses_nonzero_delay = any(
+        str(cell["id"]) in CALIBRATION_ONLY_NEURAL_CELLS for cell in cells
+    )
     return {
         "queried": {
             "queried_at_utc": utc_now(),
@@ -512,6 +567,11 @@ def neural_preflight(
             "offered_rate_frozen": offered_rate_frozen,
             "allowed_untracked_roots": list(ALLOWED_UNTRACKED),
             "rates_are_calibrated_capacity": False,
+            **(
+                {"calibration_variant": CALIBRATION_VARIANT_NONZERO_BATCH_DELAY_V1}
+                if uses_nonzero_delay and mode == "calibration"
+                else {}
+            ),
         },
         "collection_protocol": {
             "experiment_kind": EXPERIMENT_KIND,
@@ -559,6 +619,11 @@ def neural_preflight(
             "external_wall_timeout_seconds": wall_timeout_seconds(measurement),
             "zero_admission_rejection_required": mode == "reportable",
             "require_strict_generator_delivery": mode in {"smoke", "reportable"},
+            **(
+                {"calibration_variant": CALIBRATION_VARIANT_NONZERO_BATCH_DELAY_V1}
+                if uses_nonzero_delay and mode == "calibration"
+                else {}
+            ),
         },
         "paths": {
             "model": artifacts["model_path"],
@@ -776,13 +841,7 @@ def collect(
     model_contract(model_id)
     counted = counted_runs_for(mode, args.counted_runs)
     cell_ids = [item.strip() for item in args.cells.split(",") if item.strip()]
-    if not cell_ids:
-        raise NeuralCollectorError("cells are required")
-    cells = []
-    for cell_id in cell_ids:
-        if cell_id not in CELL_BY_ID:
-            raise NeuralCollectorError(f"unknown cell {cell_id!r}")
-        cells.append(dict(CELL_BY_ID[cell_id]))
+    cells = resolve_neural_cells(cell_ids, mode)
     if args.target_rps is None:
         if mode == "smoke":
             target_rps = 50.0
