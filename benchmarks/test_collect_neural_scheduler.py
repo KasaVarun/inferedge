@@ -10,15 +10,21 @@ import tempfile
 import unittest
 
 from benchmarks.collect_neural_scheduler import (
+    AG2_OFFERED_RATE,
+    ARRIVAL_SCREEN_MAX_LAG_NS,
     CALIBRATION_ONLY_NEURAL_CELLS,
     CALIBRATION_VARIANT_NONZERO_BATCH_DELAY_V1,
+    CONTRAST_ID_AG2,
+    CONTRAST_SIGN_G2_MINUS_A,
     EXPERIMENT_KIND,
     NEURAL_LOCAL_CELLS,
     NEURAL_LOCAL_CELL_BY_ID,
     NEURAL_MODELS,
     REFERENCE_CHECKING_POLICY,
+    REPORTABLE_CONTRAST_AG2,
     REPORTABLE_MODEL_ID,
     NeuralCollectorError,
+    arrival_screen_problems,
     bind_commands,
     build_plan,
     build_parser,
@@ -28,8 +34,10 @@ from benchmarks.collect_neural_scheduler import (
     model_contract,
     neural_scheduler_command,
     open_loop_profile,
+    realized_mean_batch_size,
     resolve_neural_cell,
     resolve_neural_cells,
+    resolve_reportable_contrast,
     validate_reportable_args,
     validate_trial,
     verify_neural_artifacts,
@@ -184,10 +192,18 @@ class NeuralLocalCellTest(unittest.TestCase):
         self.assertEqual([cell["id"] for cell in cells], ["A", "G1", "G2"])
         with self.assertRaises(NeuralCollectorError) as smoke:
             resolve_neural_cells(["A", "G1"], "smoke")
-        self.assertIn("calibration-only", str(smoke.exception))
+        self.assertIn("not permitted", str(smoke.exception))
         with self.assertRaises(NeuralCollectorError) as reportable:
             resolve_neural_cells(["A", "G2"], "reportable")
-        self.assertIn("calibration-only", str(reportable.exception))
+        self.assertIn("not permitted", str(reportable.exception))
+        allowed = resolve_neural_cells(
+            ["A", "G2"], "reportable", reportable_contrast=REPORTABLE_CONTRAST_AG2
+        )
+        self.assertEqual([cell["id"] for cell in allowed], ["A", "G2"])
+        with self.assertRaises(NeuralCollectorError):
+            resolve_neural_cells(
+                ["A", "G1"], "reportable", reportable_contrast=REPORTABLE_CONTRAST_AG2
+            )
 
 
 class CommandAndPlanTest(unittest.TestCase):
@@ -331,7 +347,8 @@ class ValidationGateTest(unittest.TestCase):
         )
         with self.assertRaises(NeuralCollectorError) as raised:
             validate_reportable_args(args)
-        self.assertIn("A,C", str(raised.exception))
+        message = str(raised.exception)
+        self.assertTrue("A,C" in message or "A,G2" in message)
 
     def test_expected_launch_detects_wrong_reported_delay(self) -> None:
         document = sample_report(
@@ -529,7 +546,14 @@ class ArtifactAndCollectionTest(unittest.TestCase):
         args = build_parser().parse_args(self._args("smoke", cells="A,G1,G2"))
         with self.assertRaises(NeuralCollectorError) as raised:
             collect(args, runner=self.world.runner)
-        self.assertIn("calibration-only", str(raised.exception))
+        self.assertIn("not permitted", str(raised.exception))
+        self.assertEqual(self.world.trial_calls, [])
+
+    def test_smoke_rejects_g2(self) -> None:
+        args = build_parser().parse_args(self._args("smoke", cells="A,G2"))
+        with self.assertRaises(NeuralCollectorError) as raised:
+            collect(args, runner=self.world.runner)
+        self.assertIn("not permitted", str(raised.exception))
         self.assertEqual(self.world.trial_calls, [])
 
     def test_reportable_rejects_g1_g2(self) -> None:
@@ -539,7 +563,7 @@ class ArtifactAndCollectionTest(unittest.TestCase):
         with self.assertRaises(NeuralCollectorError) as raised:
             collect(args, runner=self.world.runner)
         message = str(raised.exception)
-        self.assertTrue("A,C" in message or "calibration-only" in message)
+        self.assertTrue("A,C" in message or "A,G2" in message or "not permitted" in message)
         self.assertEqual(self.world.trial_calls, [])
 
     def test_reportable_a_c_accepted_with_frozen_rate_preflight_path(self) -> None:
@@ -666,6 +690,178 @@ class ArtifactAndCollectionTest(unittest.TestCase):
             collect(args, runner=self.world.runner, clock=fixed_clock)
         self.assertIn("exists", str(raised.exception).lower())
         self.assertTrue(first.is_dir())
+
+
+class AG2ContrastCollectorTest(unittest.TestCase):
+    def test_exact_ag2_contrast_accepted(self) -> None:
+        contract = resolve_reportable_contrast(
+            model_id=REPORTABLE_MODEL_ID,
+            cell_ids=["A", "G2"],
+            baseline_cell="A",
+            alternative_cell="G2",
+            target_rps=AG2_OFFERED_RATE,
+            counted_runs=20,
+            offered_rate_frozen=True,
+        )
+        self.assertEqual(contract["contrast_id"], CONTRAST_ID_AG2)
+        self.assertEqual(contract["contrast_sign_convention"], CONTRAST_SIGN_G2_MINUS_A)
+        self.assertEqual(contract["arrival_screen_max_lag_ns"], ARRIVAL_SCREEN_MAX_LAG_NS)
+        self.assertEqual(contract["persistent_batching_min_mean"], 2.0)
+
+    def test_wrong_contrast_cells_and_rate_rejected(self) -> None:
+        with self.assertRaises(NeuralCollectorError):
+            resolve_reportable_contrast(
+                model_id=REPORTABLE_MODEL_ID,
+                cell_ids=["A", "G1"],
+                baseline_cell="A",
+                alternative_cell="G1",
+                target_rps=AG2_OFFERED_RATE,
+                counted_runs=20,
+                offered_rate_frozen=True,
+            )
+        with self.assertRaises(NeuralCollectorError) as rate:
+            resolve_reportable_contrast(
+                model_id=REPORTABLE_MODEL_ID,
+                cell_ids=["A", "G2"],
+                baseline_cell="A",
+                alternative_cell="G2",
+                target_rps=500.0,
+                counted_runs=20,
+                offered_rate_frozen=True,
+            )
+        self.assertIn("1000", str(rate.exception))
+        with self.assertRaises(NeuralCollectorError) as blocks:
+            resolve_reportable_contrast(
+                model_id=REPORTABLE_MODEL_ID,
+                cell_ids=["A", "G2"],
+                baseline_cell="A",
+                alternative_cell="G2",
+                target_rps=AG2_OFFERED_RATE,
+                counted_runs=10,
+                offered_rate_frozen=True,
+            )
+        self.assertIn("20", str(blocks.exception))
+
+    def test_g2_wrong_delay_or_cap_rejected_in_definitions(self) -> None:
+        wrong_delay = dict(REPORTABLE_CONTRAST_AG2["expected_cells"]["G2"])
+        wrong_delay["max_batch_delay_ms"] = 1
+        self.assertNotEqual(wrong_delay, REPORTABLE_CONTRAST_AG2["expected_cells"]["G2"])
+        wrong_cap = dict(REPORTABLE_CONTRAST_AG2["expected_cells"]["G2"])
+        wrong_cap["max_batch_size"] = 8
+        self.assertEqual(NEURAL_LOCAL_CELL_BY_ID["G2"]["max_batch_delay_ms"], 2)
+        self.assertEqual(NEURAL_LOCAL_CELL_BY_ID["G2"]["max_batch_size"], 4)
+
+    def test_arrival_screen_inclusive_bound(self) -> None:
+        document = sample_report()
+        document["generator_lag"]["maximum_nanoseconds"] = ARRIVAL_SCREEN_MAX_LAG_NS
+        self.assertEqual(arrival_screen_problems(document, ARRIVAL_SCREEN_MAX_LAG_NS), [])
+        document["generator_lag"]["maximum_nanoseconds"] = ARRIVAL_SCREEN_MAX_LAG_NS + 1
+        problems = arrival_screen_problems(document, ARRIVAL_SCREEN_MAX_LAG_NS)
+        self.assertTrue(problems)
+        missing = sample_report()
+        del missing["generator_lag"]
+        self.assertTrue(arrival_screen_problems(missing, ARRIVAL_SCREEN_MAX_LAG_NS))
+
+    def test_persistent_batching_mean_gate(self) -> None:
+        document = sample_report()
+        document["metrics"]["engine_run_count"] = 50
+        document["metrics"]["requests_entered_engine_runs"] = 100
+        document["metrics"]["batch_size_histogram"] = [0, 0, 50] + [0] * 30
+        mean, problems = realized_mean_batch_size(document)
+        self.assertEqual(problems, [])
+        self.assertEqual(mean, 2.0)
+        _document, _status, ok = validate_trial(
+            dump_report(document),
+            expected={
+                "model_path": document["model"],
+                "workload": "open_loop_constant",
+                "worker_count": 1,
+                "queue_capacity": 64,
+                "enable_batching": False,
+                "max_batch_size": 1,
+                "max_batch_delay_ms": 0,
+                "warmup_requests": 0,
+                "check_interval": 1,
+                "duration_ms": 1000,
+                "lag_tolerance_ms": 1000,
+                "comparison_class": "primary",
+                "analysis_protocol_version": 2,
+                "target_rps": 50.0,
+            },
+            mode="reportable",
+            require_zero_rejections=True,
+            require_persistent_batching=True,
+            persistent_batching_min_mean=2.0,
+        )
+        self.assertEqual(ok, [])
+        document["metrics"]["engine_run_count"] = 80
+        document["metrics"]["requests_entered_engine_runs"] = 100
+        document["metrics"]["batch_size_histogram"] = [0, 60, 20] + [0] * 30
+        mean_low, _ = realized_mean_batch_size(document)
+        self.assertLess(mean_low, 2.0)
+        _document, _status, rejected = validate_trial(
+            dump_report(document),
+            expected={
+                "model_path": document["model"],
+                "workload": "open_loop_constant",
+                "worker_count": 1,
+                "queue_capacity": 64,
+                "enable_batching": False,
+                "max_batch_size": 1,
+                "max_batch_delay_ms": 0,
+                "warmup_requests": 0,
+                "check_interval": 1,
+                "duration_ms": 1000,
+                "lag_tolerance_ms": 1000,
+                "comparison_class": "primary",
+                "analysis_protocol_version": 2,
+                "target_rps": 50.0,
+            },
+            mode="reportable",
+            require_zero_rejections=True,
+            require_persistent_batching=True,
+            persistent_batching_min_mean=2.0,
+        )
+        self.assertTrue(any("persistent-batching" in item for item in rejected))
+
+    def test_validate_reportable_args_ag2_path(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "--binary",
+                "/tmp/x",
+                "--repo-root",
+                ".",
+                "--expected-commit",
+                COMMIT,
+                "--mode",
+                "reportable",
+                "--model-id",
+                REPORTABLE_MODEL_ID,
+                "--cells",
+                "A,G2",
+                "--target-rps",
+                "1000",
+                "--counted-runs",
+                "20",
+                "--offered-rate-frozen",
+            ]
+        )
+        contract = validate_reportable_args(args)
+        self.assertEqual(contract["contrast_id"], CONTRAST_ID_AG2)
+
+    def test_ac_contrast_still_valid(self) -> None:
+        contract = resolve_reportable_contrast(
+            model_id=REPORTABLE_MODEL_ID,
+            cell_ids=["A", "C"],
+            baseline_cell=None,
+            alternative_cell=None,
+            target_rps=90.0,
+            counted_runs=10,
+            offered_rate_frozen=True,
+        )
+        self.assertEqual(contract["contrast_id"], "gemm_f32_A_vs_C")
+        self.assertEqual(contract["contrast_sign_convention"], "C_minus_A")
 
 
 class BindCommandTest(unittest.TestCase):

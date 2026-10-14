@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Analyze one neural_scheduler_batching run set.
 
-Primary confirmatory contrast is gemm_f32 cell C minus cell A on producer-observed
-P50 latency. This module never declares a winner. It refuses Add or overhead
-experiment identities.
+Confirmatory contrasts are allowlisted: gemm_f32 C minus A, and the frozen
+A versus G2 study (G2 minus A). This module never declares a winner. It
+refuses Add or overhead experiment identities.
 """
 
 from __future__ import annotations
@@ -23,22 +23,32 @@ from benchmarks.analyze_scheduler import (
 )
 from benchmarks.collect_baseline import ONNXRUNTIME_VERSION, CollectorError
 from benchmarks.collect_neural_scheduler import (
+    AG2_OFFERED_RATE,
     ANALYSIS_PROTOCOL_VERSION,
+    ARRIVAL_FIDELITY_STATUS_NOT_CERTIFIED,
+    ARRIVAL_SCREEN_MAX_LAG_NS,
+    ARRIVAL_SCREEN_POLICY_VERSION,
+    CONTRAST_ID_AC,
+    CONTRAST_ID_AG2,
     CONTRAST_SIGN_CONVENTION,
+    CONTRAST_SIGN_G2_MINUS_A,
     EXPERIMENT_KIND,
+    PHASE_BOUNDARY_FIDELITY_UNAVAILABLE,
+    PERSISTENT_BATCHING_MIN_MEAN,
     REFERENCE_CHECKING_POLICY,
     REPORTABLE_ALTERNATIVE,
     REPORTABLE_BASELINE,
     REPORTABLE_CELLS,
+    REPORTABLE_CONTRAST_AG2,
     REPORTABLE_MODEL_ID,
     model_contract,
+    normalize_cell_definition,
     rejection_total,
     validate_trial,
 )
 from benchmarks.collect_scheduler import (
     BOOTSTRAP_REPLICATES,
     BOOTSTRAP_SEED,
-    CELL_BY_ID,
     CONFIDENCE_LEVEL,
     MINIMUM_INTERVAL_BLOCKS,
     PREFERRED_COUNTED_RUNS,
@@ -162,7 +172,143 @@ def _require_text(record: dict, key: str) -> str:
     return value
 
 
-def _check_environment(environment: dict) -> dict:
+def _effect_definition(sign: str) -> str:
+    if sign == CONTRAST_SIGN_CONVENTION:
+        return "difference = C_metric - A_metric"
+    if sign == CONTRAST_SIGN_G2_MINUS_A:
+        return "difference = G2_metric - A_metric"
+    raise AnalyzerError(f"unsupported contrast sign convention {sign!r}")
+
+
+def _cell_map_from_definitions(definitions: object, expected_cells: tuple[str, ...]) -> dict[str, dict]:
+    if not isinstance(definitions, list) or not definitions:
+        raise AnalyzerError("cell_definitions are missing")
+    resolved: dict[str, dict] = {}
+    for raw in definitions:
+        if not isinstance(raw, dict):
+            raise AnalyzerError("cell definition is not an object")
+        try:
+            cell = normalize_cell_definition(raw)
+        except CollectorError as exc:
+            raise AnalyzerError(str(exc)) from exc
+        cell_id = cell["id"]
+        if cell_id in resolved:
+            raise AnalyzerError(f"duplicate cell definition for {cell_id}")
+        resolved[cell_id] = cell
+    for cell_id in expected_cells:
+        if cell_id not in resolved:
+            raise AnalyzerError(f"cell definition for {cell_id} is missing")
+    unexpected = [cell_id for cell_id in resolved if cell_id not in expected_cells]
+    if unexpected:
+        raise AnalyzerError(f"unexpected cell definition(s): {', '.join(unexpected)}")
+    if list(resolved.keys()) != list(expected_cells):
+        # Presence is required; order of the definitions list may differ from cells.
+        pass
+    return resolved
+
+
+def _require_cell_matches(cell: dict, expected: dict, label: str) -> None:
+    actual = normalize_cell_definition(cell)
+    want = normalize_cell_definition(expected)
+    if actual != want:
+        raise AnalyzerError(f"{label} cell definition does not match the allowlisted contrast")
+
+
+def _resolve_confirmatory_contrast(protocol: dict) -> dict:
+    cells = tuple(protocol.get("cells") or ())
+    contrast_id = protocol.get("contrast_id")
+    sign = protocol.get("contrast_sign_convention")
+    if cells == REPORTABLE_CELLS:
+        if contrast_id not in {None, CONTRAST_ID_AC}:
+            raise AnalyzerError(f"unknown contrast_id {contrast_id!r} for A/C evidence")
+        if sign != CONTRAST_SIGN_CONVENTION:
+            raise AnalyzerError("contrast sign convention is not C_minus_A")
+        if protocol.get("baseline_cell") != REPORTABLE_BASELINE:
+            raise AnalyzerError("baseline cell must be A")
+        if protocol.get("alternative_cell") != REPORTABLE_ALTERNATIVE:
+            raise AnalyzerError("alternative cell must be C")
+        if protocol.get("arrival_fidelity_status") is not None:
+            raise AnalyzerError("A/C contrast must not carry an A/G2 arrival policy")
+        if protocol.get("arrival_screen_max_lag_ns") is not None:
+            raise AnalyzerError("A/C contrast must not carry an A/G2 arrival screen")
+        if protocol.get("persistent_batching_cell") is not None:
+            raise AnalyzerError("A/C contrast must not require G2 persistent batching")
+        expected = {
+            "A": {"id": "A", "enable_batching": False, "max_batch_size": 1, "max_batch_delay_ms": 0},
+            "C": {"id": "C", "enable_batching": True, "max_batch_size": 4, "max_batch_delay_ms": 0},
+        }
+        cell_map = _cell_map_from_definitions(protocol.get("cell_definitions"), REPORTABLE_CELLS)
+        for cell_id, want in expected.items():
+            _require_cell_matches(cell_map[cell_id], want, cell_id)
+        return {
+            "contrast_id": CONTRAST_ID_AC,
+            "cells": REPORTABLE_CELLS,
+            "baseline_cell": REPORTABLE_BASELINE,
+            "alternative_cell": REPORTABLE_ALTERNATIVE,
+            "contrast_sign_convention": CONTRAST_SIGN_CONVENTION,
+            "effect_definition": _effect_definition(CONTRAST_SIGN_CONVENTION),
+            "required_counted_runs": None,
+            "fixed_offered_rate": None,
+            "arrival_screen_max_lag_ns": None,
+            "persistent_batching_cell": None,
+            "persistent_batching_min_mean": None,
+            "cell_map": cell_map,
+            "expected_cells": expected,
+        }
+    if cells == REPORTABLE_CONTRAST_AG2["cells"]:
+        if contrast_id != CONTRAST_ID_AG2:
+            raise AnalyzerError(
+                "A/G2 confirmatory evidence requires contrast_id "
+                f"{CONTRAST_ID_AG2!r}"
+            )
+        if sign != CONTRAST_SIGN_G2_MINUS_A:
+            raise AnalyzerError("contrast sign convention is not G2_minus_A")
+        if protocol.get("baseline_cell") != "A":
+            raise AnalyzerError("baseline cell must be A")
+        if protocol.get("alternative_cell") != "G2":
+            raise AnalyzerError("alternative cell must be G2")
+        if protocol.get("arrival_fidelity_status") != ARRIVAL_FIDELITY_STATUS_NOT_CERTIFIED:
+            raise AnalyzerError("arrival_fidelity_status must be not_certified")
+        if protocol.get("phase_boundary_fidelity") != PHASE_BOUNDARY_FIDELITY_UNAVAILABLE:
+            raise AnalyzerError("phase_boundary_fidelity must be unavailable")
+        if protocol.get("arrival_screen_max_lag_ns") != ARRIVAL_SCREEN_MAX_LAG_NS:
+            raise AnalyzerError("arrival_screen_max_lag_ns must be 5000000")
+        if protocol.get("arrival_screen_policy_version") != ARRIVAL_SCREEN_POLICY_VERSION:
+            raise AnalyzerError("arrival_screen_policy_version mismatch")
+        if protocol.get("persistent_batching_cell") != "G2":
+            raise AnalyzerError("persistent_batching_cell must be G2")
+        if protocol.get("persistent_batching_min_mean") != PERSISTENT_BATCHING_MIN_MEAN:
+            raise AnalyzerError("persistent_batching_min_mean must be 2.0")
+        offered = protocol.get("offered_rate")
+        if not isinstance(offered, (int, float)) or float(offered) != AG2_OFFERED_RATE:
+            raise AnalyzerError(f"A/G2 offered rate must be {AG2_OFFERED_RATE:g}")
+        expected = REPORTABLE_CONTRAST_AG2["expected_cells"]
+        cell_map = _cell_map_from_definitions(
+            protocol.get("cell_definitions"), REPORTABLE_CONTRAST_AG2["cells"]
+        )
+        for cell_id, want in expected.items():
+            _require_cell_matches(cell_map[cell_id], want, cell_id)
+        return {
+            "contrast_id": CONTRAST_ID_AG2,
+            "cells": REPORTABLE_CONTRAST_AG2["cells"],
+            "baseline_cell": "A",
+            "alternative_cell": "G2",
+            "contrast_sign_convention": CONTRAST_SIGN_G2_MINUS_A,
+            "effect_definition": _effect_definition(CONTRAST_SIGN_G2_MINUS_A),
+            "required_counted_runs": PREFERRED_COUNTED_RUNS,
+            "fixed_offered_rate": AG2_OFFERED_RATE,
+            "arrival_screen_max_lag_ns": ARRIVAL_SCREEN_MAX_LAG_NS,
+            "persistent_batching_cell": "G2",
+            "persistent_batching_min_mean": PERSISTENT_BATCHING_MIN_MEAN,
+            "cell_map": cell_map,
+            "expected_cells": expected,
+        }
+    if "G1" in cells:
+        raise AnalyzerError("G1 is calibration-only and is never confirmatory")
+    raise AnalyzerError(f"unknown confirmatory cell pair {cells!r}")
+
+
+def _check_environment(environment: dict) -> tuple[dict, dict | None]:
     if environment.get("experiment_kind") != EXPERIMENT_KIND:
         raise AnalyzerError("refusing a run that is not neural_scheduler_batching")
     protocol = environment.get("collection_protocol")
@@ -172,8 +318,6 @@ def _check_environment(environment: dict) -> dict:
         raise AnalyzerError("collection protocol experiment_kind mismatch")
     if protocol.get("analysis_protocol_version") != ANALYSIS_PROTOCOL_VERSION:
         raise AnalyzerError("analysis protocol is not 2")
-    if protocol.get("contrast_sign_convention") != CONTRAST_SIGN_CONVENTION:
-        raise AnalyzerError("contrast sign convention is not C_minus_A")
     if protocol.get("reference_checking_policy") != REFERENCE_CHECKING_POLICY:
         raise AnalyzerError("reference checking policy is not precomputed_reference_compare")
     if protocol.get("bootstrap_seed") != BOOTSTRAP_SEED:
@@ -226,24 +370,37 @@ def _check_environment(environment: dict) -> dict:
         raise AnalyzerError("counted_runs_per_cell is missing")
     if evidence_class == "correctness" and counted != 0:
         raise AnalyzerError("a smoke pair cannot be promoted into counted blocks")
+    contrast = None
     if evidence_class == "confirmatory":
         if model_id != REPORTABLE_MODEL_ID:
             raise AnalyzerError("confirmatory analysis supports only gemm_f32")
-        if tuple(protocol.get("cells") or ()) != REPORTABLE_CELLS:
-            raise AnalyzerError("confirmatory cells must be A,C")
-        if protocol.get("baseline_cell") != REPORTABLE_BASELINE:
-            raise AnalyzerError("baseline cell must be A")
-        if protocol.get("alternative_cell") != REPORTABLE_ALTERNATIVE:
-            raise AnalyzerError("alternative cell must be C")
         if protocol.get("offered_rate_frozen") is not True:
             raise AnalyzerError("confirmatory analysis requires a frozen offered rate")
-        if counted < MINIMUM_INTERVAL_BLOCKS:
-            raise AnalyzerError(
-                f"confirmatory analysis needs at least {MINIMUM_INTERVAL_BLOCKS} counted blocks"
-            )
         if protocol.get("zero_admission_rejection_required") is not True:
             raise AnalyzerError("confirmatory analysis requires the zero-rejection gate")
-    return protocol
+        contrast = _resolve_confirmatory_contrast(protocol)
+        if contrast["required_counted_runs"] is None:
+            if counted < MINIMUM_INTERVAL_BLOCKS:
+                raise AnalyzerError(
+                    f"confirmatory analysis needs at least {MINIMUM_INTERVAL_BLOCKS} counted blocks"
+                )
+        elif counted != contrast["required_counted_runs"]:
+            raise AnalyzerError(
+                "A/G2 confirmatory analysis requires exactly "
+                f"{contrast['required_counted_runs']} counted blocks"
+            )
+        source_policy = environment.get("source_defined_policy")
+        if isinstance(source_policy, dict):
+            if source_policy.get("contrast_sign_convention") != contrast["contrast_sign_convention"]:
+                raise AnalyzerError("source_defined_policy contrast sign mismatch")
+            if contrast["contrast_id"] == CONTRAST_ID_AG2:
+                if source_policy.get("contrast_id") != CONTRAST_ID_AG2:
+                    raise AnalyzerError("source_defined_policy contrast_id mismatch")
+                if source_policy.get("arrival_screen_max_lag_ns") != ARRIVAL_SCREEN_MAX_LAG_NS:
+                    raise AnalyzerError("source_defined_policy arrival screen mismatch")
+    elif protocol.get("contrast_id") == CONTRAST_ID_AG2:
+        raise AnalyzerError("A/G2 contrast_id is confirmatory-only")
+    return protocol, contrast
 
 
 def _fairness_record(environment: dict, meta: dict, report: dict) -> dict:
@@ -331,7 +488,7 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
     environment = _load_json(run_set / "environment.json")
     if environment.get("status") != "completed":
         raise AnalyzerError("environment status is not completed")
-    protocol = _check_environment(environment)
+    protocol, contrast = _check_environment(environment)
     plan_document = _load_json(run_set / "execution_plan.json")
     plan = plan_document.get("trials")
     if not isinstance(plan, list):
@@ -359,7 +516,26 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
         _require_text(queried, key)
     model = pathlib.Path(verified["model_path"])
     binary = pathlib.Path(queried["benchmark_binary_path"])
-    cell_map = {cell_id: CELL_BY_ID[cell_id] for cell_id in cells}
+    if contrast is not None:
+        cell_map = contrast["cell_map"]
+        sign = contrast["contrast_sign_convention"]
+        effect_definition = contrast["effect_definition"]
+        contrast_id = contrast["contrast_id"]
+        arrival_screen = contrast["arrival_screen_max_lag_ns"]
+        persistent_cell = contrast["persistent_batching_cell"]
+        persistent_min = contrast["persistent_batching_min_mean"]
+    else:
+        cell_map = _cell_map_from_definitions(protocol.get("cell_definitions"), tuple(cells))
+        sign = protocol.get("contrast_sign_convention") or CONTRAST_SIGN_CONVENTION
+        effect_definition = (
+            _effect_definition(sign)
+            if sign in {CONTRAST_SIGN_CONVENTION, CONTRAST_SIGN_G2_MINUS_A}
+            else "difference = alternative_metric - baseline_metric"
+        )
+        contrast_id = protocol.get("contrast_id")
+        arrival_screen = None
+        persistent_cell = None
+        persistent_min = None
     profile = protocol["profile_definitions"][0]
     reports: dict[str, dict] = {}
     fairness: list[dict] = []
@@ -395,7 +571,11 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
             problems.append(f"{trial_id} report is missing")
             continue
         text = report_path.read_text(encoding="utf-8")
-        cell = cell_map[str(trial["cell_id"])]
+        cell_id = str(trial["cell_id"])
+        if cell_id not in cell_map:
+            problems.append(f"{trial_id} unknown cell {cell_id}")
+            continue
+        cell = cell_map[cell_id]
         expected = {
             "model_path": str(model),
             "workload": profile["workload"],
@@ -412,11 +592,21 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
             "analysis_protocol_version": ANALYSIS_PROTOCOL_VERSION,
             "target_rps": profile.get("target_rps"),
         }
+        counted_trial = not bool(trial["pilot"])
+        apply_arrival = arrival_screen is not None and counted_trial
+        apply_persistent = (
+            persistent_cell is not None and counted_trial and cell_id == persistent_cell
+        )
         document, _status, arm_problems = validate_trial(
             text,
             expected=expected,
             mode=str(protocol["collection_mode"]),
             require_zero_rejections=bool(protocol.get("zero_admission_rejection_required")),
+            arrival_screen_max_lag_ns=int(arrival_screen) if apply_arrival else None,
+            require_persistent_batching=apply_persistent,
+            persistent_batching_min_mean=(
+                float(persistent_min) if apply_persistent else None
+            ),
         )
         if arm_problems or document is None:
             problems.append(f"{trial_id} " + "; ".join(arm_problems or ["invalid report"]))
@@ -425,6 +615,18 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
             problems.append(f"{trial_id} schema_version is not 3")
         if rejection_total(document) != 0 and protocol.get("zero_admission_rejection_required"):
             problems.append(f"{trial_id} has scheduler admission rejections")
+        scheduler = document.get("scheduler")
+        if isinstance(scheduler, dict):
+            reported = {
+                "id": cell_id,
+                "enable_batching": scheduler.get("enable_batching"),
+                "max_batch_size": scheduler.get("max_batch_size"),
+                "max_batch_delay_ms": scheduler.get("max_batch_delay_ms"),
+            }
+            if normalize_cell_definition(reported) != cell:
+                problems.append(
+                    f"{trial_id} runner scheduler configuration diverges from cell_definitions"
+                )
         reports[trial_id] = document
         if not trial["pilot"]:
             fairness.append(_fairness_record(environment, meta, document))
@@ -456,7 +658,12 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
                     reports[str(right["trial_id"])],
                 )
             )
-    allow_interval = evidence_class == "confirmatory" and counted >= MINIMUM_INTERVAL_BLOCKS
+    if contrast is not None and contrast["required_counted_runs"] is not None:
+        allow_interval = (
+            evidence_class == "confirmatory" and counted == contrast["required_counted_runs"]
+        )
+    else:
+        allow_interval = evidence_class == "confirmatory" and counted >= MINIMUM_INTERVAL_BLOCKS
     metrics = []
     for name, units, extractor in METRIC_EXTRACTORS:
         if counted == 0:
@@ -491,7 +698,7 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
             }
             for index in range(len(indexes))
         ]
-        effect["effect_definition"] = "difference = C_metric - A_metric"
+        effect["effect_definition"] = effect_definition
         effect["winner_declared"] = False
         effect["superiority_claimed"] = False
         metrics.append(effect)
@@ -507,14 +714,33 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
         )
         if check != latency["confidence_interval"]:
             raise AnalyzerError("paired bootstrap did not reproduce the latency interval")
+    baseline_cell = str(protocol.get("baseline_cell"))
+    alternative_cell = str(protocol.get("alternative_cell"))
     histograms = []
     for block_index, baseline_report, alternative_report in pairs:
         histograms.append(
             {
                 "block_index": block_index,
-                "A": baseline_report["metrics"]["batch_size_histogram"],
-                "C": alternative_report["metrics"]["batch_size_histogram"],
+                baseline_cell: baseline_report["metrics"]["batch_size_histogram"],
+                alternative_cell: alternative_report["metrics"]["batch_size_histogram"],
             }
+        )
+    limitations = [
+        "Producer-observed latency includes open-loop observation delay.",
+        "Reference preparation occurs before submit_start and can affect generator lag.",
+        "The 1000 ms lag tolerance is not arrival-fidelity certification.",
+        "Engine-run duration per success is an aggregate descriptive quantity.",
+        "No automatic batching superiority claim is made.",
+        "Results are specific to the recorded model, binary, host, and profile.",
+    ]
+    if contrast_id == CONTRAST_ID_AG2:
+        limitations.extend(
+            [
+                "arrival_fidelity_status remains not_certified for the A/G2 study.",
+                "phase_boundary_fidelity remains unavailable.",
+                "The 5 ms coarse generator-lag screen is not precise arrival certification.",
+                "Persistent batching gate uses mean realized batch size, not configured max.",
+            ]
         )
     aggregate = {
         "experiment_kind": EXPERIMENT_KIND,
@@ -527,11 +753,12 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
         "reference_checking_policy": REFERENCE_CHECKING_POLICY,
         "schema_version": SCHEMA_VERSION,
         "analysis_protocol_version": ANALYSIS_PROTOCOL_VERSION,
-        "contrast_sign_convention": CONTRAST_SIGN_CONVENTION,
+        "contrast_id": contrast_id,
+        "contrast_sign_convention": sign,
         "baseline_cell": protocol.get("baseline_cell"),
         "alternative_cell": protocol.get("alternative_cell"),
         "primary_metric": PRIMARY_METRIC,
-        "effect_definition": "difference = C_metric - A_metric",
+        "effect_definition": effect_definition,
         "winner_declared": False,
         "superiority_claimed": False,
         "experimental_unit": "paired_block",
@@ -542,6 +769,10 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
         "offered_rate": protocol["offered_rate"],
         "offered_rate_frozen": protocol.get("offered_rate_frozen"),
         "traffic_profile": profile_id,
+        "arrival_fidelity_status": protocol.get("arrival_fidelity_status"),
+        "phase_boundary_fidelity": protocol.get("phase_boundary_fidelity"),
+        "arrival_screen_max_lag_ns": protocol.get("arrival_screen_max_lag_ns"),
+        "arrival_screen_policy_version": protocol.get("arrival_screen_policy_version"),
         "bootstrap": {
             "method": "paired_block_bootstrap_mean",
             "seed": BOOTSTRAP_SEED,
@@ -553,14 +784,7 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
         "metrics": metrics,
         "batch_size_histograms": histograms,
         "bootstrap_reproduction": check,
-        "limitations": [
-            "Producer-observed latency includes open-loop observation delay.",
-            "Reference preparation occurs before submit_start and can affect generator lag.",
-            "The 1000 ms lag tolerance is not arrival-fidelity certification.",
-            "Engine-run duration per success is an aggregate descriptive quantity.",
-            "No automatic batching superiority claim is made.",
-            "Results are specific to the recorded model, binary, host, and profile.",
-        ],
+        "limitations": limitations,
         "queried": {
             "git_commit": queried["git_commit"],
             "benchmark_binary_sha256": queried["benchmark_binary_sha256"],
