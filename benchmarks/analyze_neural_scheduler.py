@@ -61,6 +61,23 @@ class AnalyzerError(CollectorError):
     pass
 
 
+# Exact (git_commit, benchmark_binary_sha256) pairs authorized for legacy
+# pre-adaptive report revalidation. Cross-product matching is forbidden.
+LEGACY_PRE_ADAPTIVE_IDENTITY_PAIRS = frozenset(
+    {
+        (
+            "0a8d52b5a9f176a38b65a8b8a2028b87857a1b97",
+            "acb0af726be4c564e3b829836723946916257d2f92ccce39e07acf50f70fc0d0",
+        ),
+    }
+)
+
+LEGACY_ADAPTIVE_IDENTITY_LIMITATIONS = (
+    "adaptive_batching inferred false under pre-adaptive report contract",
+    "Identity is supported by recorded collection metadata, not cryptographic attestation.",
+)
+
+
 def _load_json(path: pathlib.Path) -> dict:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
@@ -478,7 +495,66 @@ def _load_trials(run_set: pathlib.Path, plan: list[dict]) -> dict[str, dict]:
     return found
 
 
-def analyze(run_set: pathlib.Path) -> pathlib.Path:
+def _resolve_adaptive_identity(
+    *,
+    queried: dict,
+    loaded_reports: dict[str, dict],
+    legacy_pre_adaptive_identity: bool,
+) -> dict:
+    """Return strict-new or authorized-legacy adaptive identity settings."""
+    presence = []
+    true_values = []
+    for trial_id, document in loaded_reports.items():
+        scheduler = document.get("scheduler")
+        if not isinstance(scheduler, dict):
+            raise AnalyzerError(f"{trial_id} scheduler object is missing")
+        has_field = "adaptive_batching" in scheduler
+        presence.append(has_field)
+        if has_field and scheduler.get("adaptive_batching") is True:
+            true_values.append(trial_id)
+    if presence and any(presence) and not all(presence):
+        raise AnalyzerError("mixed adaptive_batching field presence across trial reports")
+    all_missing = bool(presence) and not any(presence)
+
+    if not legacy_pre_adaptive_identity:
+        if all_missing:
+            raise AnalyzerError(
+                "new-runner adaptive identity requires scheduler.adaptive_batching "
+                "(pass --legacy-pre-adaptive-identity only for authorized pre-R1 evidence)"
+            )
+        return {
+            "adaptive_identity_status": "strict_new",
+            "require_adaptive_batching_field": True,
+            "adaptive_batching": False,
+            "limitations": [],
+        }
+
+    if true_values:
+        raise AnalyzerError(
+            "legacy adaptive identity forbids adaptive_batching true "
+            f"in {', '.join(true_values)}"
+        )
+    if not all_missing:
+        raise AnalyzerError(
+            "legacy adaptive identity requires homogeneous missing scheduler.adaptive_batching"
+        )
+    pair = (queried.get("git_commit"), queried.get("benchmark_binary_sha256"))
+    if pair not in LEGACY_PRE_ADAPTIVE_IDENTITY_PAIRS:
+        raise AnalyzerError(
+            "legacy adaptive identity pair is not allowlisted "
+            f"(commit={pair[0]!r}, binary_sha256={pair[1]!r})"
+        )
+    return {
+        "adaptive_identity_status": "legacy_authorized",
+        "require_adaptive_batching_field": False,
+        "adaptive_batching": False,
+        "limitations": list(LEGACY_ADAPTIVE_IDENTITY_LIMITATIONS),
+    }
+
+
+def analyze(
+    run_set: pathlib.Path, *, legacy_pre_adaptive_identity: bool = False
+) -> pathlib.Path:
     run_set = pathlib.Path(run_set)
     aggregate_path = run_set / "aggregate.json"
     if aggregate_path.exists():
@@ -537,9 +613,35 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
         persistent_cell = None
         persistent_min = None
     profile = protocol["profile_definitions"][0]
+    loaded_texts: dict[str, str] = {}
+    loaded_reports: dict[str, dict] = {}
+    problems: list[str] = []
+    for trial in plan:
+        trial_id = str(trial["trial_id"])
+        report_path = run_set / "runs" / f"{trial_id}.json"
+        if not report_path.is_file():
+            problems.append(f"{trial_id} report is missing")
+            continue
+        text = report_path.read_text(encoding="utf-8")
+        try:
+            document = json.loads(text)
+        except json.JSONDecodeError as exc:
+            problems.append(f"{trial_id} report is not valid JSON: {exc}")
+            continue
+        if not isinstance(document, dict):
+            problems.append(f"{trial_id} report is not a JSON object")
+            continue
+        loaded_texts[trial_id] = text
+        loaded_reports[trial_id] = document
+    if problems:
+        raise AnalyzerError("; ".join(problems))
+    identity = _resolve_adaptive_identity(
+        queried=queried,
+        loaded_reports=loaded_reports,
+        legacy_pre_adaptive_identity=legacy_pre_adaptive_identity,
+    )
     reports: dict[str, dict] = {}
     fairness: list[dict] = []
-    problems: list[str] = []
     for trial in plan:
         trial_id = str(trial["trial_id"])
         meta = metas[trial_id]
@@ -566,11 +668,6 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
             problems.append(f"{trial_id} is not a valid completed trial")
         if meta.get("command") != trial.get("command"):
             problems.append(f"{trial_id} executed command diverges from the execution plan")
-        report_path = run_set / "runs" / f"{trial_id}.json"
-        if not report_path.is_file():
-            problems.append(f"{trial_id} report is missing")
-            continue
-        text = report_path.read_text(encoding="utf-8")
         cell_id = str(trial["cell_id"])
         if cell_id not in cell_map:
             problems.append(f"{trial_id} unknown cell {cell_id}")
@@ -584,6 +681,8 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
             "enable_batching": cell["enable_batching"],
             "max_batch_size": cell["max_batch_size"],
             "max_batch_delay_ms": cell["max_batch_delay_ms"],
+            "adaptive_batching": identity["adaptive_batching"],
+            "require_adaptive_batching_field": identity["require_adaptive_batching_field"],
             "warmup_requests": protocol["measurement"]["warmup_requests"],
             "check_interval": protocol["measurement"]["check_interval"],
             "duration_ms": protocol["measurement"]["duration_ms"],
@@ -598,7 +697,7 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
             persistent_cell is not None and counted_trial and cell_id == persistent_cell
         )
         document, _status, arm_problems = validate_trial(
-            text,
+            loaded_texts[trial_id],
             expected=expected,
             mode=str(protocol["collection_mode"]),
             require_zero_rejections=bool(protocol.get("zero_admission_rejection_required")),
@@ -784,7 +883,8 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
         "metrics": metrics,
         "batch_size_histograms": histograms,
         "bootstrap_reproduction": check,
-        "limitations": limitations,
+        "limitations": limitations + list(identity["limitations"]),
+        "adaptive_identity_status": identity["adaptive_identity_status"],
         "queried": {
             "git_commit": queried["git_commit"],
             "benchmark_binary_sha256": queried["benchmark_binary_sha256"],
@@ -807,9 +907,21 @@ def analyze(run_set: pathlib.Path) -> pathlib.Path:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Analyze one neural scheduler run set.")
     parser.add_argument("run_set")
+    parser.add_argument(
+        "--legacy-pre-adaptive-identity",
+        action="store_true",
+        help=(
+            "Authorize revalidation of pre-R1 reports that omit scheduler.adaptive_batching. "
+            "Requires an allowlisted (git_commit, benchmark_binary_sha256) pair and "
+            "homogeneous missing fields. Default analysis stays strict."
+        ),
+    )
     args = parser.parse_args(argv)
     try:
-        analyze(pathlib.Path(args.run_set))
+        analyze(
+            pathlib.Path(args.run_set),
+            legacy_pre_adaptive_identity=bool(args.legacy_pre_adaptive_identity),
+        )
     except AnalyzerError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

@@ -49,6 +49,8 @@ def expected_launch(**overrides) -> dict:
         "enable_batching": False,
         "max_batch_size": 1,
         "max_batch_delay_ms": 0,
+        "adaptive_batching": False,
+        "require_adaptive_batching_field": True,
         "warmup_requests": 0,
         "check_interval": 1,
         "duration_ms": 1000,
@@ -80,6 +82,7 @@ def sample_report(**overrides) -> dict:
             "enable_batching": False,
             "max_batch_size": 1,
             "max_batch_delay_ms": 0,
+            "adaptive_batching": False,
             "enable_metrics": True,
         },
         "generator": {
@@ -522,6 +525,7 @@ class World:
             document["scheduler"]["max_batch_delay_ms"] = int(
                 args[args.index("--max-batch-delay-ms") + 1]
             )
+            document["scheduler"]["adaptive_batching"] = "--adaptive-batching" in args
             if "--completion-timing" in args:
                 document = schema4_report(document)
                 if self.force_imprecise_tail:
@@ -1236,6 +1240,96 @@ class Protocol3TimingTest(unittest.TestCase):
                 }
             )
         self.assertIn("refusing to downgrade", str(caught.exception))
+
+
+class AdaptiveIdentityValidationTest(unittest.TestCase):
+    def test_new_report_false_accepted(self) -> None:
+        document = sample_report()
+        _report, status = classify_report(
+            dump_report(document), expected=expected_launch(require_adaptive_batching_field=True)
+        )
+        self.assertTrue(status["collector_valid"])
+        self.assertFalse(document["scheduler"]["adaptive_batching"])
+
+    def test_new_report_true_accepted_when_expected(self) -> None:
+        document = sample_report()
+        document["scheduler"]["adaptive_batching"] = True
+        _report, status = classify_report(
+            dump_report(document),
+            expected=expected_launch(
+                require_adaptive_batching_field=True, adaptive_batching=True
+            ),
+        )
+        self.assertTrue(status["collector_valid"])
+
+    def test_new_report_missing_rejected(self) -> None:
+        document = sample_report()
+        del document["scheduler"]["adaptive_batching"]
+        _report, status = classify_report(
+            dump_report(document), expected=expected_launch(require_adaptive_batching_field=True)
+        )
+        self.assertFalse(status["collector_valid"])
+        self.assertTrue(
+            any("adaptive_batching" in item for item in status.get("problems", []))
+        )
+
+    def test_wrong_type_rejected(self) -> None:
+        document = sample_report()
+        document["scheduler"]["adaptive_batching"] = "false"
+        _report, status = classify_report(
+            dump_report(document), expected=expected_launch(require_adaptive_batching_field=True)
+        )
+        self.assertFalse(status["collector_valid"])
+
+    def test_wrong_value_rejected(self) -> None:
+        document = sample_report()
+        document["scheduler"]["adaptive_batching"] = True
+        _report, status = classify_report(
+            dump_report(document), expected=expected_launch(require_adaptive_batching_field=True)
+        )
+        self.assertFalse(status["collector_valid"])
+        self.assertTrue(
+            any("adaptive_batching" in item for item in status.get("problems", []))
+        )
+
+    def test_extra_scheduler_key_rejected(self) -> None:
+        document = sample_report()
+        document["scheduler"]["unexpected"] = True
+        _report, status = classify_report(
+            dump_report(document), expected=expected_launch(require_adaptive_batching_field=True)
+        )
+        self.assertFalse(status["collector_valid"])
+
+    def test_legacy_mode_forbids_present_field(self) -> None:
+        document = sample_report()
+        _report, status = classify_report(
+            dump_report(document),
+            expected=expected_launch(require_adaptive_batching_field=False),
+        )
+        self.assertFalse(status["collector_valid"])
+        self.assertTrue(
+            any("legacy" in item for item in status.get("problems", []))
+        )
+
+    def test_legacy_mode_accepts_homogeneous_missing(self) -> None:
+        document = sample_report()
+        del document["scheduler"]["adaptive_batching"]
+        _report, status = classify_report(
+            dump_report(document),
+            expected=expected_launch(require_adaptive_batching_field=False),
+        )
+        self.assertTrue(status["collector_valid"])
+
+    def test_schema4_preserves_adaptive_field(self) -> None:
+        document = schema4_report()
+        self.assertIn("adaptive_batching", document["scheduler"])
+        _report, status = classify_report(
+            dump_report(document),
+            expected=expected_launch(
+                analysis_protocol_version=3, require_adaptive_batching_field=True
+            ),
+        )
+        self.assertTrue(status["collector_valid"])
 
 
 if __name__ == "__main__":

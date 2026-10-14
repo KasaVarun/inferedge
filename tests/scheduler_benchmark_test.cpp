@@ -230,6 +230,125 @@ TEST(SchedulerBenchmarkCliTest, RejectsClosedLoopSchedule) {
     EXPECT_EQ(parsed.action, SchedulerBenchmarkCliAction::kError);
 }
 
+TEST(SchedulerBenchmarkCliTest, AdaptiveBatchingDefaultsOff) {
+    const auto parsed = inferedge::parse_scheduler_benchmark_cli(
+        {"--model", "model.onnx", "--workers", "1", "--queue-capacity", "1", "--workload",
+         "closed_loop", "--max-offered", "1", "--max-outstanding", "1", "--duration-ms", "10",
+         "--completion-timeout-ms", "10"});
+    EXPECT_EQ(parsed.action, SchedulerBenchmarkCliAction::kRun);
+    EXPECT_FALSE(parsed.config.adaptive_batching);
+    EXPECT_NE(inferedge::scheduler_benchmark_help_message().find("--adaptive-batching"),
+              std::string::npos);
+}
+
+TEST(SchedulerBenchmarkCliTest, AdaptiveBatchingFlagSetsTrue) {
+    const auto parsed = inferedge::parse_scheduler_benchmark_cli({"--model",
+                                                                  "model.onnx",
+                                                                  "--workers",
+                                                                  "1",
+                                                                  "--queue-capacity",
+                                                                  "1",
+                                                                  "--workload",
+                                                                  "closed_loop",
+                                                                  "--max-offered",
+                                                                  "1",
+                                                                  "--max-outstanding",
+                                                                  "1",
+                                                                  "--duration-ms",
+                                                                  "10",
+                                                                  "--completion-timeout-ms",
+                                                                  "10",
+                                                                  "--enable-batching",
+                                                                  "--max-batch-size",
+                                                                  "4",
+                                                                  "--max-batch-delay-ms",
+                                                                  "2",
+                                                                  "--adaptive-batching"});
+    EXPECT_EQ(parsed.action, SchedulerBenchmarkCliAction::kRun);
+    EXPECT_TRUE(parsed.config.adaptive_batching);
+    EXPECT_TRUE(parsed.config.enable_batching);
+}
+
+TEST(SchedulerBenchmarkCliTest, RejectsAdaptiveWithoutBatching) {
+    const auto parsed = inferedge::parse_scheduler_benchmark_cli({"--model",
+                                                                  "model.onnx",
+                                                                  "--workers",
+                                                                  "1",
+                                                                  "--queue-capacity",
+                                                                  "1",
+                                                                  "--workload",
+                                                                  "closed_loop",
+                                                                  "--max-offered",
+                                                                  "1",
+                                                                  "--max-outstanding",
+                                                                  "1",
+                                                                  "--duration-ms",
+                                                                  "10",
+                                                                  "--completion-timeout-ms",
+                                                                  "10",
+                                                                  "--max-batch-size",
+                                                                  "4",
+                                                                  "--max-batch-delay-ms",
+                                                                  "2",
+                                                                  "--adaptive-batching"});
+    EXPECT_EQ(parsed.action, SchedulerBenchmarkCliAction::kError);
+    EXPECT_NE(parsed.message.find("--enable-batching"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkCliTest, RejectsAdaptiveWithBatchSizeOne) {
+    const auto parsed = inferedge::parse_scheduler_benchmark_cli({"--model",
+                                                                  "model.onnx",
+                                                                  "--workers",
+                                                                  "1",
+                                                                  "--queue-capacity",
+                                                                  "1",
+                                                                  "--workload",
+                                                                  "closed_loop",
+                                                                  "--max-offered",
+                                                                  "1",
+                                                                  "--max-outstanding",
+                                                                  "1",
+                                                                  "--duration-ms",
+                                                                  "10",
+                                                                  "--completion-timeout-ms",
+                                                                  "10",
+                                                                  "--enable-batching",
+                                                                  "--max-batch-size",
+                                                                  "1",
+                                                                  "--max-batch-delay-ms",
+                                                                  "2",
+                                                                  "--adaptive-batching"});
+    EXPECT_EQ(parsed.action, SchedulerBenchmarkCliAction::kError);
+    EXPECT_NE(parsed.message.find("--max-batch-size"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkCliTest, RejectsAdaptiveWithZeroDelay) {
+    const auto parsed = inferedge::parse_scheduler_benchmark_cli({"--model",
+                                                                  "model.onnx",
+                                                                  "--workers",
+                                                                  "1",
+                                                                  "--queue-capacity",
+                                                                  "1",
+                                                                  "--workload",
+                                                                  "closed_loop",
+                                                                  "--max-offered",
+                                                                  "1",
+                                                                  "--max-outstanding",
+                                                                  "1",
+                                                                  "--duration-ms",
+                                                                  "10",
+                                                                  "--completion-timeout-ms",
+                                                                  "10",
+                                                                  "--enable-batching",
+                                                                  "--max-batch-size",
+                                                                  "4",
+                                                                  "--max-batch-delay-ms",
+                                                                  "0",
+                                                                  "--adaptive-batching"});
+    EXPECT_EQ(parsed.action, SchedulerBenchmarkCliAction::kError);
+    EXPECT_NE(parsed.message.find("--max-batch-delay-ms"), std::string::npos);
+}
+
 TEST(SchedulerBenchmarkPlanTest, ConstantScheduleIsSpaced) {
     const auto planned = inferedge::plan_constant_arrivals(100.0, 50ms, 10);
     ASSERT_EQ(planned.error, SchedulerBenchmarkPlanError::kNone);
@@ -472,6 +591,7 @@ TEST(SchedulerBenchmarkTest, JsonSchemaIsVersionThree) {
     const auto json = inferedge::write_scheduler_benchmark_json(report, "0.1.0");
     EXPECT_TRUE(json.error.empty());
     EXPECT_NE(json.text.find("\"schema_version\": 3"), std::string::npos);
+    EXPECT_NE(json.text.find("\"adaptive_batching\": false"), std::string::npos);
     EXPECT_NE(json.text.find("\"arrival_stop_reason\""), std::string::npos);
     EXPECT_NE(json.text.find("\"completion_timeout_bound\": \"future_observation_only\""),
               std::string::npos);
@@ -481,6 +601,64 @@ TEST(SchedulerBenchmarkTest, JsonSchemaIsVersionThree) {
     const auto rejected = inferedge::write_scheduler_benchmark_json(report, "0.1.0");
     EXPECT_FALSE(rejected.error.empty());
     EXPECT_TRUE(rejected.text.empty());
+}
+
+TEST(SchedulerBenchmarkTest, AdaptiveFalseIsReportedAndSerialized) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.max_offered = 1;
+    config.max_outstanding = 1;
+    EXPECT_FALSE(config.adaptive_batching);
+    EXPECT_FALSE(inferedge::scheduler_config(config).adaptive_batching);
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_FALSE(run.report.adaptive_batching);
+    EXPECT_EQ(run.report.adaptive_batching, inferedge::scheduler_config(config).adaptive_batching);
+    const auto json = inferedge::write_scheduler_benchmark_json(run.report, "0.1.0");
+    EXPECT_TRUE(json.error.empty());
+    EXPECT_NE(json.text.find("\"schema_version\": 3"), std::string::npos);
+    EXPECT_NE(json.text.find("\"adaptive_batching\": false"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkTest, AdaptiveTrueIsReportedAndSerialized) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.max_offered = 2;
+    config.max_outstanding = 2;
+    config.enable_batching = true;
+    config.max_batch_size = 4;
+    config.max_batch_delay = 2ms;
+    config.adaptive_batching = true;
+    config.model_path = INFEREDGE_BATCH_ADD_MODEL_PATH;
+    EXPECT_TRUE(inferedge::scheduler_config(config).adaptive_batching);
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.adaptive_batching);
+    EXPECT_EQ(run.report.adaptive_batching, inferedge::scheduler_config(config).adaptive_batching);
+    const auto json = inferedge::write_scheduler_benchmark_json(run.report, "0.1.0");
+    EXPECT_TRUE(json.error.empty());
+    EXPECT_NE(json.text.find("\"schema_version\": 3"), std::string::npos);
+    EXPECT_NE(json.text.find("\"adaptive_batching\": true"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkTest, AdaptiveTrueKeepsSchemaFourTimingKeys) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.max_offered = 1;
+    config.max_outstanding = 1;
+    config.enable_batching = true;
+    config.max_batch_size = 4;
+    config.max_batch_delay = 2ms;
+    config.adaptive_batching = true;
+    config.enable_completion_timing = true;
+    config.model_path = INFEREDGE_BATCH_ADD_MODEL_PATH;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.adaptive_batching);
+    EXPECT_TRUE(run.report.completion_timing_enabled);
+    const auto json = inferedge::write_scheduler_benchmark_json(run.report, "0.1.0");
+    EXPECT_TRUE(json.error.empty());
+    EXPECT_NE(json.text.find("\"schema_version\": 4"), std::string::npos);
+    EXPECT_NE(json.text.find("\"adaptive_batching\": true"), std::string::npos);
+    EXPECT_NE(json.text.find("\"enable_completion_timing\": true"), std::string::npos);
+    EXPECT_NE(json.text.find("\"pre_publication_latency\""), std::string::npos);
 }
 
 TEST(SchedulerBenchmarkTest, InjectedCheckFailureExitsNonzero) {

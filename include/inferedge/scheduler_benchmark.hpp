@@ -78,6 +78,9 @@ struct SchedulerBenchmarkConfig {
     bool enable_batching{false};
     std::uint32_t max_batch_size{1};
     std::chrono::milliseconds max_batch_delay{0};
+    // Opt-in minimum-target early sealing. Default false. When true, requires
+    // enable_batching, max_batch_size >= 2, and max_batch_delay > 0.
+    bool adaptive_batching{false};
     bool enable_metrics{true};
     // Off keeps schema 3. On records one pre-publication stamp per published
     // completion and writes schema 4. It does not record a post-publication time.
@@ -275,6 +278,7 @@ struct SchedulerBenchmarkReport {
     bool enable_batching{false};
     std::uint32_t max_batch_size{0};
     std::chrono::milliseconds max_batch_delay{0};
+    bool adaptive_batching{false};
     bool enable_metrics{false};
     bool completion_timing_enabled{false};
     std::intmax_t steady_clock_period_num{0};
@@ -401,5 +405,9 @@ scheduler_benchmark_check_returned_inputs(std::span<const NamedTensor> returned,
 // Loads no model until the configuration is accepted. Uses shutdown(kDrain)
 // on every scheduler it starts. Does not call SchedulerTestAccess.
 [[nodiscard]] SchedulerBenchmarkRun run_scheduler_benchmark(const SchedulerBenchmarkConfig& config);
+
+// Copies the benchmark fields that govern InferenceScheduler construction.
+// Reported adaptive_batching must match this bridge, not argv alone.
+[[nodiscard]] SchedulerConfig scheduler_config(const SchedulerBenchmarkConfig& config);
 
 } // namespace inferedge

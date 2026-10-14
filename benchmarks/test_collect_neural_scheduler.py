@@ -226,6 +226,29 @@ class CommandAndPlanTest(unittest.TestCase):
         self.assertEqual(command[command.index("--target-rps") + 1], "120")
         self.assertNotIn("batch_add_f32", " ".join(command))
 
+    def test_expected_launch_requires_adaptive_false(self) -> None:
+        from benchmarks.collect_neural_scheduler import _expected_launch
+
+        checked = {
+            "paths": {"model": pathlib.Path("/models/gemm_f32.onnx")},
+            "collection_protocol": {
+                "measurement": {
+                    "worker_count": 1,
+                    "queue_capacity": 64,
+                    "warmup_requests": 100,
+                    "check_interval": 1,
+                    "duration_ms": 1000,
+                    "lag_tolerance_ms": 1000,
+                }
+            },
+        }
+        expected = _expected_launch(
+            checked, resolve_neural_cell("G2"), open_loop_profile("neural_open", 1000.0)
+        )
+        self.assertTrue(expected["require_adaptive_batching_field"])
+        self.assertFalse(expected["adaptive_batching"])
+        self.assertNotIn("G3", expected.get("id", "G2"))
+
     def test_a_g1_g2_runner_argv(self) -> None:
         binary = pathlib.Path("/tmp") / BINARY_NAME
         model = pathlib.Path("/models/gemm_f32.onnx")
@@ -359,6 +382,7 @@ class ValidationGateTest(unittest.TestCase):
                 "enable_batching": True,
                 "max_batch_size": 4,
                 "max_batch_delay_ms": 2,
+                "adaptive_batching": False,
                 "enable_metrics": True,
             },
         )
@@ -371,6 +395,8 @@ class ValidationGateTest(unittest.TestCase):
             "enable_batching": True,
             "max_batch_size": 4,
             "max_batch_delay_ms": 1,
+            "adaptive_batching": False,
+            "require_adaptive_batching_field": True,
             "warmup_requests": 100,
             "check_interval": 1,
             "duration_ms": 1000,

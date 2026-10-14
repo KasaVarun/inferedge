@@ -8,7 +8,11 @@ import pathlib
 import tempfile
 import unittest
 
-from benchmarks.analyze_neural_scheduler import AnalyzerError, analyze
+from benchmarks.analyze_neural_scheduler import (
+    LEGACY_PRE_ADAPTIVE_IDENTITY_PAIRS,
+    AnalyzerError,
+    analyze,
+)
 from benchmarks.analyze_scheduler import (
     AnalyzerError as AddAnalyzerError,
 )
@@ -715,6 +719,123 @@ class AddAnalyzerSafetyTest(unittest.TestCase):
             self.assertFalse((run_set / "aggregate.json").exists())
         finally:
             temporary.cleanup()
+
+
+LEGACY_COMMIT, LEGACY_BINARY = next(iter(LEGACY_PRE_ADAPTIVE_IDENTITY_PAIRS))
+
+
+def _trial_report_paths(run_set: pathlib.Path) -> list[pathlib.Path]:
+    return sorted(
+        path
+        for path in (run_set / "runs").glob("*.json")
+        if not path.name.endswith(".meta.json")
+    )
+
+
+def _strip_adaptive_field(run_set: pathlib.Path) -> None:
+    for path in _trial_report_paths(run_set):
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["scheduler"].pop("adaptive_batching", None)
+        path.write_text(dump_report(document), encoding="utf-8")
+
+
+def _set_legacy_identity(run_set: pathlib.Path, commit: str, binary_sha: str) -> None:
+    def sync(environment: dict) -> None:
+        environment["queried"]["git_commit"] = commit
+        environment["queried"]["benchmark_binary_sha256"] = binary_sha
+
+    _mutate_environment(run_set, sync)
+    for path in (run_set / "runs").glob("*.meta.json"):
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        meta["git_commit"] = commit
+        meta["benchmark_binary_sha256"] = binary_sha
+        path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+
+
+class AdaptiveIdentityAnalyzerTest(unittest.TestCase):
+    def test_strict_new_records_status(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        try:
+            run_set = _write_run(pathlib.Path(temporary.name), 20, contrast="ag2")
+            aggregate = analyze(run_set)
+            document = json.loads(aggregate.read_text(encoding="utf-8"))
+            self.assertEqual(document["adaptive_identity_status"], "strict_new")
+            self.assertFalse(
+                any("pre-adaptive report contract" in item for item in document["limitations"])
+            )
+        finally:
+            temporary.cleanup()
+
+    def test_missing_field_rejected_without_legacy_flag(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        try:
+            run_set = _write_run(pathlib.Path(temporary.name), 20, contrast="ag2")
+            _strip_adaptive_field(run_set)
+            with self.assertRaises(AnalyzerError) as raised:
+                analyze(run_set)
+            self.assertIn("adaptive_batching", str(raised.exception))
+        finally:
+            temporary.cleanup()
+
+    def test_legacy_approved_identity_accepted(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        try:
+            run_set = _write_run(pathlib.Path(temporary.name), 20, contrast="ag2")
+            _set_legacy_identity(run_set, LEGACY_COMMIT, LEGACY_BINARY)
+            _strip_adaptive_field(run_set)
+            aggregate = analyze(run_set, legacy_pre_adaptive_identity=True)
+            document = json.loads(aggregate.read_text(encoding="utf-8"))
+            self.assertEqual(document["adaptive_identity_status"], "legacy_authorized")
+            self.assertTrue(
+                any("pre-adaptive report contract" in item for item in document["limitations"])
+            )
+            self.assertTrue(
+                any("not cryptographic attestation" in item for item in document["limitations"])
+            )
+        finally:
+            temporary.cleanup()
+
+    def test_legacy_unapproved_identity_rejected(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        try:
+            run_set = _write_run(pathlib.Path(temporary.name), 20, contrast="ag2")
+            _strip_adaptive_field(run_set)
+            with self.assertRaises(AnalyzerError) as raised:
+                analyze(run_set, legacy_pre_adaptive_identity=True)
+            self.assertIn("not allowlisted", str(raised.exception))
+        finally:
+            temporary.cleanup()
+
+    def test_legacy_cross_matched_pair_rejected(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        try:
+            run_set = _write_run(pathlib.Path(temporary.name), 20, contrast="ag2")
+            _set_legacy_identity(run_set, LEGACY_COMMIT, "ff" * 32)
+            _strip_adaptive_field(run_set)
+            with self.assertRaises(AnalyzerError) as raised:
+                analyze(run_set, legacy_pre_adaptive_identity=True)
+            self.assertIn("not allowlisted", str(raised.exception))
+        finally:
+            temporary.cleanup()
+
+    def test_legacy_mixed_field_presence_rejected(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        try:
+            run_set = _write_run(pathlib.Path(temporary.name), 20, contrast="ag2")
+            _set_legacy_identity(run_set, LEGACY_COMMIT, LEGACY_BINARY)
+            reports = _trial_report_paths(run_set)
+            document = json.loads(reports[0].read_text(encoding="utf-8"))
+            document["scheduler"].pop("adaptive_batching", None)
+            reports[0].write_text(dump_report(document), encoding="utf-8")
+            with self.assertRaises(AnalyzerError) as raised:
+                analyze(run_set, legacy_pre_adaptive_identity=True)
+            self.assertIn("mixed adaptive_batching", str(raised.exception))
+        finally:
+            temporary.cleanup()
+
+    def test_no_g3_cell_in_resolver(self) -> None:
+        with self.assertRaises(Exception):
+            resolve_neural_cell("G3")
 
 
 if __name__ == "__main__":

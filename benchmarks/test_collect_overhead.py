@@ -161,6 +161,99 @@ class ValidationTest(unittest.TestCase):
         self.assertEqual(PRECISION_SCHEMA_VERSION, 4)
 
 
+class AdaptiveIdentityValidationTest(unittest.TestCase):
+    """New overhead collection must require scheduler.adaptive_batching=false."""
+
+    def test_adaptive_false_accepted_for_both_arms(self) -> None:
+        for arm in ("off", "on"):
+            document = _arm_report(arm)
+            self.assertIs(document["scheduler"]["adaptive_batching"], False)
+            _parsed, status, problems = validate_arm(dump_report(document), arm, MODEL)
+            self.assertEqual(problems, [], arm)
+            self.assertTrue(status["collector_valid"], arm)
+            self.assertEqual(status["delivery_class"], "STRICT_PRIMARY", arm)
+
+    def test_adaptive_true_rejected_for_both_arms(self) -> None:
+        for arm in ("off", "on"):
+            document = _arm_report(arm)
+            document["scheduler"]["adaptive_batching"] = True
+            _parsed, status, problems = validate_arm(dump_report(document), arm, MODEL)
+            self.assertTrue(problems, arm)
+            self.assertTrue(
+                any("adaptive_batching" in item for item in problems),
+                problems,
+            )
+            self.assertNotEqual(status["delivery_class"], "STRICT_PRIMARY", arm)
+
+    def test_adaptive_string_false_rejected_for_both_arms(self) -> None:
+        for arm in ("off", "on"):
+            document = _arm_report(arm)
+            document["scheduler"]["adaptive_batching"] = "false"
+            _parsed, status, problems = validate_arm(dump_report(document), arm, MODEL)
+            self.assertTrue(
+                any("adaptive_batching" in item and "boolean" in item for item in problems),
+                problems,
+            )
+            self.assertNotEqual(status["delivery_class"], "STRICT_PRIMARY", arm)
+
+    def test_adaptive_field_missing_rejected_for_both_arms(self) -> None:
+        for arm in ("off", "on"):
+            document = _arm_report(arm)
+            del document["scheduler"]["adaptive_batching"]
+            _parsed, status, problems = validate_arm(dump_report(document), arm, MODEL)
+            self.assertTrue(problems, arm)
+            self.assertTrue(
+                any("adaptive_batching" in item for item in problems),
+                problems,
+            )
+            self.assertNotEqual(status["delivery_class"], "STRICT_PRIMARY", arm)
+
+    def test_unknown_scheduler_key_rejected_for_both_arms(self) -> None:
+        for arm in ("off", "on"):
+            document = _arm_report(arm)
+            document["scheduler"]["unexpected_key"] = True
+            _parsed, status, problems = validate_arm(dump_report(document), arm, MODEL)
+            self.assertTrue(
+                any("unexpected_key" in item for item in problems),
+                problems,
+            )
+            self.assertNotEqual(status["delivery_class"], "STRICT_PRIMARY", arm)
+
+    def test_existing_scheduler_fields_remain_required(self) -> None:
+        document = _arm_report("off")
+        del document["scheduler"]["enable_metrics"]
+        _parsed, status, problems = validate_arm(dump_report(document), "off", MODEL)
+        self.assertTrue(any("enable_metrics" in item for item in problems), problems)
+        self.assertNotEqual(status["delivery_class"], "STRICT_PRIMARY")
+
+    def test_accounting_validation_unchanged(self) -> None:
+        document = _arm_report("off")
+        document["submit_attempts"] = 99
+        document["generator_skips_lag"] = 1
+        _scale(document, 99)
+        _parsed, status, problems = validate_arm(dump_report(document), "off", MODEL)
+        self.assertTrue(problems)
+        self.assertNotEqual(status["delivery_class"], "STRICT_PRIMARY")
+
+    def test_schema4_timing_behavior_unchanged(self) -> None:
+        on_document, on_status, on_problems = validate_arm(
+            dump_report(_arm_report("on")), "on", MODEL
+        )
+        self.assertEqual(on_problems, [])
+        self.assertEqual(on_document["schema_version"], PRECISION_SCHEMA_VERSION)
+        self.assertTrue(on_document["scheduler"]["enable_completion_timing"])
+        self.assertIs(on_document["scheduler"]["adaptive_batching"], False)
+        self.assertEqual(on_status["analysis_protocol_version"], 3)
+        off_document, off_status, off_problems = validate_arm(
+            dump_report(_arm_report("off")), "off", MODEL
+        )
+        self.assertEqual(off_problems, [])
+        self.assertEqual(off_document["schema_version"], SCHEMA_VERSION)
+        self.assertNotIn("enable_completion_timing", off_document["scheduler"])
+        self.assertIs(off_document["scheduler"]["adaptive_batching"], False)
+        self.assertEqual(off_status["analysis_protocol_version"], 2)
+
+
 class CollectionSafetyTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

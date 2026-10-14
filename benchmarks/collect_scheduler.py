@@ -231,6 +231,7 @@ SCHEDULER_KEYS = (
     "max_batch_delay_ms",
     "enable_metrics",
 )
+SCHEDULER_KEYS_WITH_ADAPTIVE = SCHEDULER_KEYS[:5] + ("adaptive_batching",) + SCHEDULER_KEYS[5:]
 GENERATOR_KEYS = (
     "lag_definition",
     "lag_policy",
@@ -1275,13 +1276,35 @@ def _check_observation(document: dict, workload: str, problems: list[str]) -> No
         problems.append("open-loop observation quantum is not 1000000 nanoseconds")
 
 
+def _scheduler_keys_for_expected(expected: dict, scheduler: dict) -> tuple[str, ...]:
+    """Select exact scheduler keys for new, legacy, or transitional callers.
+
+    require_adaptive_batching_field True: new evidence; adaptive field mandatory.
+    False: authorized legacy; adaptive field forbidden.
+    Absent: if the report already carries adaptive_batching, validate it; else
+    accept the pre-R1 key set (for unupdated callers such as overhead fixtures).
+    """
+    require_field = expected.get("require_adaptive_batching_field")
+    base = SCHEDULER_KEYS
+    if require_field is True:
+        base = SCHEDULER_KEYS_WITH_ADAPTIVE
+    elif require_field is False:
+        base = SCHEDULER_KEYS
+    elif "adaptive_batching" in scheduler:
+        base = SCHEDULER_KEYS_WITH_ADAPTIVE
+    if analysis_protocol_of(expected) == 3:
+        return base + ("enable_completion_timing",)
+    return base
+
+
 def _check_scheduler(document: dict, expected: dict, problems: list[str]) -> None:
     scheduler = _object(document["scheduler"], "scheduler", problems)
     if scheduler is None:
         return
-    scheduler_keys = SCHEDULER_KEYS
-    if analysis_protocol_of(expected) == 3:
-        scheduler_keys = SCHEDULER_KEYS + ("enable_completion_timing",)
+    require_field = expected.get("require_adaptive_batching_field")
+    if require_field is False and "adaptive_batching" in scheduler:
+        problems.append("legacy adaptive identity forbids scheduler.adaptive_batching")
+    scheduler_keys = _scheduler_keys_for_expected(expected, scheduler)
     require_exact_keys(scheduler, scheduler_keys, "scheduler", problems)
     if any(key not in scheduler for key in scheduler_keys):
         return
@@ -1305,6 +1328,15 @@ def _check_scheduler(document: dict, expected: dict, problems: list[str]) -> Non
     batching = _bool(scheduler["enable_batching"], "scheduler.enable_batching", problems)
     if batching is not None and batching != expected["enable_batching"]:
         problems.append("scheduler.enable_batching does not match the cell")
+    if "adaptive_batching" in scheduler_keys:
+        adaptive = _bool(scheduler["adaptive_batching"], "scheduler.adaptive_batching", problems)
+        expected_adaptive = bool(expected.get("adaptive_batching", False))
+        if adaptive is not None and adaptive != expected_adaptive:
+            problems.append(
+                f"scheduler.adaptive_batching is {adaptive}, expected {expected_adaptive}"
+            )
+    elif require_field is True:
+        problems.append("scheduler.adaptive_batching is required for new runner evidence")
     metrics = _bool(scheduler["enable_metrics"], "scheduler.enable_metrics", problems)
     if metrics is not None and metrics is not True:
         problems.append("scheduler metrics are disabled")
@@ -1909,6 +1941,8 @@ def _expected_launch(checked: dict, cell: dict, profile: dict) -> dict:
         "enable_batching": cell["enable_batching"],
         "max_batch_size": cell["max_batch_size"],
         "max_batch_delay_ms": cell["max_batch_delay_ms"],
+        "adaptive_batching": False,
+        "require_adaptive_batching_field": True,
         "warmup_requests": measurement["warmup_requests"],
         "check_interval": measurement["check_interval"],
         "duration_ms": measurement["duration_ms"],

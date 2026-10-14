@@ -199,6 +199,17 @@ std::string validate_config(const SchedulerBenchmarkConfig& config) {
     if (!batch_bounds_ok(config)) {
         return "batch bounds are outside the scheduler limits";
     }
+    if (config.adaptive_batching) {
+        if (!config.enable_batching) {
+            return "adaptive_batching requires enable_batching";
+        }
+        if (config.max_batch_size < 2) {
+            return "adaptive_batching requires max_batch_size >= 2";
+        }
+        if (config.max_batch_delay <= std::chrono::milliseconds::zero()) {
+            return "adaptive_batching requires max_batch_delay > 0";
+        }
+    }
     if (config.max_offered < 1 || config.max_offered > kMaxSchedulerBenchmarkOffered) {
         return "max_offered is outside 1..100000";
     }
@@ -259,19 +270,6 @@ std::string validate_config(const SchedulerBenchmarkConfig& config) {
         return "workload is unsupported";
     }
     return {};
-}
-
-SchedulerConfig scheduler_config(const SchedulerBenchmarkConfig& config) {
-    SchedulerConfig built;
-    built.model_path = config.model_path;
-    built.worker_count = config.worker_count;
-    built.queue_capacity = config.queue_capacity;
-    built.enable_batching = config.enable_batching;
-    built.max_batch_size = config.max_batch_size;
-    built.max_batch_delay = config.max_batch_delay;
-    built.enable_metrics = config.enable_metrics;
-    built.enable_completion_timing = config.enable_completion_timing;
-    return built;
 }
 
 void remember_error(SharedTrial& trial, std::uint64_t attempt_id, std::string kind,
@@ -1055,6 +1053,7 @@ SchedulerBenchmarkReport make_report(const SchedulerBenchmarkConfig& config, Sha
     report.enable_batching = config.enable_batching;
     report.max_batch_size = config.max_batch_size;
     report.max_batch_delay = config.max_batch_delay;
+    report.adaptive_batching = config.adaptive_batching;
     report.enable_metrics = config.enable_metrics;
     report.completion_timing_enabled = config.enable_completion_timing;
     report.steady_clock_period_num = std::chrono::steady_clock::period::num;
@@ -1709,6 +1708,20 @@ std::string recheck_identity(const PreparedModel& model, const SchedulerBenchmar
 }
 
 } // namespace
+
+SchedulerConfig scheduler_config(const SchedulerBenchmarkConfig& config) {
+    SchedulerConfig built;
+    built.model_path = config.model_path;
+    built.worker_count = config.worker_count;
+    built.queue_capacity = config.queue_capacity;
+    built.enable_batching = config.enable_batching;
+    built.max_batch_size = config.max_batch_size;
+    built.max_batch_delay = config.max_batch_delay;
+    built.adaptive_batching = config.adaptive_batching;
+    built.enable_metrics = config.enable_metrics;
+    built.enable_completion_timing = config.enable_completion_timing;
+    return built;
+}
 
 const char* scheduler_workload_name(SchedulerWorkloadKind workload) noexcept {
     switch (workload) {
