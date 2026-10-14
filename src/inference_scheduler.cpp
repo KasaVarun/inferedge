@@ -33,13 +33,15 @@ struct RequestEntry {
     std::uint64_t sequence{0};
     std::promise<SchedulerCompletion> completion;
     bool backstop{false};
+    bool completion_timing{false};
 
     RequestEntry() = default;
     RequestEntry(const RequestEntry&) = delete;
     RequestEntry& operator=(const RequestEntry&) = delete;
     RequestEntry(RequestEntry&& other) noexcept
         : inputs(std::move(other.inputs)), request_id(other.request_id), sequence(other.sequence),
-          completion(std::move(other.completion)), backstop(std::exchange(other.backstop, false)) {}
+          completion(std::move(other.completion)), backstop(std::exchange(other.backstop, false)),
+          completion_timing(other.completion_timing) {}
     RequestEntry& operator=(RequestEntry&&) = delete;
 
     ~RequestEntry() noexcept {
@@ -54,6 +56,9 @@ struct RequestEntry {
             completion_value.inference_error.kind = InferenceErrorKind::kExecution;
             // Short enough for libc++ and libstdc++ small-string storage.
             completion_value.inference_error.message = "unsettled";
+            if (completion_timing) {
+                completion_value.pre_publication_time = std::chrono::steady_clock::now();
+            }
             completion.set_value(std::move(completion_value));
         } catch (...) {
             // already satisfied, no shared state, or allocation failure.
@@ -67,6 +72,13 @@ static_assert(std::is_nothrow_destructible_v<RequestEntry>);
 static_assert(!std::is_copy_constructible_v<RequestEntry>);
 static_assert(!std::is_copy_assignable_v<RequestEntry>);
 static_assert(!std::is_move_assignable_v<RequestEntry>);
+
+void stamp_pre_publication(SchedulerCompletion& completion, bool enabled) noexcept {
+    if (!enabled) {
+        return;
+    }
+    completion.pre_publication_time = std::chrono::steady_clock::now();
+}
 
 enum class State {
     kIdle,
@@ -634,6 +646,7 @@ bool InferenceScheduler::Impl::PublishInferenceFailure(RequestEntry& entry, Infe
     completion.sequence = entry.sequence;
     completion.status = CompletionStatus::kInferenceFailed;
     completion.inference_error = std::move(error);
+    stamp_pre_publication(completion, entry.completion_timing);
     try {
         entry.completion.set_value(std::move(completion));
     } catch (const std::future_error&) {
@@ -651,6 +664,7 @@ bool InferenceScheduler::Impl::PublishBatchSuccess(RequestEntry& entry,
     completion.sequence = entry.sequence;
     completion.status = CompletionStatus::kSucceeded;
     completion.outputs = std::move(outputs);
+    stamp_pre_publication(completion, entry.completion_timing);
     try {
         entry.completion.set_value(std::move(completion));
     } catch (const std::future_error&) {
@@ -1169,6 +1183,7 @@ CompletionStatus InferenceScheduler::Impl::Execute(InferenceEngine& engine, Requ
         completion.status = status;
         completion.outputs = std::move(result.outputs);
     }
+    stamp_pre_publication(completion, entry.completion_timing);
     entry.completion.set_value(std::move(completion));
     entry.backstop = false;
     return status;
@@ -1192,6 +1207,7 @@ bool InferenceScheduler::Impl::PublishWorkerFailure(RequestEntry& entry, std::st
         completion.status = CompletionStatus::kWorkerFailed;
         completion.inference_error.kind = InferenceErrorKind::kExecution;
         completion.inference_error.message = WorkerFailureMessage(text);
+        stamp_pre_publication(completion, entry.completion_timing);
         entry.completion.set_value(std::move(completion));
     } catch (const std::future_error&) {
         // Already satisfied or moved-from. This is not a new completion.
@@ -1208,6 +1224,7 @@ void InferenceScheduler::Impl::PublishCanceled(RequestEntry& entry) noexcept {
         completion.request_id = entry.request_id;
         completion.sequence = entry.sequence;
         completion.status = CompletionStatus::kCanceled;
+        stamp_pre_publication(completion, entry.completion_timing);
         entry.completion.set_value(std::move(completion));
     } catch (const std::future_error&) {
         entry.backstop = false;
@@ -1231,6 +1248,7 @@ void InferenceScheduler::Impl::PublishSchedulerFailure(RequestEntry& entry) noex
         completion.status = CompletionStatus::kSchedulerFailed;
         completion.inference_error.kind = InferenceErrorKind::kExecution;
         completion.inference_error.message = "no worker";
+        stamp_pre_publication(completion, entry.completion_timing);
         entry.completion.set_value(std::move(completion));
         entry.backstop = false;
     } catch (const std::future_error&) {
@@ -1542,6 +1560,7 @@ Admission InferenceScheduler::Impl::Submit(std::vector<NamedTensor> inputs) {
     entry.sequence = id;
     ++accepted_;
     entry.backstop = true;
+    entry.completion_timing = config_.enable_completion_timing;
 
     try {
         QueuePush<RequestEntry> pushed = queue_->try_push(std::move(entry));

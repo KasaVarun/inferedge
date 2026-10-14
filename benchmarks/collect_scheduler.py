@@ -63,6 +63,7 @@ TOOL_NAME = "inferedge-bench-scheduler"
 TOOL_VERSION = "0.1.0"
 BINARY_NAME = "inferedge-bench-scheduler"
 SCHEMA_VERSION = 3
+PRECISION_SCHEMA_VERSION = 4
 MODEL_RELATIVE = "models/batch_add_f32.onnx"
 MODEL_SHA256 = "f33bbe0ad5420419dd2dbb5322f4172e213b854f1124c660b1d732e8f8ce3b23"
 OUTPUT_ROOT_RELATIVE = "benchmarks/scheduler_runs"
@@ -72,6 +73,7 @@ OPEN_LOOP_QUANTUM_NS = 1_000_000
 MINIMUM_SUBMIT_FRACTION = 0.99
 ANALYSIS_PROTOCOL_VERSION = 2
 PUBLICATION_POLICY = "strict_generator_delivery"
+PUBLICATION_POLICY_3 = "pre_publication_timing"
 PROTOCOL1_PUBLICATION_POLICY = "submit_fraction_0_99"
 DEFAULT_COUNTED_RUNS = 5
 PROTOCOL2_DEFAULT_COUNTED_RUNS = 10
@@ -239,6 +241,43 @@ GENERATOR_KEYS = (
 )
 REJECTION_KEYS = ("full", "closed", "not_running")
 LAG_KEYS = ("count", "minimum_nanoseconds", "maximum_nanoseconds", "mean_nanoseconds")
+LAG4_KEYS = LAG_KEYS + (
+    "p50_nanoseconds",
+    "p95_nanoseconds",
+    "p99_nanoseconds",
+    "percentiles_reported",
+    "precise_tail",
+)
+SCHEMA4_EXTRA_KEYS = (
+    "pre_publication_latency",
+    "pre_publication_to_observation_delay",
+    "completion_timing_enabled",
+    "steady_clock_period_numerator",
+    "steady_clock_period_denominator",
+    "steady_clock_period_note",
+    "phase_boundary_fidelity",
+    "timing_outcome_counts",
+)
+TIMING_SUMMARY_KEYS = (
+    "definition",
+    "unit",
+    "sample_count",
+    "minimum_nanoseconds",
+    "maximum_nanoseconds",
+    "mean_nanoseconds",
+    "p50_nanoseconds",
+    "p95_nanoseconds",
+    "p99_nanoseconds",
+    "percentiles_reported",
+    "precise_tail",
+)
+TIMING_OUTCOME_KEYS = (
+    "inference_failure",
+    "worker_failure",
+    "scheduler_failure",
+    "canceled",
+    "backstop",
+)
 LATENCY_KEYS = (
     "sample_count",
     "minimum_nanoseconds",
@@ -453,7 +492,7 @@ def execution_plan(
     require_counted_runs(counted_runs)
     if protocol == 1:
         plan = _protocol1_plan(cells, profiles, counted_runs)
-    elif protocol == 2:
+    elif protocol in {2, 3}:
         plan = _protocol2_plan(cells, profiles, counted_runs)
     else:
         raise CollectorError(f"unsupported analysis protocol {protocol}")
@@ -664,6 +703,8 @@ def scheduler_command(
     ]
     if cell["enable_batching"]:
         command.append("--enable-batching")
+    if measurement.get("completion_timing") is True:
+        command.append("--completion-timing")
     workload = profile["workload"]
     if workload == "open_loop_constant":
         command.extend(["--target-rps", _rate_token(float(profile["target_rps"]))])
@@ -841,8 +882,8 @@ def _bool(value: object, label: str, problems: list[str]) -> bool | None:
 
 def analysis_protocol_of(expected: dict) -> int:
     value = expected.get("analysis_protocol_version", 1)
-    if value not in {1, 2}:
-        raise CollectorError(f"analysis_protocol_version {value!r} is not 1 or 2")
+    if value not in {1, 2, 3}:
+        raise CollectorError(f"analysis_protocol_version {value!r} is not 1, 2, or 3")
     return int(value)
 
 
@@ -1009,7 +1050,7 @@ def classify_report(
     status["runner_valid"] = document.get("valid") is True
     status["problems"] = collector_problems
     if collector_problems:
-        if protocol == 2:
+        if protocol in {2, 3}:
             status["delivery_class"] = "INVALID"
         return document, status
     status["collector_valid"] = True
@@ -1039,19 +1080,136 @@ def classify_report(
     if expected["comparison_class"] != "primary":
         publication.append("comparison_class is not primary")
     eligible = expected["comparison_class"] == "primary" and delivery_class == "STRICT_PRIMARY"
+    if protocol == 3 and document.get("workload") != "closed_loop":
+        fidelity, fidelity_problems = _arrival_fidelity(document, expected)
+        status["arrival_timing_fidelity"] = fidelity
+        if delivery_class == "STRICT_PRIMARY" and fidelity == "missed":
+            delivery_class = "ARRIVAL_FIDELITY_MISSED"
+            status["delivery_class"] = delivery_class
+            publication.extend(fidelity_problems)
+        metric = expected.get("latency_metric")
+        eligible = (
+            expected["comparison_class"] == "primary"
+            and delivery_class == "STRICT_PRIMARY"
+            and fidelity == "passed"
+            and metric in {"producer_observed", "pre_publication"}
+        )
     status["publication_problems"] = publication
     status["publication_eligible"] = eligible
-    status["steady_state_eligible"] = eligible
+    status["steady_state_eligible"] = eligible and delivery_class == "STRICT_PRIMARY"
     return document, status
 
 
+def _check_timing_summary(summary: object, label: str, succeeded: object, problems: list[str]) -> None:
+    value = _object(summary, label, problems)
+    if value is None:
+        return
+    require_exact_keys(value, TIMING_SUMMARY_KEYS, label, problems)
+    if any(key not in value for key in TIMING_SUMMARY_KEYS):
+        return
+    if value["unit"] != "nanoseconds":
+        problems.append(f"{label} unit is not nanoseconds")
+    count = _nonnegative_int(value["sample_count"], f"{label}.sample_count", problems)
+    if count is not None and succeeded is not None and count != succeeded:
+        problems.append(f"{label} sample_count does not equal succeeded")
+    minimum = json_integer(value["minimum_nanoseconds"], f"{label}.minimum_nanoseconds", problems)
+    maximum = json_integer(value["maximum_nanoseconds"], f"{label}.maximum_nanoseconds", problems)
+    json_number(value["mean_nanoseconds"], f"{label}.mean_nanoseconds", problems)
+    percentiles = [
+        json_integer(value[key], f"{label}.{key}", problems)
+        for key in ("p50_nanoseconds", "p95_nanoseconds", "p99_nanoseconds")
+    ]
+    _bool(value["percentiles_reported"], f"{label}.percentiles_reported", problems)
+    _bool(value["precise_tail"], f"{label}.precise_tail", problems)
+    if minimum is not None and minimum < 0:
+        problems.append(f"{label} minimum is negative")
+    if minimum is not None and maximum is not None and minimum > maximum:
+        problems.append(f"{label} minimum exceeds maximum")
+    if value.get("percentiles_reported") is True and None not in [minimum, *percentiles, maximum]:
+        if not minimum <= percentiles[0] <= percentiles[1] <= percentiles[2] <= maximum:
+            problems.append(f"{label} percentiles are not ordered")
+    if count is not None and count < 100 and value.get("precise_tail") is True:
+        problems.append(f"{label} precise_tail is true below 100 samples")
+
+
+def _check_precision(document: dict, problems: list[str]) -> None:
+    """Schema 4 fields. Absent post-publication keys are rejected by the exact key set."""
+    if document.get("completion_timing_enabled") is not True:
+        problems.append("completion_timing_enabled is not true")
+    if document.get("phase_boundary_fidelity") != "unavailable":
+        problems.append("phase_boundary_fidelity is not unavailable")
+    numerator = json_integer(
+        document.get("steady_clock_period_numerator"), "steady_clock_period_numerator", problems
+    )
+    denominator = json_integer(
+        document.get("steady_clock_period_denominator"),
+        "steady_clock_period_denominator",
+        problems,
+    )
+    if numerator is not None and denominator is not None and (numerator <= 0 or denominator <= 0):
+        problems.append("steady_clock period is not a positive ratio")
+    if type(document.get("steady_clock_period_note")) is not str:
+        problems.append("steady_clock_period_note is not a string")
+    succeeded = document.get("succeeded")
+    _check_timing_summary(
+        document.get("pre_publication_latency"),
+        "pre_publication_latency",
+        succeeded,
+        problems,
+    )
+    _check_timing_summary(
+        document.get("pre_publication_to_observation_delay"),
+        "pre_publication_to_observation_delay",
+        succeeded,
+        problems,
+    )
+    outcomes = _object(document.get("timing_outcome_counts"), "timing_outcome_counts", problems)
+    if outcomes is None:
+        return
+    require_exact_keys(outcomes, TIMING_OUTCOME_KEYS, "timing_outcome_counts", problems)
+    for key in TIMING_OUTCOME_KEYS:
+        if key in outcomes:
+            _nonnegative_int(outcomes[key], f"timing_outcome_counts.{key}", problems)
+
+
+def _arrival_fidelity(document: dict, expected: dict) -> tuple[str, list[str]]:
+    """Predeclared bounds. Absent bounds stay not_certified and do not invent a threshold."""
+    p95_bound = expected.get("arrival_fidelity_p95_max_nanoseconds")
+    max_bound = expected.get("arrival_fidelity_max_lag_nanoseconds")
+    if p95_bound is None or max_bound is None:
+        return "not_certified", []
+    lag = document["generator_lag"]
+    problems = []
+    tolerance = expected["lag_tolerance_ms"] * 1_000_000
+    if max_bound > tolerance:
+        problems.append("arrival fidelity maximum exceeds the configured lag tolerance")
+    if lag["p95_nanoseconds"] > p95_bound or lag["maximum_nanoseconds"] > max_bound:
+        problems.append("submitted lag exceeds the predeclared arrival-fidelity bounds")
+    rate_tolerance = expected.get("arrival_rate_relative_tolerance")
+    target = expected.get("target_rps")
+    if rate_tolerance is not None:
+        actual = document["throughput"]["submit_attempts_per_arrival_window_second"]
+        if target is None or not isinstance(target, (int, float)) or target <= 0:
+            problems.append("arrival rate tolerance requires a positive target rate")
+        elif abs(float(actual) - float(target)) / float(target) > float(rate_tolerance):
+            problems.append("submission attempt rate misses the predeclared relative tolerance")
+    if problems:
+        return "missed", problems
+    return "passed", []
+
+
 def _check_document(document: dict, expected: dict, problems: list[str]) -> None:
-    require_exact_keys(document, TOP_LEVEL_KEYS, "report", problems)
+    protocol = analysis_protocol_of(expected)
+    keys = TOP_LEVEL_KEYS + SCHEMA4_EXTRA_KEYS if protocol == 3 else TOP_LEVEL_KEYS
+    require_exact_keys(document, keys, "report", problems)
     if problems:
         return
     schema = json_integer(document["schema_version"], "schema_version", problems)
-    if schema is not None and schema != SCHEMA_VERSION:
-        problems.append(f"schema_version is {schema}, expected {SCHEMA_VERSION}")
+    expected_schema = PRECISION_SCHEMA_VERSION if protocol == 3 else SCHEMA_VERSION
+    if schema is not None and schema != expected_schema:
+        problems.append(f"schema_version is {schema}, expected {expected_schema}")
+    if protocol == 3:
+        _check_precision(document, problems)
     if document["tool"] != TOOL_NAME:
         problems.append(f"tool is {document['tool']!r}, expected {TOOL_NAME!r}")
     if document["tool_version"] != TOOL_VERSION:
@@ -1121,9 +1279,20 @@ def _check_scheduler(document: dict, expected: dict, problems: list[str]) -> Non
     scheduler = _object(document["scheduler"], "scheduler", problems)
     if scheduler is None:
         return
-    require_exact_keys(scheduler, SCHEDULER_KEYS, "scheduler", problems)
-    if any(key not in scheduler for key in SCHEDULER_KEYS):
+    scheduler_keys = SCHEDULER_KEYS
+    if analysis_protocol_of(expected) == 3:
+        scheduler_keys = SCHEDULER_KEYS + ("enable_completion_timing",)
+    require_exact_keys(scheduler, scheduler_keys, "scheduler", problems)
+    if any(key not in scheduler for key in scheduler_keys):
         return
+    if analysis_protocol_of(expected) == 3:
+        timing = _bool(
+            scheduler.get("enable_completion_timing"),
+            "scheduler.enable_completion_timing",
+            problems,
+        )
+        if timing is not True:
+            problems.append("protocol 3 requires completion timing")
     for label, expected_value in (
         ("worker_count", expected["worker_count"]),
         ("queue_capacity", expected["queue_capacity"]),
@@ -1181,8 +1350,9 @@ def _check_lag(document: dict, expected: dict, problems: list[str]) -> None:
     lag = _object(document["generator_lag"], "generator_lag", problems)
     if lag is None:
         return
-    require_exact_keys(lag, LAG_KEYS, "generator_lag", problems)
-    if any(key not in lag for key in LAG_KEYS):
+    lag_keys = LAG4_KEYS if analysis_protocol_of(expected) == 3 else LAG_KEYS
+    require_exact_keys(lag, lag_keys, "generator_lag", problems)
+    if any(key not in lag for key in lag_keys):
         return
     count = _nonnegative_int(lag["count"], "generator_lag.count", problems)
     minimum = json_integer(lag["minimum_nanoseconds"], "generator_lag.minimum_nanoseconds", problems)
@@ -1192,7 +1362,20 @@ def _check_lag(document: dict, expected: dict, problems: list[str]) -> None:
         return
     if minimum is not None and maximum is not None and minimum > maximum:
         problems.append("generator lag minimum exceeds maximum")
-    del expected
+    if analysis_protocol_of(expected) == 3:
+        p50 = json_integer(lag["p50_nanoseconds"], "generator_lag.p50_nanoseconds", problems)
+        p95 = json_integer(lag["p95_nanoseconds"], "generator_lag.p95_nanoseconds", problems)
+        p99 = json_integer(lag["p99_nanoseconds"], "generator_lag.p99_nanoseconds", problems)
+        reported = _bool(lag["percentiles_reported"], "generator_lag.percentiles_reported", problems)
+        _bool(lag["precise_tail"], "generator_lag.precise_tail", problems)
+        if (
+            reported is True
+            and None not in {minimum, maximum, p50, p95, p99}
+            and not minimum <= p50 <= p95 <= p99 <= maximum
+        ):
+            problems.append("signed lag percentiles are not ordered")
+        if count is not None and count < 100 and lag.get("precise_tail") is True:
+            problems.append("generator lag precise_tail is true below 100 samples")
 
 
 def _check_latency(document: dict, problems: list[str]) -> None:
@@ -1486,16 +1669,51 @@ def preflight(
     analysis_protocol_version: int = ANALYSIS_PROTOCOL_VERSION,
     baseline_cell: str | None = None,
     alternative_cell: str | None = None,
+    latency_metric: str | None = None,
+    arrival_fidelity_p95_max_nanoseconds: int | None = None,
+    arrival_fidelity_max_lag_nanoseconds: int | None = None,
+    arrival_rate_relative_tolerance: float | None = None,
     runner=query_text,
     blob_sha256=git_blob_sha256,
 ) -> dict:
     commit = require_commit_sha(expected_commit)
     if comparison_class not in {"primary", "exploratory"}:
         raise CollectorError("comparison_class must be primary or exploratory")
-    if analysis_protocol_version != ANALYSIS_PROTOCOL_VERSION:
+    if analysis_protocol_version not in {ANALYSIS_PROTOCOL_VERSION, 3}:
         raise CollectorError(
-            "new collections use analysis protocol 2; protocol 1 is reserved for existing evidence"
+            "new collections use analysis protocol 2 or explicit protocol 3; "
+            "protocol 1 is reserved for existing evidence"
         )
+    if analysis_protocol_version == 3:
+        measurement["completion_timing"] = True
+        if latency_metric not in {None, "producer_observed", "pre_publication"}:
+            raise CollectorError(f"latency metric {latency_metric!r} is not supported")
+        if (arrival_fidelity_p95_max_nanoseconds is None) != (
+            arrival_fidelity_max_lag_nanoseconds is None
+        ):
+            raise CollectorError("arrival fidelity bounds must both be set or both be omitted")
+        tolerance_ns = measurement["lag_tolerance_ms"] * 1_000_000
+        if arrival_fidelity_p95_max_nanoseconds is not None and (
+            arrival_fidelity_p95_max_nanoseconds < 0 or arrival_fidelity_max_lag_nanoseconds < 0
+        ):
+            raise CollectorError("arrival fidelity bounds must be non-negative")
+        if (
+            arrival_fidelity_max_lag_nanoseconds is not None
+            and arrival_fidelity_max_lag_nanoseconds > tolerance_ns
+        ):
+            raise CollectorError("arrival fidelity maximum exceeds the configured lag tolerance")
+        if arrival_rate_relative_tolerance is not None and arrival_rate_relative_tolerance < 0:
+            raise CollectorError("arrival rate relative tolerance must be non-negative")
+    elif any(
+        value is not None
+        for value in (
+            latency_metric,
+            arrival_fidelity_p95_max_nanoseconds,
+            arrival_fidelity_max_lag_nanoseconds,
+            arrival_rate_relative_tolerance,
+        )
+    ):
+        raise CollectorError("precision timing options require analysis protocol 3")
     require_counted_runs(counted_runs)
     contrast = resolve_contrast(cells, baseline_cell, alternative_cell)
     family = require_one_family(profiles)
@@ -1616,9 +1834,17 @@ def preflight(
             "backend": BACKEND,
             "graph_optimizations": GRAPH_OPTIMIZATIONS,
             "onnxruntime_version_pin": ONNXRUNTIME_VERSION,
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": (
+                PRECISION_SCHEMA_VERSION if analysis_protocol_version == 3 else SCHEMA_VERSION
+            ),
             "analysis_protocol_version": analysis_protocol_version,
-            "publication_policy": PUBLICATION_POLICY,
+            "publication_policy": (
+                PUBLICATION_POLICY_3 if analysis_protocol_version == 3 else PUBLICATION_POLICY
+            ),
+            "latency_metric": latency_metric,
+            "arrival_fidelity_p95_max_nanoseconds": arrival_fidelity_p95_max_nanoseconds,
+            "arrival_fidelity_max_lag_nanoseconds": arrival_fidelity_max_lag_nanoseconds,
+            "arrival_rate_relative_tolerance": arrival_rate_relative_tolerance,
             "protocol_1_publication_policy": PROTOCOL1_PUBLICATION_POLICY,
             "protocol_1_minimum_submit_fraction": MINIMUM_SUBMIT_FRACTION,
             "minimum_submit_fraction": 1.0,
@@ -1632,7 +1858,13 @@ def preflight(
         },
         "collection_protocol": {
             "analysis_protocol_version": analysis_protocol_version,
-            "publication_policy": PUBLICATION_POLICY,
+            "publication_policy": (
+                PUBLICATION_POLICY_3 if analysis_protocol_version == 3 else PUBLICATION_POLICY
+            ),
+            "latency_metric": latency_metric,
+            "arrival_fidelity_p95_max_nanoseconds": arrival_fidelity_p95_max_nanoseconds,
+            "arrival_fidelity_max_lag_nanoseconds": arrival_fidelity_max_lag_nanoseconds,
+            "arrival_rate_relative_tolerance": arrival_rate_relative_tolerance,
             "comparison_class": comparison_class,
             "workload_family": family,
             "cells": [cell["id"] for cell in cells],
@@ -1683,6 +1915,17 @@ def _expected_launch(checked: dict, cell: dict, profile: dict) -> dict:
         "lag_tolerance_ms": measurement["lag_tolerance_ms"],
         "comparison_class": checked["collection_protocol"]["comparison_class"],
         "analysis_protocol_version": checked["collection_protocol"]["analysis_protocol_version"],
+        "latency_metric": checked["collection_protocol"].get("latency_metric"),
+        "arrival_fidelity_p95_max_nanoseconds": checked["collection_protocol"].get(
+            "arrival_fidelity_p95_max_nanoseconds"
+        ),
+        "arrival_fidelity_max_lag_nanoseconds": checked["collection_protocol"].get(
+            "arrival_fidelity_max_lag_nanoseconds"
+        ),
+        "arrival_rate_relative_tolerance": checked["collection_protocol"].get(
+            "arrival_rate_relative_tolerance"
+        ),
+        "target_rps": profile.get("target_rps"),
     }
 
 
@@ -1878,7 +2121,12 @@ def collect(
         delay_seconds=args.inter_trial_delay_seconds,
         comparison_class=args.comparison_class,
         baseline_cell=args.baseline_cell,
+        analysis_protocol_version=args.analysis_protocol,
         alternative_cell=args.alternative_cell,
+        latency_metric=args.latency_metric,
+        arrival_fidelity_p95_max_nanoseconds=args.arrival_fidelity_p95_max_ns,
+        arrival_fidelity_max_lag_nanoseconds=args.arrival_fidelity_max_lag_ns,
+        arrival_rate_relative_tolerance=args.arrival_rate_relative_tolerance,
         runner=query_runner,
         blob_sha256=blob_sha256,
     )
@@ -1961,6 +2209,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-requests", type=int)
     parser.add_argument("--lag-tolerance-ms", type=int)
     parser.add_argument("--check-interval", type=int)
+    parser.add_argument("--analysis-protocol", type=int, default=ANALYSIS_PROTOCOL_VERSION)
+    parser.add_argument(
+        "--latency-metric",
+        choices=("producer_observed", "pre_publication"),
+        default=None,
+    )
+    parser.add_argument("--arrival-fidelity-p95-max-ns", type=int, default=None)
+    parser.add_argument("--arrival-fidelity-max-lag-ns", type=int, default=None)
+    parser.add_argument("--arrival-rate-relative-tolerance", type=float, default=None)
     parser.add_argument("--preflight-only", action="store_true")
     return parser
 
@@ -1993,7 +2250,12 @@ def main(argv: list[str] | None = None, runner=None, sleep=time.sleep, blob_sha2
                 delay_seconds=args.inter_trial_delay_seconds,
                 comparison_class=args.comparison_class,
                 baseline_cell=args.baseline_cell,
-                alternative_cell=args.alternative_cell,
+                analysis_protocol_version=args.analysis_protocol,
+        alternative_cell=args.alternative_cell,
+        latency_metric=args.latency_metric,
+        arrival_fidelity_p95_max_nanoseconds=args.arrival_fidelity_p95_max_ns,
+        arrival_fidelity_max_lag_nanoseconds=args.arrival_fidelity_max_lag_ns,
+        arrival_rate_relative_tolerance=args.arrival_rate_relative_tolerance,
                 runner=query_runner,
                 blob_sha256=blob_sha256,
             )

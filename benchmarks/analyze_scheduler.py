@@ -32,6 +32,7 @@ from benchmarks.collect_scheduler import (
     MAX_COUNTED_RUNS,
     MINIMUM_INTERVAL_BLOCKS,
     MINIMUM_SUBMIT_FRACTION,
+    PUBLICATION_POLICY_3,
     MODEL_SHA256,
     PREFERRED_COUNTED_RUNS,
     PROFILE_BY_ID,
@@ -83,6 +84,14 @@ FAIRNESS_SHARED = (
     "telemetry",
     "completion_observation",
     "observation_quantum_nanoseconds",
+    "schema_version",
+    "analysis_protocol_version",
+    "enable_completion_timing",
+    "latency_metric",
+    "arrival_fidelity_p95_max_nanoseconds",
+    "arrival_fidelity_max_lag_nanoseconds",
+    "steady_clock_period_numerator",
+    "steady_clock_period_denominator",
 )
 CELL_VARIABLES = ("enable_batching", "max_batch_size", "max_batch_delay_ms")
 
@@ -243,6 +252,14 @@ def fairness_record(environment: dict, report: dict, meta: dict) -> dict:
         "enable_batching": report["scheduler"]["enable_batching"],
         "max_batch_size": report["scheduler"]["max_batch_size"],
         "max_batch_delay_ms": report["scheduler"]["max_batch_delay_ms"],
+        "schema_version": report.get("schema_version"),
+        "analysis_protocol_version": protocol.get("analysis_protocol_version"),
+        "enable_completion_timing": report.get("scheduler", {}).get("enable_completion_timing", False),
+        "latency_metric": protocol.get("latency_metric"),
+        "arrival_fidelity_p95_max_nanoseconds": protocol.get("arrival_fidelity_p95_max_nanoseconds"),
+        "arrival_fidelity_max_lag_nanoseconds": protocol.get("arrival_fidelity_max_lag_nanoseconds"),
+        "steady_clock_period_numerator": report.get("steady_clock_period_numerator"),
+        "steady_clock_period_denominator": report.get("steady_clock_period_denominator"),
     }
 
 
@@ -285,6 +302,16 @@ def _expected_for(environment: dict, meta: dict) -> dict:
     version = protocol.get("analysis_protocol_version")
     if version is not None:
         expected["analysis_protocol_version"] = version
+    expected["latency_metric"] = protocol.get("latency_metric")
+    expected["arrival_fidelity_p95_max_nanoseconds"] = protocol.get(
+        "arrival_fidelity_p95_max_nanoseconds"
+    )
+    expected["arrival_fidelity_max_lag_nanoseconds"] = protocol.get(
+        "arrival_fidelity_max_lag_nanoseconds"
+    )
+    expected["arrival_rate_relative_tolerance"] = protocol.get("arrival_rate_relative_tolerance")
+    if profile.get("target_rps") is not None:
+        expected["target_rps"] = profile["target_rps"]
     return expected
 
 
@@ -303,7 +330,7 @@ def _load_trial(run_set: pathlib.Path, environment: dict, trial: dict) -> tuple[
         raise AnalyzerError(f"{trial_id} pilot flag does not match the plan")
     protocol_version = environment["collection_protocol"].get("analysis_protocol_version", 1)
     if environment["collection_protocol"]["comparison_class"] == "primary" and not trial["pilot"]:
-        if protocol_version == 2:
+        if protocol_version in {2, 3}:
             required = (
                 "CLOSED_LOOP_VALID" if report["workload"] == "closed_loop" else "STRICT_PRIMARY"
             )
@@ -552,7 +579,7 @@ BOOTSTRAP_LIMITATIONS = (
 )
 
 
-def _marks_protocol2(environment: dict) -> bool:
+def _policy_values(environment: dict) -> list:
     protocol = environment.get("collection_protocol")
     source = environment.get("source_defined_policy")
     policies = []
@@ -560,13 +587,26 @@ def _marks_protocol2(environment: dict) -> bool:
         policies.append(protocol.get("publication_policy"))
     if isinstance(source, dict):
         policies.append(source.get("publication_policy"))
-    return PUBLICATION_POLICY in policies
+    return policies
+
+
+def _marks_protocol3(environment: dict) -> bool:
+    return PUBLICATION_POLICY_3 in _policy_values(environment)
+
+
+def _marks_protocol2(environment: dict) -> bool:
+    return PUBLICATION_POLICY in _policy_values(environment)
 
 
 def analysis_protocol_version(environment: dict) -> int:
     """Missing version is protocol 1 only when the run set does not claim protocol 2."""
     protocol = environment.get("collection_protocol")
     version = protocol.get("analysis_protocol_version") if isinstance(protocol, dict) else None
+    if _marks_protocol3(environment) and version != 3:
+        raise AnalyzerError(
+            "protocol-3 publication policy is recorded but analysis_protocol_version is "
+            f"{version!r}; refusing to downgrade the publication policy"
+        )
     if _marks_protocol2(environment) and version != 2:
         raise AnalyzerError(
             "protocol-2 publication policy is recorded but analysis_protocol_version is "
@@ -574,7 +614,7 @@ def analysis_protocol_version(environment: dict) -> int:
         )
     if version is None:
         return 1
-    if version not in {1, 2}:
+    if version not in {1, 2, 3}:
         raise AnalyzerError(f"analysis_protocol_version {version!r} is not supported")
     return int(version)
 
@@ -764,8 +804,25 @@ def plan_identity_differences(
     return differences
 
 
-def _paired_metric_catalog() -> list[tuple[str, str, object]]:
-    return [
+def _timing_value(report: dict, object_name: str, key: str) -> float | None:
+    summary = report[object_name]
+    if summary["percentiles_reported"] is not True:
+        return None
+    value = summary[key]
+    if not _finite(value):
+        return None
+    return float(value)
+
+
+def _timing_p99(report: dict, object_name: str) -> float | None:
+    summary = report[object_name]
+    if summary["precise_tail"] is not True or summary["sample_count"] < P99_SAMPLE_FLOOR:
+        return None
+    return _timing_value(report, object_name, "p99_nanoseconds")
+
+
+def _paired_metric_catalog(protocol_version: int = 2) -> list[tuple[str, str, object]]:
+    catalog = [
         (
             "successful_offered_cohort_rate",
             "successful requests per arrival-window second",
@@ -812,6 +869,33 @@ def _paired_metric_catalog() -> list[tuple[str, str, object]]:
             lambda report: report["metrics"]["engine_run_count"],
         ),
     ]
+    if protocol_version == 3:
+        catalog.extend(
+            [
+                (
+                    "p50_pre_publication_latency",
+                    "nanoseconds",
+                    lambda report: _timing_value(
+                        report, "pre_publication_latency", "p50_nanoseconds"
+                    ),
+                ),
+                (
+                    "p95_pre_publication_latency",
+                    "nanoseconds",
+                    lambda report: _timing_value(
+                        report, "pre_publication_latency", "p95_nanoseconds"
+                    ),
+                ),
+                (
+                    "p50_pre_publication_to_observation_delay",
+                    "nanoseconds; includes set_value and collector delay",
+                    lambda report: _timing_value(
+                        report, "pre_publication_to_observation_delay", "p50_nanoseconds"
+                    ),
+                ),
+            ]
+        )
+    return catalog
 
 
 def _verify_block_inventory(plan: list[dict], loaded: list[tuple[dict, dict, dict, dict]]) -> None:
@@ -865,6 +949,9 @@ def _build_contrast(
     seed: int,
     replicates: int,
     level: float,
+    protocol_version: int = 2,
+    latency_metric: str | None = None,
+    fidelity_passed: bool = True,
 ) -> dict:
     profile_id = profile["id"]
     by_block: dict[int, dict[str, tuple[dict, dict]]] = {}
@@ -903,12 +990,31 @@ def _build_contrast(
         baseline_reports.append(left_report)
         alternative_reports.append(right_report)
     metrics = {}
-    for name, units, extractor in _paired_metric_catalog():
+    open_loop = allow_interval and profile["family"] == "open_loop"
+
+    def metric_interval(name: str) -> bool:
+        if protocol_version != 3:
+            return open_loop
+        if "observation_delay" in name:
+            return False
+        producer = name in {"p50_e2e_latency", "p95_e2e_latency", "p99_e2e_latency"}
+        pre_publication = "pre_publication_latency" in name
+        if not producer and not pre_publication:
+            return open_loop
+        if not fidelity_passed or latency_metric is None:
+            return False
+        if latency_metric == "producer_observed":
+            return open_loop and producer
+        if latency_metric == "pre_publication":
+            return open_loop and pre_publication
+        return False
+
+    for name, units, extractor in _paired_metric_catalog(protocol_version):
         metrics[name] = paired_metric_effect(
             [extractor(report) for report in baseline_reports],
             [extractor(report) for report in alternative_reports],
             units=units,
-            allow_interval=allow_interval and profile["family"] == "open_loop",
+            allow_interval=metric_interval(name),
             seed=seed,
             replicates=replicates,
             level=level,
@@ -932,11 +1038,40 @@ def _build_contrast(
             p99_baseline,
             p99_alternative,
             units="microseconds",
-            allow_interval=allow_interval and profile["family"] == "open_loop",
+            allow_interval=metric_interval("p99_e2e_latency"),
             seed=seed,
             replicates=replicates,
             level=level,
         )
+    if protocol_version == 3:
+        pre_p99_baseline = [
+            _timing_p99(report, "pre_publication_latency") for report in baseline_reports
+        ]
+        pre_p99_alternative = [
+            _timing_p99(report, "pre_publication_latency") for report in alternative_reports
+        ]
+        if any(value is None for value in pre_p99_baseline + pre_p99_alternative):
+            metrics["p99_pre_publication_latency"] = {
+                "effect_estimate": None,
+                "confidence_interval": None,
+                "confidence_interval_computed": False,
+                "comparison_supported": False,
+                "superiority_claimed": False,
+                "p99_omitted_reason": (
+                    "at least one run has precise_tail false or fewer than 100 successful samples"
+                ),
+                "limitation_notes": [NARROW_CLAIM],
+            }
+        else:
+            metrics["p99_pre_publication_latency"] = paired_metric_effect(
+                pre_p99_baseline,
+                pre_p99_alternative,
+                units="nanoseconds",
+                allow_interval=metric_interval("p99_pre_publication_latency"),
+                seed=seed,
+                replicates=replicates,
+                level=level,
+            )
         metrics["p99_e2e_latency"]["p99_reduction"] = "paired_difference_of_run_p99"
     return {
         "profile_id": profile_id,
@@ -1061,6 +1196,7 @@ def _analyze_protocol2(run_set: pathlib.Path) -> dict:
                     raise AnalyzerError(
                         f"profile {profile_id} is not a fair comparison set: " + ", ".join(differences)
                     )
+    protocol_number = analysis_protocol_version(environment)
     baseline = protocol.get("baseline_cell")
     alternative = protocol.get("alternative_cell")
     contrast_source = protocol.get("contrast_source")
@@ -1087,6 +1223,11 @@ def _analyze_protocol2(run_set: pathlib.Path) -> dict:
         seed = int(protocol.get("bootstrap_seed", BOOTSTRAP_SEED))
         replicates = int(protocol.get("bootstrap_replicates", BOOTSTRAP_REPLICATES))
         level = float(protocol.get("confidence_level", CONFIDENCE_LEVEL))
+        fidelity_passed = protocol_number != 3 or all(
+            status.get("arrival_timing_fidelity") == "passed"
+            for trial, _report, status, _meta in loaded
+            if not trial["pilot"]
+        )
         for profile in profiles:
             contrasts.append(
                 _build_contrast(
@@ -1099,6 +1240,9 @@ def _analyze_protocol2(run_set: pathlib.Path) -> dict:
                     seed=seed,
                     replicates=replicates,
                     level=level,
+                    protocol_version=protocol_number,
+                    latency_metric=protocol.get("latency_metric"),
+                    fidelity_passed=fidelity_passed,
                 )
             )
     interval_computed = any(
@@ -1106,11 +1250,12 @@ def _analyze_protocol2(run_set: pathlib.Path) -> dict:
         for contrast in contrasts
         for metric in contrast["metrics"].values()
     )
+    protocol_number = analysis_protocol_version(environment)
     document = {
         "aggregate_schema_version": AGGREGATE_SCHEMA_VERSION,
-        "source_schema_version": 3,
-        "analysis_protocol_version": 2,
-        "publication_policy": PUBLICATION_POLICY,
+        "source_schema_version": 4 if protocol_number == 3 else 3,
+        "analysis_protocol_version": protocol_number,
+        "publication_policy": PUBLICATION_POLICY_3 if protocol_number == 3 else PUBLICATION_POLICY,
         "tool": TOOL_NAME,
         "tool_version": TOOL_VERSION,
         "run_set_id": run_set.name,
@@ -1158,6 +1303,22 @@ def _analyze_protocol2(run_set: pathlib.Path) -> dict:
     else:
         document["exploratory_groups"] = []
         document["publication_eligible"] = not bounded and not closed_groups and bool(steady)
+    if protocol_number == 3:
+        certified = all(
+            status.get("arrival_timing_fidelity") == "passed"
+            for trial, _report, status, _meta in loaded
+            if not trial["pilot"]
+        )
+        document["latency_metric"] = protocol.get("latency_metric")
+        document["arrival_timing_fidelity"] = "passed" if certified else "not_certified"
+        document["phase_boundary_fidelity"] = "unavailable"
+        document["instrumentation_overhead_calibrated"] = False
+        document["limitations"] = list(document["limitations"]) + [
+            "phase_boundary_fidelity is unavailable; signed lag percentiles do not certify burst waveform fidelity",
+            "instrumentation overhead is not calibrated and is not subtracted from latency",
+            "pre_publication_to_observation_delay includes set_value and collector delay; it is not pure polling overhead",
+            "pre_publication_latency is not pure engine execution time",
+        ]
     _write_aggregate(aggregate_path, document)
     return document
 

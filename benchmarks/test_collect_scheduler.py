@@ -351,6 +351,55 @@ class GitPolicyTest(unittest.TestCase):
         self.assertTrue(any("tracked worktree change" in item for item in problems))
 
 
+def schema4_report(document: dict | None = None, **overrides) -> dict:
+    value = sample_report() if document is None else document
+    value["schema_version"] = 4
+    value["completion_timing_enabled"] = True
+    value["steady_clock_period_numerator"] = 1
+    value["steady_clock_period_denominator"] = 1_000_000_000
+    value["steady_clock_period_note"] = "nominal steady_clock tick, not calibrated accuracy"
+    value["phase_boundary_fidelity"] = "unavailable"
+    value["scheduler"] = dict(value["scheduler"])
+    value["scheduler"]["enable_completion_timing"] = True
+    lag = dict(value["generator_lag"])
+    lag.update(
+        {
+            "p50_nanoseconds": 0,
+            "p95_nanoseconds": 1000,
+            "p99_nanoseconds": 1000,
+            "percentiles_reported": True,
+            "precise_tail": lag["count"] >= 100,
+        }
+    )
+    value["generator_lag"] = lag
+    timing = {
+        "definition": "pre-publication",
+        "unit": "nanoseconds",
+        "sample_count": value["succeeded"],
+        "minimum_nanoseconds": 10,
+        "maximum_nanoseconds": 20,
+        "mean_nanoseconds": 15.0,
+        "p50_nanoseconds": 12,
+        "p95_nanoseconds": 18,
+        "p99_nanoseconds": 20,
+        "percentiles_reported": True,
+        "precise_tail": value["succeeded"] >= 100,
+    }
+    value["pre_publication_latency"] = dict(timing)
+    delay = dict(timing)
+    delay["definition"] = "includes set_value and collector delay"
+    value["pre_publication_to_observation_delay"] = delay
+    value["timing_outcome_counts"] = {
+        "inference_failure": 0,
+        "worker_failure": 0,
+        "scheduler_failure": 0,
+        "canceled": 0,
+        "backstop": 0,
+    }
+    value.update(overrides)
+    return value
+
+
 class World:
     def __init__(self, root: pathlib.Path) -> None:
         self.root = root
@@ -367,6 +416,7 @@ class World:
         self.nm_output = ""
         self.version_stdout = f"{TOOL_NAME} {TOOL_VERSION}\n"
         self.fail_timeout = False
+        self.force_imprecise_tail = False
         self.bad_model = False
         self.trial_calls: list[list[str]] = []
 
@@ -472,6 +522,15 @@ class World:
             document["scheduler"]["max_batch_delay_ms"] = int(
                 args[args.index("--max-batch-delay-ms") + 1]
             )
+            if "--completion-timing" in args:
+                document = schema4_report(document)
+                if self.force_imprecise_tail:
+                    for name in (
+                        "pre_publication_latency",
+                        "pre_publication_to_observation_delay",
+                        "generator_lag",
+                    ):
+                        document[name]["precise_tail"] = False
             if workload == "closed_loop":
                 document["completion_observation"] = "closed_loop_producer_wait"
                 document["observation_quantum_nanoseconds"] = 0
@@ -960,6 +1019,223 @@ class Protocol2PlanTest(unittest.TestCase):
             require_counted_runs(0)
         with self.assertRaises(CollectorError):
             require_counted_runs(MAX_COUNTED_RUNS + 1)
+
+
+class Protocol3TimingTest(unittest.TestCase):
+    def test_schema3_protocol2_report_stays_strict_without_timing_fields(self) -> None:
+        _document, status = classify_report(
+            dump_report(sample_report()),
+            expected=expected_launch(analysis_protocol_version=2),
+        )
+        self.assertTrue(status["collector_valid"])
+        self.assertEqual(status["delivery_class"], "STRICT_PRIMARY")
+        self.assertNotIn("pre_publication_latency", sample_report())
+
+    def test_protocol3_without_bounds_is_not_certified(self) -> None:
+        _document, status = classify_report(
+            dump_report(schema4_report()),
+            expected=expected_launch(analysis_protocol_version=3, latency_metric="pre_publication"),
+        )
+        self.assertEqual(status["delivery_class"], "STRICT_PRIMARY")
+        self.assertEqual(status["arrival_timing_fidelity"], "not_certified")
+        self.assertFalse(status["publication_eligible"])
+
+    def test_fidelity_pass_and_miss(self) -> None:
+        passed_document, passed = classify_report(
+            dump_report(schema4_report()),
+            expected=expected_launch(
+                analysis_protocol_version=3,
+                latency_metric="producer_observed",
+                arrival_fidelity_p95_max_nanoseconds=1000,
+                arrival_fidelity_max_lag_nanoseconds=1000,
+                target_rps=50,
+            ),
+        )
+        self.assertTrue(passed_document["completion_timing_enabled"])
+        self.assertEqual(passed["delivery_class"], "STRICT_PRIMARY")
+        self.assertEqual(passed["arrival_timing_fidelity"], "passed")
+        self.assertTrue(passed["publication_eligible"])
+        missed_report = schema4_report()
+        missed_report["generator_lag"]["p95_nanoseconds"] = 5000
+        missed_report["generator_lag"]["p99_nanoseconds"] = 5000
+        missed_report["generator_lag"]["maximum_nanoseconds"] = 5000
+        _document, missed = classify_report(
+            dump_report(missed_report),
+            expected=expected_launch(
+                analysis_protocol_version=3,
+                latency_metric="pre_publication",
+                arrival_fidelity_p95_max_nanoseconds=1000,
+                arrival_fidelity_max_lag_nanoseconds=1000,
+            ),
+        )
+        self.assertEqual(missed["delivery_class"], "ARRIVAL_FIDELITY_MISSED")
+        self.assertFalse(missed["publication_eligible"])
+
+    def test_negative_lag_percentile_stays_signed_and_unordered_quantiles_fail(self) -> None:
+        report = schema4_report()
+        report["generator_lag"]["minimum_nanoseconds"] = -20
+        report["generator_lag"]["p50_nanoseconds"] = -10
+        report["generator_lag"]["p95_nanoseconds"] = -5
+        report["generator_lag"]["p99_nanoseconds"] = 0
+        report["generator_lag"]["maximum_nanoseconds"] = 0
+        _document, status = classify_report(
+            dump_report(report),
+            expected=expected_launch(analysis_protocol_version=3),
+        )
+        self.assertTrue(status["collector_valid"])
+        report["generator_lag"]["p50_nanoseconds"] = 5
+        report["generator_lag"]["p95_nanoseconds"] = -5
+        _document, broken = classify_report(
+            dump_report(report),
+            expected=expected_launch(analysis_protocol_version=3),
+        )
+        self.assertFalse(broken["collector_valid"])
+
+    def test_missing_timing_sample_count_is_invalid(self) -> None:
+        report = schema4_report()
+        report["pre_publication_latency"]["sample_count"] = 99
+        _document, status = classify_report(
+            dump_report(report),
+            expected=expected_launch(analysis_protocol_version=3),
+        )
+        self.assertFalse(status["collector_valid"])
+        self.assertEqual(status["delivery_class"], "INVALID")
+
+    def test_malformed_schema4_evidence_is_rejected(self) -> None:
+        expected = expected_launch(analysis_protocol_version=3)
+
+        def rejected(report: dict) -> dict:
+            _document, status = classify_report(dump_report(report), expected=expected)
+            self.assertFalse(status["collector_valid"])
+            self.assertEqual(status["delivery_class"], "INVALID")
+            self.assertFalse(status["publication_eligible"])
+            return status
+
+        delay = schema4_report()
+        delay["pre_publication_to_observation_delay"]["sample_count"] = delay["succeeded"] - 1
+        rejected(delay)
+        missing_delay = schema4_report()
+        del missing_delay["pre_publication_to_observation_delay"]
+        rejected(missing_delay)
+        nonfinite = schema4_report()
+        nonfinite["pre_publication_latency"]["mean_nanoseconds"] = float("inf")
+        rejected(nonfinite)
+        negative = schema4_report()
+        negative["pre_publication_latency"]["minimum_nanoseconds"] = -1
+        rejected(negative)
+        disabled = schema4_report()
+        disabled["completion_timing_enabled"] = False
+        rejected(disabled)
+        scheduler_off = schema4_report()
+        scheduler_off["scheduler"]["enable_completion_timing"] = False
+        rejected(scheduler_off)
+        missing_period = schema4_report()
+        del missing_period["steady_clock_period_numerator"]
+        rejected(missing_period)
+        e2e = schema4_report()
+        e2e["successful_e2e_latency"]["sample_count"] = e2e["succeeded"] - 1
+        rejected(e2e)
+
+    def test_protocol_and_schema_cannot_be_crossed(self) -> None:
+        schema4 = schema4_report()
+        _document, as_protocol2 = classify_report(
+            dump_report(schema4),
+            expected=expected_launch(analysis_protocol_version=2),
+        )
+        self.assertEqual(as_protocol2["delivery_class"], "INVALID")
+        schema3 = sample_report()
+        _document, as_protocol3 = classify_report(
+            dump_report(schema3),
+            expected=expected_launch(analysis_protocol_version=3),
+        )
+        self.assertEqual(as_protocol3["delivery_class"], "INVALID")
+
+    def test_negative_fidelity_bounds_are_rejected_before_a_run(self) -> None:
+        with self.assertRaises(CollectorError) as negative:
+            preflight(
+                repo_root=pathlib.Path("."),
+                binary=pathlib.Path("inferedge-bench-scheduler"),
+                expected_commit=COMMIT,
+                cells=[],
+                profiles=[],
+                measurement={"lag_tolerance_ms": 1000},
+                counted_runs=1,
+                delay_seconds=0.0,
+                comparison_class="primary",
+                analysis_protocol_version=3,
+                arrival_fidelity_p95_max_nanoseconds=-1,
+                arrival_fidelity_max_lag_nanoseconds=10,
+            )
+        self.assertIn("non-negative", str(negative.exception))
+        with self.assertRaises(CollectorError) as protocol2:
+            preflight(
+                repo_root=pathlib.Path("."),
+                binary=pathlib.Path("inferedge-bench-scheduler"),
+                expected_commit=COMMIT,
+                cells=[],
+                profiles=[],
+                measurement={"lag_tolerance_ms": 1000},
+                counted_runs=1,
+                delay_seconds=0.0,
+                comparison_class="primary",
+                analysis_protocol_version=2,
+                latency_metric="pre_publication",
+            )
+        self.assertIn("protocol 3", str(protocol2.exception))
+
+    def test_missing_field_wrong_type_and_observation_are_invalid(self) -> None:
+        missing = schema4_report()
+        del missing["pre_publication_latency"]
+        _document, status = classify_report(
+            dump_report(missing),
+            expected=expected_launch(analysis_protocol_version=3),
+        )
+        self.assertEqual(status["delivery_class"], "INVALID")
+        wrong_type = schema4_report()
+        wrong_type["pre_publication_latency"]["sample_count"] = "100"
+        _document, status = classify_report(
+            dump_report(wrong_type),
+            expected=expected_launch(analysis_protocol_version=3),
+        )
+        self.assertFalse(status["collector_valid"])
+        observed = schema4_report()
+        observed["completion_observation"] = "busy_spin"
+        _document, status = classify_report(
+            dump_report(observed),
+            expected=expected_launch(analysis_protocol_version=3),
+        )
+        self.assertFalse(status["collector_valid"])
+        posted = schema4_report()
+        posted["post_publication_time"] = 1
+        _document, status = classify_report(
+            dump_report(posted),
+            expected=expected_launch(analysis_protocol_version=3),
+        )
+        self.assertFalse(status["collector_valid"])
+
+    def test_missing_latency_metric_stays_descriptive(self) -> None:
+        _document, status = classify_report(
+            dump_report(schema4_report()),
+            expected=expected_launch(
+                analysis_protocol_version=3,
+                arrival_fidelity_p95_max_nanoseconds=1000,
+                arrival_fidelity_max_lag_nanoseconds=1000,
+            ),
+        )
+        self.assertEqual(status["arrival_timing_fidelity"], "passed")
+        self.assertFalse(status["publication_eligible"])
+
+    def test_protocol3_policy_without_version_is_not_downgraded(self) -> None:
+        from benchmarks.analyze_scheduler import AnalyzerError, analysis_protocol_version
+
+        with self.assertRaises(AnalyzerError) as caught:
+            analysis_protocol_version(
+                {
+                    "collection_protocol": {"publication_policy": "pre_publication_timing"},
+                    "source_defined_policy": {},
+                }
+            )
+        self.assertIn("refusing to downgrade", str(caught.exception))
 
 
 if __name__ == "__main__":

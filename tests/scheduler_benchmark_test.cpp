@@ -3,11 +3,13 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <future>
 #include <gtest/gtest.h>
 #include <limits>
+#include <optional>
 #include <spawn.h>
 #include <string>
 #include <string_view>
@@ -572,4 +574,141 @@ TEST(SchedulerBenchmarkProcessTest, JsonTrialExitsZero) {
     EXPECT_NE(process.output.find("\"workload\": \"closed_loop\""), std::string::npos);
     EXPECT_NE(process.output.find("\"valid\": true"), std::string::npos);
     EXPECT_EQ(process.output.back(), '\n');
+}
+
+TEST(SchedulerBenchmarkTimingTest, SignedLagPercentilesKeepEarlyArrivals) {
+    using namespace std::chrono_literals;
+    const std::chrono::nanoseconds lags[] = {-20ns, -10ns, 0ns, 30ns, 40ns};
+    const inferedge::SchedulerBenchmarkLagSummary summary =
+        inferedge::scheduler_benchmark_summarize_lag(lags);
+    EXPECT_EQ(summary.count, 5U);
+    EXPECT_EQ(summary.minimum.count(), -20);
+    EXPECT_EQ(summary.maximum.count(), 40);
+    EXPECT_TRUE(summary.percentiles_reported);
+    EXPECT_FALSE(summary.precise_tail);
+    EXPECT_EQ(summary.p50_nanoseconds, 0);
+    EXPECT_EQ(summary.p95_nanoseconds, 40);
+    EXPECT_EQ(summary.p99_nanoseconds, 40);
+}
+
+TEST(SchedulerBenchmarkTimingTest, Schema3OmitsTimingFields) {
+    inferedge::SchedulerBenchmarkReport report;
+    report.valid = true;
+    report.workload = "closed_loop";
+    report.arrival_stop_reason = "configured_duration";
+    report.completion_observation = "closed_loop_producer_wait";
+    report.model = "model";
+    const inferedge::SchedulerBenchmarkJsonResult json =
+        inferedge::write_scheduler_benchmark_json(report, "0.1.0");
+    EXPECT_TRUE(json.error.empty()) << json.error;
+    EXPECT_NE(json.text.find("\"schema_version\": 3"), std::string::npos);
+    EXPECT_EQ(json.text.find("pre_publication_latency"), std::string::npos);
+    EXPECT_EQ(json.text.find("p50_nanoseconds"), std::string::npos);
+    EXPECT_EQ(json.text.find("post_publication"), std::string::npos);
+    EXPECT_EQ(json.text.find("completion_timing_enabled"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkTimingTest, Schema4RequiresTimingObjectsAndRejectsNonfiniteMeans) {
+    inferedge::SchedulerBenchmarkReport report;
+    report.completion_timing_enabled = true;
+    report.valid = true;
+    report.workload = "open_loop_constant";
+    report.arrival_stop_reason = "configured_duration";
+    report.completion_observation = "open_loop_poll";
+    report.model = "model";
+    report.steady_clock_period_num = 1;
+    report.steady_clock_period_den = 1000000000;
+    report.succeeded = 1;
+    report.pre_publication_latency.sample_count = 1;
+    report.pre_publication_latency.percentiles_reported = true;
+    report.pre_publication_latency.mean_nanoseconds = 10.0;
+    report.pre_publication_to_observation_delay.sample_count = 1;
+    report.pre_publication_to_observation_delay.mean_nanoseconds = 20.0;
+    report.generator_lag.count = 1;
+    report.generator_lag.p50_nanoseconds = -5;
+    report.generator_lag.p95_nanoseconds = -5;
+    report.generator_lag.p99_nanoseconds = -5;
+    report.generator_lag.percentiles_reported = true;
+    report.generator_lag.mean_nanoseconds = -5.0;
+    const inferedge::SchedulerBenchmarkJsonResult json =
+        inferedge::write_scheduler_benchmark_json(report, "0.1.0");
+    EXPECT_TRUE(json.error.empty()) << json.error;
+    EXPECT_NE(json.text.find("\"schema_version\": 4"), std::string::npos);
+    EXPECT_NE(json.text.find("\"completion_timing_enabled\": true"), std::string::npos);
+    EXPECT_NE(json.text.find("\"pre_publication_latency\""), std::string::npos);
+    EXPECT_NE(json.text.find("\"pre_publication_to_observation_delay\""), std::string::npos);
+    EXPECT_NE(json.text.find("\"p50_nanoseconds\": -5"), std::string::npos);
+    EXPECT_EQ(json.text.find("post_publication"), std::string::npos);
+    EXPECT_NE(json.text.find("\"phase_boundary_fidelity\": \"unavailable\""), std::string::npos);
+    report.pre_publication_latency.mean_nanoseconds = std::numeric_limits<double>::infinity();
+    const inferedge::SchedulerBenchmarkJsonResult rejected =
+        inferedge::write_scheduler_benchmark_json(report, "0.1.0");
+    EXPECT_FALSE(rejected.error.empty());
+}
+
+std::optional<std::int64_t> JsonIntAfter(const std::string& text, std::string_view object,
+                                         std::string_view field) {
+    const std::string object_key = "\"" + std::string{object} + "\"";
+    const auto object_at = text.find(object_key);
+    if (object_at == std::string::npos) {
+        return std::nullopt;
+    }
+    const std::string field_key = "\"" + std::string{field} + "\": ";
+    const auto field_at = text.find(field_key, object_at);
+    if (field_at == std::string::npos) {
+        return std::nullopt;
+    }
+    const char* begin = text.data() + field_at + field_key.size();
+    const char* end = text.data() + text.size();
+    std::int64_t value = 0;
+    const std::from_chars_result parsed = std::from_chars(begin, end, value);
+    if (parsed.ec != std::errc{}) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+TEST(SchedulerBenchmarkProcessTest, CompletionTimingSelectsSchema4) {
+    const ProcessOutput process = RunProcess({INFEREDGE_BENCH_SCHEDULER_EXECUTABLE,
+                                              "--model",
+                                              INFEREDGE_BATCH_ADD_MODEL_PATH,
+                                              "--workers",
+                                              "1",
+                                              "--queue-capacity",
+                                              "4",
+                                              "--workload",
+                                              "closed_loop",
+                                              "--producer-count",
+                                              "1",
+                                              "--max-offered",
+                                              "1",
+                                              "--max-outstanding",
+                                              "1",
+                                              "--duration-ms",
+                                              "1000",
+                                              "--completion-timeout-ms",
+                                              "5000",
+                                              "--completion-timing",
+                                              "--format",
+                                              "json"});
+    EXPECT_EQ(process.status, 0) << process.error << process.output;
+    EXPECT_NE(process.output.find("\"schema_version\": 4"), std::string::npos);
+    EXPECT_NE(process.output.find("\"completion_timing_enabled\": true"), std::string::npos);
+    EXPECT_NE(process.output.find("\"sample_count\": 1"), std::string::npos);
+    EXPECT_EQ(process.output.find("post_publication"), std::string::npos);
+    const auto producer =
+        JsonIntAfter(process.output, "successful_e2e_latency", "minimum_nanoseconds");
+    const auto pre = JsonIntAfter(process.output, "pre_publication_latency", "minimum_nanoseconds");
+    const auto delay =
+        JsonIntAfter(process.output, "pre_publication_to_observation_delay", "minimum_nanoseconds");
+    ASSERT_TRUE(producer.has_value());
+    ASSERT_TRUE(pre.has_value());
+    ASSERT_TRUE(delay.has_value());
+    EXPECT_EQ(*pre + *delay, *producer);
+    EXPECT_EQ(JsonIntAfter(process.output, "pre_publication_latency", "sample_count"),
+              std::optional<std::int64_t>{1});
+    EXPECT_EQ(JsonIntAfter(process.output, "pre_publication_to_observation_delay", "sample_count"),
+              std::optional<std::int64_t>{1});
+    EXPECT_EQ(JsonIntAfter(process.output, "successful_e2e_latency", "sample_count"),
+              std::optional<std::int64_t>{1});
 }

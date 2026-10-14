@@ -76,6 +76,11 @@ struct Writer {
 
 bool finite_report(const SchedulerBenchmarkReport& report) {
     const SchedulerBenchmarkThroughput& throughput = report.throughput;
+    if (report.completion_timing_enabled &&
+        (!std::isfinite(report.pre_publication_latency.mean_nanoseconds) ||
+         !std::isfinite(report.pre_publication_to_observation_delay.mean_nanoseconds))) {
+        return false;
+    }
     if (!std::isfinite(report.generator_lag.mean_nanoseconds) ||
         !std::isfinite(report.latency.mean_microseconds) ||
         !std::isfinite(report.latency.p50_microseconds) ||
@@ -131,7 +136,9 @@ SchedulerBenchmarkJsonResult write_scheduler_benchmark_json(const SchedulerBench
         return failure("JSON numbers must be finite");
     }
     Writer writer;
-    writer.raw("{\n  \"schema_version\": 3,\n  \"tool\": ");
+    writer.raw("{\n  \"schema_version\": ");
+    writer.u64(report.completion_timing_enabled ? 4 : 3);
+    writer.raw(",\n  \"tool\": ");
     writer.string(kToolName);
     writer.raw(",\n  \"tool_version\": ");
     writer.string(tool_version);
@@ -165,6 +172,9 @@ SchedulerBenchmarkJsonResult write_scheduler_benchmark_json(const SchedulerBench
     writer.i64(report.max_batch_delay.count());
     writer.raw(",\n    \"enable_metrics\": ");
     writer.boolean(report.enable_metrics);
+    if (report.completion_timing_enabled) {
+        writer.raw(",\n    \"enable_completion_timing\": true");
+    }
     writer.raw("\n  },\n  \"generator\": {\n    \"lag_definition\": "
                "\"actual_submit_start_minus_scheduled_arrival\",\n    \"lag_policy\": "
                "\"stop_and_record\",\n    \"outstanding_policy\": \"skip_opportunity\",\n    "
@@ -230,6 +240,18 @@ SchedulerBenchmarkJsonResult write_scheduler_benchmark_json(const SchedulerBench
     writer.i64(report.generator_lag.maximum.count());
     writer.raw(",\n    \"mean_nanoseconds\": ");
     writer.number(report.generator_lag.mean_nanoseconds);
+    if (report.completion_timing_enabled) {
+        writer.raw(",\n    \"p50_nanoseconds\": ");
+        writer.i64(report.generator_lag.p50_nanoseconds);
+        writer.raw(",\n    \"p95_nanoseconds\": ");
+        writer.i64(report.generator_lag.p95_nanoseconds);
+        writer.raw(",\n    \"p99_nanoseconds\": ");
+        writer.i64(report.generator_lag.p99_nanoseconds);
+        writer.raw(",\n    \"percentiles_reported\": ");
+        writer.boolean(report.generator_lag.percentiles_reported);
+        writer.raw(",\n    \"precise_tail\": ");
+        writer.boolean(report.generator_lag.precise_tail);
+    }
     writer.raw("\n  },\n  \"successful_e2e_latency\": {\n    \"sample_count\": ");
     writer.u64(report.latency.sample_count);
     writer.raw(",\n    \"minimum_nanoseconds\": ");
@@ -248,7 +270,61 @@ SchedulerBenchmarkJsonResult write_scheduler_benchmark_json(const SchedulerBench
     writer.boolean(report.latency.percentiles_reported);
     writer.raw(",\n    \"precise_tail\": ");
     writer.boolean(report.latency.precise_tail);
-    writer.raw("\n  },\n  \"throughput\": {\n    \"arrival_window_seconds\": ");
+    writer.raw("\n  }");
+    if (report.completion_timing_enabled) {
+        auto write_nanos = [&writer](const char* name, const char* definition,
+                                     const SchedulerBenchmarkNanosecondSummary& summary) {
+            writer.raw(",\n  \"");
+            writer.raw(name);
+            writer.raw("\": {\n    \"definition\": ");
+            writer.string(definition);
+            writer.raw(",\n    \"unit\": \"nanoseconds\",\n    \"sample_count\": ");
+            writer.u64(summary.sample_count);
+            writer.raw(",\n    \"minimum_nanoseconds\": ");
+            writer.i64(summary.minimum.count());
+            writer.raw(",\n    \"maximum_nanoseconds\": ");
+            writer.i64(summary.maximum.count());
+            writer.raw(",\n    \"mean_nanoseconds\": ");
+            writer.number(summary.mean_nanoseconds);
+            writer.raw(",\n    \"p50_nanoseconds\": ");
+            writer.i64(summary.p50_nanoseconds);
+            writer.raw(",\n    \"p95_nanoseconds\": ");
+            writer.i64(summary.p95_nanoseconds);
+            writer.raw(",\n    \"p99_nanoseconds\": ");
+            writer.i64(summary.p99_nanoseconds);
+            writer.raw(",\n    \"percentiles_reported\": ");
+            writer.boolean(summary.percentiles_reported);
+            writer.raw(",\n    \"precise_tail\": ");
+            writer.boolean(summary.precise_tail);
+            writer.raw("\n  }");
+        };
+        write_nanos("pre_publication_latency",
+                    "steady_clock immediately before submit() until the pre-publication stamp",
+                    report.pre_publication_latency);
+        write_nanos("pre_publication_to_observation_delay",
+                    "pre-publication stamp until the future is observed ready; includes set_value "
+                    "and collector delay, not pure polling delay",
+                    report.pre_publication_to_observation_delay);
+        writer.raw(
+            ",\n  \"completion_timing_enabled\": true,\n  \"steady_clock_period_numerator\": ");
+        writer.i64(static_cast<std::int64_t>(report.steady_clock_period_num));
+        writer.raw(",\n  \"steady_clock_period_denominator\": ");
+        writer.i64(static_cast<std::int64_t>(report.steady_clock_period_den));
+        writer.raw(",\n  \"steady_clock_period_note\": \"nominal steady_clock tick, not calibrated "
+                   "accuracy\",\n  \"phase_boundary_fidelity\": \"unavailable\",\n  "
+                   "\"timing_outcome_counts\": {\n    \"inference_failure\": ");
+        writer.u64(report.timing_inference_failures);
+        writer.raw(",\n    \"worker_failure\": ");
+        writer.u64(report.timing_worker_failures);
+        writer.raw(",\n    \"scheduler_failure\": ");
+        writer.u64(report.timing_scheduler_failures);
+        writer.raw(",\n    \"canceled\": ");
+        writer.u64(report.timing_cancellations);
+        writer.raw(",\n    \"backstop\": ");
+        writer.u64(report.timing_backstops);
+        writer.raw("\n  }");
+    }
+    writer.raw(",\n  \"throughput\": {\n    \"arrival_window_seconds\": ");
     writer.number(report.throughput.arrival_window_seconds);
     writer.raw(",\n    \"completion_seconds\": ");
     writer.number(report.throughput.completion_seconds);

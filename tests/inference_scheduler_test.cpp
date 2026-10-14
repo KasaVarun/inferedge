@@ -3868,4 +3868,217 @@ TEST_F(InferenceSchedulerTest, FailedSiblingKeepsTheOtherWorkersEngineRun) {
     ExpectHistogramInvariants(metrics);
 }
 
+SchedulerConfig TimingAddConfig(bool timing, bool metrics, std::uint32_t workers = 1,
+                                std::size_t capacity = 2) {
+    SchedulerConfig config{INFEREDGE_ADD_MODEL_PATH, workers, capacity};
+    config.enable_completion_timing = timing;
+    config.enable_metrics = metrics;
+    return config;
+}
+
+void ExpectPreStamp(const SchedulerCompletion& completion) {
+    ASSERT_TRUE(completion.pre_publication_time.has_value());
+}
+
+TEST_F(InferenceSchedulerTest, CompletionTimingDefaultsOff) {
+    auto scheduler = MakeAdd(1, 1);
+    RequireStart(*scheduler);
+    const SchedulerCompletion completion = Take(scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F)));
+    ExpectSum(completion, 4.F, 6.F);
+    EXPECT_FALSE(completion.pre_publication_time.has_value());
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+}
+
+TEST_F(InferenceSchedulerTest, UnbatchedSuccessCarriesOnePrePublicationStamp) {
+    auto scheduler = MakeScheduler(TimingAddConfig(true, false));
+    RequireStart(*scheduler);
+    const auto before = std::chrono::steady_clock::now();
+    const SchedulerCompletion completion = Take(scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F)));
+    const auto after = std::chrono::steady_clock::now();
+    ExpectSum(completion, 4.F, 6.F);
+    ExpectPreStamp(completion);
+    EXPECT_GE(*completion.pre_publication_time, before);
+    EXPECT_LE(*completion.pre_publication_time, after);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    const SchedulerMetrics metrics = scheduler->metrics();
+    EXPECT_FALSE(metrics.enabled);
+    EXPECT_TRUE(metrics.finalized);
+    EXPECT_EQ(metrics.engine_run_count, 0U);
+}
+
+TEST_F(InferenceSchedulerTest, TimingOffStillCollectsMetrics) {
+    auto scheduler = MakeScheduler(TimingAddConfig(false, true));
+    RequireStart(*scheduler);
+    const SchedulerCompletion completion = Take(scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F)));
+    ExpectSum(completion, 4.F, 6.F);
+    EXPECT_FALSE(completion.pre_publication_time.has_value());
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    const SchedulerMetrics metrics = scheduler->metrics();
+    EXPECT_TRUE(metrics.enabled);
+    EXPECT_TRUE(metrics.finalized);
+    EXPECT_EQ(metrics.engine_run_count, 1U);
+}
+
+TEST_F(InferenceSchedulerTest, BatchedSuccessStampsEachRequestOnce) {
+    SchedulerConfig config{INFEREDGE_BATCH_ADD_MODEL_PATH, 1, 4};
+    config.enable_batching = true;
+    config.max_batch_size = 4;
+    config.max_batch_delay = std::chrono::milliseconds{0};
+    config.enable_completion_timing = true;
+    config.enable_metrics = true;
+    auto scheduler = MakeScheduler(std::move(config));
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    std::atomic<int> runs{0};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler, [&runs](std::size_t count) {
+        EXPECT_EQ(count, 2U);
+        runs.fetch_add(1);
+    });
+    RequireStart(*scheduler);
+    Admission first = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission second = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    release.release();
+    const SchedulerCompletion left = Take(std::move(first));
+    const SchedulerCompletion right = Take(std::move(second));
+    EXPECT_EQ(left.status, CompletionStatus::kSucceeded);
+    EXPECT_EQ(right.status, CompletionStatus::kSucceeded);
+    ExpectPreStamp(left);
+    ExpectPreStamp(right);
+    EXPECT_NE(left.request_id, right.request_id);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(runs.load(), 1);
+    EXPECT_EQ(scheduler->metrics().engine_run_count, 1U);
+}
+
+TEST_F(InferenceSchedulerTest, InferenceFailureKeepsAPreStampOutsideSuccess) {
+    auto scheduler = MakeScheduler(TimingAddConfig(true, true));
+    RequireStart(*scheduler);
+    const SchedulerCompletion failed = Take(scheduler->submit({NamedTensor{"A", {2}, {1.F, 2.F}}}));
+    EXPECT_EQ(failed.status, CompletionStatus::kInferenceFailed);
+    ExpectPreStamp(failed);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(scheduler->stats().succeeded, 0U);
+    EXPECT_EQ(scheduler->stats().failed_inference, 1U);
+}
+
+TEST_F(InferenceSchedulerTest, WorkerFailureCarriesItsOwnPreStamp) {
+    auto scheduler = MakeScheduler(TimingAddConfig(true, false));
+    SchedulerTestAccess::SetThrowInWorker(*scheduler, 0);
+    RequireStart(*scheduler);
+    const SchedulerCompletion failed = Take(scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F)));
+    EXPECT_EQ(failed.status, CompletionStatus::kWorkerFailed);
+    ExpectPreStamp(failed);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+}
+
+TEST_F(InferenceSchedulerTest, QueuedCancelCarriesAPreStamp) {
+    auto scheduler = MakeScheduler(TimingAddConfig(true, false, 1, 2));
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    RequireStart(*scheduler);
+    Admission waiting = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    const ShutdownResult shutdown =
+        ShutdownWhileBlocked(*scheduler, release, ShutdownPolicy::kCancelPending);
+    ExpectWinner(shutdown, ShutdownPolicy::kCancelPending, true);
+    const SchedulerCompletion canceled = Take(std::move(waiting));
+    EXPECT_EQ(canceled.status, CompletionStatus::kCanceled);
+    ExpectPreStamp(canceled);
+}
+
+TEST_F(InferenceSchedulerTest, RejectedSubmissionHasNoCompletionStamp) {
+    auto scheduler = MakeScheduler(TimingAddConfig(true, false, 1, 1));
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    RequireStart(*scheduler);
+    Admission accepted = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission rejected = scheduler->submit(AddInputs(5.F, 6.F, 7.F, 8.F));
+    EXPECT_EQ(rejected.status, AdmissionStatus::kRejectedFull);
+    EXPECT_FALSE(rejected.completion.has_value());
+    EXPECT_TRUE(rejected.inputs.has_value());
+    release.release();
+    ExpectSum(Take(std::move(accepted)), 4.F, 6.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+}
+
+TEST_F(InferenceSchedulerTest, DrainShutdownDoesNotInventASecondStamp) {
+    auto scheduler = MakeScheduler(TimingAddConfig(true, false));
+    RequireStart(*scheduler);
+    const SchedulerCompletion completion = Take(scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F)));
+    ExpectPreStamp(completion);
+    ExpectWinner(scheduler->shutdown(ShutdownPolicy::kDrain), ShutdownPolicy::kDrain, true);
+    ExpectWinner(scheduler->shutdown(ShutdownPolicy::kDrain), ShutdownPolicy::kDrain, false);
+    EXPECT_EQ(scheduler->stats().succeeded, 1U);
+}
+
+TEST_F(InferenceSchedulerTest, FutureRemainsReadableAfterSchedulerDestruction) {
+    SchedulerCompletion completion;
+    {
+        auto scheduler = MakeScheduler(TimingAddConfig(true, false));
+        RequireStart(*scheduler);
+        Admission admission = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+        EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind,
+                  SchedulerErrorKind::kNone);
+        scheduler.reset();
+        completion = admission.completion->get();
+    }
+    ExpectSum(completion, 4.F, 6.F);
+    ExpectPreStamp(completion);
+}
+
+TEST_F(InferenceSchedulerTest, ConcurrentGetObservesThePublishedStamp) {
+    auto scheduler = MakeScheduler(TimingAddConfig(true, false, 2, 2));
+    RequireStart(*scheduler);
+    Admission left = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission right = scheduler->submit(AddInputs(5.F, 6.F, 7.F, 8.F));
+    SchedulerCompletion left_completion;
+    SchedulerCompletion right_completion;
+    std::thread left_reader([&] { left_completion = left.completion->get(); });
+    std::thread right_reader([&] { right_completion = right.completion->get(); });
+    left_reader.join();
+    right_reader.join();
+    ExpectPreStamp(left_completion);
+    ExpectPreStamp(right_completion);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+}
+
+TEST_F(InferenceSchedulerTest, LastWorkerFailureStampsTheSweptRequests) {
+    auto scheduler = MakeScheduler(TimingAddConfig(true, false, 1, 3));
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetThrowInWorker(*scheduler, 0);
+    RequireStart(*scheduler);
+    Admission first = scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission second = scheduler->submit(AddInputs(1.F, 0.F, 1.F, 0.F));
+    Admission third = scheduler->submit(AddInputs(2.F, 0.F, 2.F, 0.F));
+    release.release();
+    const SchedulerCompletion worker_failed = Take(std::move(first));
+    const SchedulerCompletion left = Take(std::move(second));
+    const SchedulerCompletion right = Take(std::move(third));
+    EXPECT_EQ(worker_failed.status, CompletionStatus::kWorkerFailed);
+    EXPECT_EQ(left.status, CompletionStatus::kSchedulerFailed);
+    EXPECT_EQ(right.status, CompletionStatus::kSchedulerFailed);
+    EXPECT_EQ(left.inference_error.message, "no worker");
+    EXPECT_EQ(right.inference_error.message, "no worker");
+    ExpectPreStamp(worker_failed);
+    ExpectPreStamp(left);
+    ExpectPreStamp(right);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+}
+
+TEST_F(InferenceSchedulerTest, PublicationFailureBackstopCarriesItsOwnStamp) {
+    auto scheduler = MakeScheduler(TimingAddConfig(true, false));
+    SchedulerTestAccess::SetThrowInWorker(*scheduler, 0);
+    SchedulerTestAccess::SetFailWorkerFailurePublication(*scheduler, 0);
+    RequireStart(*scheduler);
+    const SchedulerCompletion failed = Take(scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F)));
+    EXPECT_EQ(failed.status, CompletionStatus::kSchedulerFailed);
+    EXPECT_EQ(failed.inference_error.message, "unsettled");
+    ExpectPreStamp(failed);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+}
+
 } // namespace

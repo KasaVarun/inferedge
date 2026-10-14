@@ -118,7 +118,8 @@ std::string parse_rate(std::string_view text, double& value, std::string_view fl
 std::string scheduler_benchmark_help_message() {
     return "Usage: inferedge-bench-scheduler [options]\n"
            "\n"
-           "Benchmark one InferenceScheduler. Schema version 3 is --format json.\n"
+           "Benchmark one InferenceScheduler. --format json is schema 3.\n"
+           "--completion-timing selects schema 4 and one pre-publication stamp.\n"
            "Warm-up uses a separate scheduler and is excluded from the report.\n"
            "Open-loop lag above --lag-tolerance-ms stops the rest of the schedule.\n"
            "An outstanding-cap hit skips that opportunity and is not a rejection.\n"
@@ -145,6 +146,7 @@ std::string scheduler_benchmark_help_message() {
            "  --max-batch-size <n>           1..32 (default 1)\n"
            "  --max-batch-delay-ms <n>       0..1000 (default 0)\n"
            "  --disable-metrics              leave scheduler metrics off\n"
+           "  --completion-timing            schema 4 pre-publication stamps (default off)\n"
            "  --format <text|json>           default text\n"
            "  --help, -h\n"
            "  --version, -V\n";
@@ -203,6 +205,7 @@ parse_scheduler_benchmark_cli(const std::vector<std::string_view>& args) {
     bool saw_delay = false;
     bool saw_format = false;
     bool saw_metrics = false;
+    bool saw_timing = false;
 
     for (std::size_t index = 0; index < args.size(); ++index) {
         const std::string_view argument = args[index];
@@ -218,6 +221,14 @@ parse_scheduler_benchmark_cli(const std::vector<std::string_view>& args) {
         };
         if (argument == "--enable-batching") {
             parsed.config.enable_batching = true;
+            continue;
+        }
+        if (argument == "--completion-timing") {
+            if (const std::string duplicated = assign_once(saw_timing, argument);
+                !duplicated.empty()) {
+                return error_result(duplicated);
+            }
+            parsed.config.enable_completion_timing = true;
             continue;
         }
         if (argument == "--disable-metrics") {

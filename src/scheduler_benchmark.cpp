@@ -4,7 +4,9 @@
 #include <cmath>
 #include <condition_variable>
 #include <future>
+#include <limits>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <utility>
 
@@ -60,7 +62,17 @@ struct SharedTrial {
     std::condition_variable ready;
     std::vector<Inflight> inflight;
     std::vector<std::chrono::nanoseconds> latencies;
+    std::vector<std::chrono::nanoseconds> pre_publication_latencies;
+    std::vector<std::chrono::nanoseconds> observation_delays;
     std::vector<std::chrono::nanoseconds> lags;
+    std::uint64_t missing_pre_stamps{0};
+    std::uint64_t unrepresentable_timing{0};
+    std::uint64_t negative_timing{0};
+    std::uint64_t timing_inference_failures{0};
+    std::uint64_t timing_worker_failures{0};
+    std::uint64_t timing_scheduler_failures{0};
+    std::uint64_t timing_cancellations{0};
+    std::uint64_t timing_backstops{0};
     std::vector<SchedulerBenchmarkErrorRecord> errors;
     std::uint64_t scheduled{0};
     std::uint64_t attempts{0};
@@ -236,6 +248,7 @@ SchedulerConfig scheduler_config(const SchedulerBenchmarkConfig& config) {
     built.max_batch_size = config.max_batch_size;
     built.max_batch_delay = config.max_batch_delay;
     built.enable_metrics = config.enable_metrics;
+    built.enable_completion_timing = config.enable_completion_timing;
     return built;
 }
 
@@ -448,6 +461,18 @@ void run_open_loop_generator(InferenceScheduler& scheduler, const SchedulerBench
     }
 }
 
+std::optional<std::int64_t> exact_nanoseconds(std::chrono::steady_clock::duration delta) {
+    using Nanoseconds = std::chrono::nanoseconds;
+    if (delta > Nanoseconds::max() || delta < Nanoseconds::min()) {
+        return std::nullopt;
+    }
+    const auto nanos = std::chrono::duration_cast<Nanoseconds>(delta);
+    if (std::chrono::duration_cast<std::chrono::steady_clock::duration>(nanos) != delta) {
+        return std::nullopt;
+    }
+    return nanos.count();
+}
+
 void record_observed(SharedTrial& trial, const SchedulerBenchmarkConfig& config, Inflight item,
                      std::chrono::steady_clock::time_point observed) {
     SchedulerCompletion completion;
@@ -473,6 +498,64 @@ void record_observed(SharedTrial& trial, const SchedulerBenchmarkConfig& config,
     if (completion.status == CompletionStatus::kSucceeded) {
         record_success_sample(trial, config, item, observed - item.submit_start, completion, false);
     }
+    if (!config.enable_completion_timing) {
+        return;
+    }
+    const bool backstop = completion.status == CompletionStatus::kSchedulerFailed &&
+                          completion.inference_error.message == "unsettled";
+    if (backstop) {
+        ++trial.timing_backstops;
+    }
+    if (!completion.pre_publication_time.has_value()) {
+        ++trial.missing_pre_stamps;
+        remember_error(trial, item.attempt_id, "pre_publication_stamp",
+                       "timing-enabled completion omitted the pre-publication stamp");
+        return;
+    }
+    const auto pre_latency =
+        exact_nanoseconds(*completion.pre_publication_time - item.submit_start);
+    const auto delay = exact_nanoseconds(observed - *completion.pre_publication_time);
+    if (!pre_latency.has_value() || !delay.has_value()) {
+        ++trial.unrepresentable_timing;
+        remember_error(trial, item.attempt_id, "timing_duration",
+                       "a timing duration is not an exact int64 nanosecond value");
+        return;
+    }
+    if (*pre_latency < 0 || *delay < 0) {
+        ++trial.negative_timing;
+        remember_error(trial, item.attempt_id, "timing_duration",
+                       "a pre-publication interval moved backwards");
+        return;
+    }
+    if (completion.status == CompletionStatus::kSucceeded) {
+        // The stored producer-observed sample is this same duration converted to
+        // nanoseconds. Exact stamps must add to it; overflow is not a sample.
+        constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+        const auto producer_observed =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(observed - item.submit_start);
+        if (*pre_latency > kMax - *delay ||
+            std::chrono::nanoseconds{*pre_latency + *delay} != producer_observed) {
+            ++trial.unrepresentable_timing;
+            remember_error(trial, item.attempt_id, "timing_duration",
+                           "pre-publication latency and observation delay do not add to the "
+                           "producer-observed duration");
+            return;
+        }
+    }
+    if (completion.status != CompletionStatus::kSucceeded) {
+        if (completion.status == CompletionStatus::kInferenceFailed) {
+            ++trial.timing_inference_failures;
+        } else if (completion.status == CompletionStatus::kWorkerFailed) {
+            ++trial.timing_worker_failures;
+        } else if (completion.status == CompletionStatus::kCanceled) {
+            ++trial.timing_cancellations;
+        } else if (!backstop) {
+            ++trial.timing_scheduler_failures;
+        }
+        return;
+    }
+    trial.pre_publication_latencies.push_back(std::chrono::nanoseconds{*pre_latency});
+    trial.observation_delays.push_back(std::chrono::nanoseconds{*delay});
 }
 
 // Readiness uses wait_for(0) under the trial mutex. That probe does not call
@@ -719,6 +802,59 @@ void add_reason(std::vector<std::string>& reasons, std::string reason) {
     reasons.push_back(std::move(reason));
 }
 
+bool signed_nearest_rank(std::uint64_t count, std::uint64_t percent, std::uint64_t& index) {
+    if (percent == 0 || count == 0 ||
+        count > (std::numeric_limits<std::uint64_t>::max() - 99) / percent) {
+        return false;
+    }
+    const std::uint64_t rank = (percent * count + 99) / 100;
+    if (rank == 0 || rank > count) {
+        return false;
+    }
+    index = rank - 1;
+    return true;
+}
+
+void fill_signed_percentiles(const std::vector<std::chrono::nanoseconds>& sorted, std::int64_t& p50,
+                             std::int64_t& p95, std::int64_t& p99, bool& reported) {
+    std::uint64_t p50_index = 0;
+    std::uint64_t p95_index = 0;
+    std::uint64_t p99_index = 0;
+    const auto count = static_cast<std::uint64_t>(sorted.size());
+    if (!signed_nearest_rank(count, 50, p50_index) || !signed_nearest_rank(count, 95, p95_index) ||
+        !signed_nearest_rank(count, 99, p99_index)) {
+        reported = false;
+        return;
+    }
+    p50 = sorted[static_cast<std::size_t>(p50_index)].count();
+    p95 = sorted[static_cast<std::size_t>(p95_index)].count();
+    p99 = sorted[static_cast<std::size_t>(p99_index)].count();
+    reported = true;
+}
+
+SchedulerBenchmarkNanosecondSummary
+summarize_nonnegative_nanos(const std::vector<std::chrono::nanoseconds>& samples) {
+    SchedulerBenchmarkNanosecondSummary summary;
+    summary.sample_count = samples.size();
+    if (samples.empty()) {
+        return summary;
+    }
+    summary.minimum = *std::min_element(samples.begin(), samples.end());
+    summary.maximum = *std::max_element(samples.begin(), samples.end());
+    long double total = 0;
+    for (const std::chrono::nanoseconds sample : samples) {
+        total += static_cast<long double>(sample.count());
+    }
+    summary.mean_nanoseconds =
+        static_cast<double>(total / static_cast<long double>(samples.size()));
+    std::vector<std::chrono::nanoseconds> sorted = samples;
+    std::sort(sorted.begin(), sorted.end());
+    fill_signed_percentiles(sorted, summary.p50_nanoseconds, summary.p95_nanoseconds,
+                            summary.p99_nanoseconds, summary.percentiles_reported);
+    summary.precise_tail = summary.sample_count >= 100 && summary.percentiles_reported;
+    return summary;
+}
+
 SchedulerBenchmarkLagSummary summarize_lag(const std::vector<std::chrono::nanoseconds>& lags) {
     SchedulerBenchmarkLagSummary summary;
     summary.count = lags.size();
@@ -732,9 +868,11 @@ SchedulerBenchmarkLagSummary summarize_lag(const std::vector<std::chrono::nanose
         total += static_cast<long double>(lag.count());
     }
     summary.mean_nanoseconds = static_cast<double>(total / static_cast<long double>(lags.size()));
-    if (!std::isfinite(summary.mean_nanoseconds)) {
-        summary.mean_nanoseconds = 0.0;
-    }
+    std::vector<std::chrono::nanoseconds> sorted = lags;
+    std::sort(sorted.begin(), sorted.end());
+    fill_signed_percentiles(sorted, summary.p50_nanoseconds, summary.p95_nanoseconds,
+                            summary.p99_nanoseconds, summary.percentiles_reported);
+    summary.precise_tail = summary.count >= 100 && summary.percentiles_reported;
     return summary;
 }
 
@@ -762,7 +900,8 @@ void check_last_success(SharedTrial& trial, const SchedulerBenchmarkConfig& conf
                                            0,
                                            CompletionStatus::kSucceeded,
                                            {},
-                                           trial.unchecked_outputs},
+                                           trial.unchecked_outputs,
+                                           std::nullopt},
                        trial.unchecked_c0, trial.unchecked_c1)) {
         ++trial.mismatches;
         remember_error(trial, trial.unchecked_attempt, "correctness",
@@ -786,6 +925,9 @@ SchedulerBenchmarkReport make_report(const SchedulerBenchmarkConfig& config, Sha
     report.max_batch_size = config.max_batch_size;
     report.max_batch_delay = config.max_batch_delay;
     report.enable_metrics = config.enable_metrics;
+    report.completion_timing_enabled = config.enable_completion_timing;
+    report.steady_clock_period_num = std::chrono::steady_clock::period::num;
+    report.steady_clock_period_den = std::chrono::steady_clock::period::den;
     report.warmup_requests = config.warmup_requests;
     report.warmup_uses_separate_scheduler = true;
     report.configured_duration = config.duration;
@@ -826,6 +968,20 @@ SchedulerBenchmarkReport make_report(const SchedulerBenchmarkConfig& config, Sha
     report.canceled = trial.canceled;
     report.timeouts = trial.timeouts;
     report.generator_lag = summarize_lag(trial.lags);
+    // Schema 3 historically replaced a nonfinite lag mean with zero. Schema 4
+    // keeps the nonfinite value so the trial is rejected instead.
+    if (!report.completion_timing_enabled &&
+        !std::isfinite(report.generator_lag.mean_nanoseconds)) {
+        report.generator_lag.mean_nanoseconds = 0.0;
+    }
+    report.pre_publication_latency = summarize_nonnegative_nanos(trial.pre_publication_latencies);
+    report.pre_publication_to_observation_delay =
+        summarize_nonnegative_nanos(trial.observation_delays);
+    report.timing_inference_failures = trial.timing_inference_failures;
+    report.timing_worker_failures = trial.timing_worker_failures;
+    report.timing_scheduler_failures = trial.timing_scheduler_failures;
+    report.timing_cancellations = trial.timing_cancellations;
+    report.timing_backstops = trial.timing_backstops;
     report.metrics = metrics;
     report.correctness_checked = trial.checked;
     report.correctness_mismatches = trial.mismatches;
@@ -932,6 +1088,26 @@ SchedulerBenchmarkReport make_report(const SchedulerBenchmarkConfig& config, Sha
     }
     if (!histogram_holds(metrics, report.histogram_saturated)) {
         add_reason(report.invalid_reasons, "histogram");
+    }
+    if (config.enable_completion_timing) {
+        if (trial.missing_pre_stamps != 0) {
+            add_reason(report.invalid_reasons, "missing_pre_publication_stamp");
+        }
+        if (trial.unrepresentable_timing != 0) {
+            add_reason(report.invalid_reasons, "timing_unrepresentable");
+        }
+        if (trial.negative_timing != 0) {
+            add_reason(report.invalid_reasons, "negative_timing_duration");
+        }
+        if (report.pre_publication_latency.sample_count != trial.succeeded ||
+            report.pre_publication_to_observation_delay.sample_count != trial.succeeded) {
+            add_reason(report.invalid_reasons, "timing_sample_count");
+        }
+        if (!std::isfinite(report.pre_publication_latency.mean_nanoseconds) ||
+            !std::isfinite(report.pre_publication_to_observation_delay.mean_nanoseconds) ||
+            !std::isfinite(report.generator_lag.mean_nanoseconds)) {
+            add_reason(report.invalid_reasons, "timing_summary");
+        }
     }
     if (config.enable_metrics) {
         if (!metrics.enabled || !metrics.finalized) {
@@ -1088,6 +1264,17 @@ plan_burst_arrivals(double high_requests_per_second, double low_requests_per_sec
     return result;
 }
 
+SchedulerBenchmarkLagSummary
+scheduler_benchmark_summarize_lag(std::span<const std::chrono::nanoseconds> lags) {
+    return summarize_lag(std::vector<std::chrono::nanoseconds>{lags.begin(), lags.end()});
+}
+
+SchedulerBenchmarkNanosecondSummary
+scheduler_benchmark_summarize_timing(std::span<const std::chrono::nanoseconds> samples) {
+    return summarize_nonnegative_nanos(
+        std::vector<std::chrono::nanoseconds>{samples.begin(), samples.end()});
+}
+
 SchedulerBenchmarkLag measure_generator_lag(std::chrono::steady_clock::time_point scheduled,
                                             std::chrono::steady_clock::time_point actual,
                                             std::chrono::nanoseconds tolerance) noexcept {
@@ -1167,6 +1354,10 @@ SchedulerBenchmarkRun run_scheduler_benchmark(const SchedulerBenchmarkConfig& co
     trial.inflight.reserve(config.max_outstanding);
     trial.latencies.reserve(static_cast<std::size_t>(
         std::min(config.max_offered, static_cast<std::uint64_t>(config.max_outstanding))));
+    if (config.enable_completion_timing) {
+        trial.pre_publication_latencies.reserve(static_cast<std::size_t>(config.max_offered));
+        trial.observation_delays.reserve(static_cast<std::size_t>(config.max_offered));
+    }
     const auto window_start = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point arrival_end = window_start;
     try {

@@ -17,7 +17,8 @@ std::string text_report(const SchedulerBenchmarkReport& report) {
     text += std::to_string(report.succeeded);
     text += "\nengine_run_count ";
     text += std::to_string(report.metrics.engine_run_count);
-    text += "\n";
+    text += "\ncompletion_timing ";
+    text += report.completion_timing_enabled ? "true\n" : "false\n";
     return text;
 }
 

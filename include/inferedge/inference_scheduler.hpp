@@ -39,6 +39,10 @@ struct SchedulerConfig {
     std::uint32_t max_batch_size{1};
     std::chrono::milliseconds max_batch_delay{0};
     bool enable_metrics{false};
+    // When true, each published completion carries one steady_clock time point
+    // taken immediately before promise::set_value. The default reads no clock
+    // on that path. This is not a post-publication timestamp.
+    bool enable_completion_timing{false};
 };
 
 enum class SchedulerErrorKind {
@@ -75,6 +79,11 @@ struct SchedulerCompletion {
     CompletionStatus status{CompletionStatus::kSchedulerFailed};
     InferenceError inference_error;
     std::vector<NamedTensor> outputs;
+    // Empty unless the scheduler was constructed with enable_completion_timing.
+    // The value is the steady_clock reading taken immediately before the
+    // set_value that stored this completion. It is not the future ready
+    // transition and it is not a reading taken after set_value returns.
+    std::optional<std::chrono::steady_clock::time_point> pre_publication_time;
 };
 
 enum class AdmissionStatus {

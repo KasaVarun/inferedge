@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,9 @@ struct SchedulerBenchmarkConfig {
     std::uint32_t max_batch_size{1};
     std::chrono::milliseconds max_batch_delay{0};
     bool enable_metrics{true};
+    // Off keeps schema 3. On records one pre-publication stamp per published
+    // completion and writes schema 4. It does not record a post-publication time.
+    bool enable_completion_timing{false};
     SchedulerWorkloadKind workload{SchedulerWorkloadKind::kOpenLoopConstant};
     double target_requests_per_second{0.0};
     double burst_high_requests_per_second{0.0};
@@ -152,6 +156,28 @@ struct SchedulerBenchmarkLagSummary {
     std::chrono::nanoseconds minimum{0};
     std::chrono::nanoseconds maximum{0};
     double mean_nanoseconds{0.0};
+    // Signed nearest-rank order statistics. Schema 3 JSON omits them.
+    // Schema 4 writes them. Early arrivals stay negative.
+    std::int64_t p50_nanoseconds{0};
+    std::int64_t p95_nanoseconds{0};
+    std::int64_t p99_nanoseconds{0};
+    bool percentiles_reported{false};
+    bool precise_tail{false};
+};
+
+// Successful timing samples, in nanoseconds. Percentiles use the same
+// nearest-rank index as summarize_latencies. This summary accepts only
+// non-negative samples; the caller rejects a negative duration first.
+struct SchedulerBenchmarkNanosecondSummary {
+    std::uint64_t sample_count{0};
+    std::chrono::nanoseconds minimum{0};
+    std::chrono::nanoseconds maximum{0};
+    double mean_nanoseconds{0.0};
+    std::int64_t p50_nanoseconds{0};
+    std::int64_t p95_nanoseconds{0};
+    std::int64_t p99_nanoseconds{0};
+    bool percentiles_reported{false};
+    bool precise_tail{false};
 };
 
 // Percentiles come from summarize_latencies. percentiles_reported is false
@@ -219,6 +245,9 @@ struct SchedulerBenchmarkReport {
     std::uint32_t max_batch_size{0};
     std::chrono::milliseconds max_batch_delay{0};
     bool enable_metrics{false};
+    bool completion_timing_enabled{false};
+    std::intmax_t steady_clock_period_num{0};
+    std::intmax_t steady_clock_period_den{1};
     std::uint64_t warmup_requests{0};
     bool warmup_uses_separate_scheduler{true};
     std::chrono::nanoseconds configured_duration{0};
@@ -245,6 +274,13 @@ struct SchedulerBenchmarkReport {
     std::uint64_t timeouts{0};
     SchedulerBenchmarkLagSummary generator_lag;
     SchedulerBenchmarkLatency latency;
+    SchedulerBenchmarkNanosecondSummary pre_publication_latency;
+    SchedulerBenchmarkNanosecondSummary pre_publication_to_observation_delay;
+    std::uint64_t timing_inference_failures{0};
+    std::uint64_t timing_worker_failures{0};
+    std::uint64_t timing_scheduler_failures{0};
+    std::uint64_t timing_cancellations{0};
+    std::uint64_t timing_backstops{0};
     std::string completion_observation;
     std::chrono::nanoseconds observation_quantum{0};
     SchedulerBenchmarkThroughput throughput;
@@ -278,6 +314,13 @@ struct SchedulerBenchmarkRun {
 plan_burst_arrivals(double high_requests_per_second, double low_requests_per_second,
                     std::chrono::nanoseconds high, std::chrono::nanoseconds low,
                     std::chrono::nanoseconds duration, std::uint64_t max_offered);
+
+// Signed nearest-rank lag summary. Does not reject a negative sample.
+[[nodiscard]] SchedulerBenchmarkLagSummary
+scheduler_benchmark_summarize_lag(std::span<const std::chrono::nanoseconds> lags);
+
+[[nodiscard]] SchedulerBenchmarkNanosecondSummary
+scheduler_benchmark_summarize_timing(std::span<const std::chrono::nanoseconds> samples);
 
 [[nodiscard]] SchedulerBenchmarkLag
 measure_generator_lag(std::chrono::steady_clock::time_point scheduled,

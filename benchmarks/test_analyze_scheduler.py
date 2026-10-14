@@ -12,6 +12,7 @@ from benchmarks.analyze_scheduler import (
     AnalyzerError,
     analyze,
     assert_fair_pair,
+    fairness_differences,
     fairness_record,
     reduce_group,
 )
@@ -21,7 +22,7 @@ from benchmarks.collect_scheduler import (
     build_parser,
     collect,
 )
-from benchmarks.test_collect_scheduler import COMMIT, World, sample_report
+from benchmarks.test_collect_scheduler import COMMIT, World, sample_report, schema4_report
 
 
 class ReductionTest(unittest.TestCase):
@@ -559,6 +560,103 @@ class Protocol2AggregateTest(unittest.TestCase):
         observation["completion_observation"] = "closed_loop_producer_wait"
         with self.assertRaises(AnalyzerError):
             assert_fair_pair(left, observation)
+
+
+class Protocol3AnalysisTest(unittest.TestCase):
+    def test_predeclared_metric_is_distinct_and_does_not_declare_a_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            world = World(pathlib.Path(temporary))
+            world.build()
+            args = build_parser().parse_args(
+                world.argv(
+                    cells="A,B",
+                    counted_runs="1",
+                    analysis_protocol="3",
+                    latency_metric="pre_publication",
+                    arrival_fidelity_p95_max_ns="1000",
+                    arrival_fidelity_max_lag_ns="1000",
+                )
+            )
+            run_set = collect(
+                args, runner=world.runner, sleep=lambda _seconds: None, blob_sha256=world.blob
+            )
+            document = analyze(run_set)
+        self.assertEqual(document["analysis_protocol_version"], 3)
+        self.assertEqual(document["source_schema_version"], 4)
+        self.assertEqual(document["publication_policy"], "pre_publication_timing")
+        self.assertEqual(document["latency_metric"], "pre_publication")
+        self.assertEqual(document["arrival_timing_fidelity"], "passed")
+        self.assertFalse(document["winner_declared"])
+        self.assertFalse(document["superiority_claimed"])
+        metrics = document["contrasts"][0]["metrics"]
+        self.assertIn("p50_pre_publication_latency", metrics)
+        self.assertIn("p50_e2e_latency", metrics)
+        self.assertNotEqual(
+            metrics["p50_pre_publication_latency"]["units"], metrics["p50_e2e_latency"]["units"]
+        )
+        delay = metrics["p50_pre_publication_to_observation_delay"]
+        self.assertFalse(delay["confidence_interval_computed"])
+        self.assertIn("set_value", delay["units"])
+        self.assertIn("phase_boundary_fidelity is unavailable", " ".join(document["limitations"]))
+        self.assertFalse(document["comparison_supported"])
+        self.assertFalse(document["instrumentation_overhead_calibrated"])
+
+    def test_p99_is_omitted_when_the_tail_is_not_precise(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            world = World(pathlib.Path(temporary))
+            world.build()
+            world.force_imprecise_tail = True
+            args = build_parser().parse_args(
+                world.argv(
+                    cells="A,B",
+                    counted_runs="1",
+                    analysis_protocol="3",
+                    latency_metric="producer_observed",
+                    arrival_fidelity_p95_max_ns="1000",
+                    arrival_fidelity_max_lag_ns="1000",
+                )
+            )
+            run_set = collect(
+                args, runner=world.runner, sleep=lambda _seconds: None, blob_sha256=world.blob
+            )
+            document = analyze(run_set)
+        reason = document["contrasts"][0]["metrics"]["p99_pre_publication_latency"][
+            "p99_omitted_reason"
+        ]
+        self.assertIn("precise_tail", reason)
+        self.assertFalse(document["winner_declared"])
+
+    def test_clock_period_mismatch_is_not_a_fair_pair(self) -> None:
+        environment = {
+            "queried": {
+                "git_commit": COMMIT,
+                "benchmark_binary_sha256": "a" * 64,
+                "onnxruntime_resolved_library": "/ort/libonnxruntime.so.1.31.0",
+            },
+            "verified_configuration": {"model_sha256": "b" * 64, "sanitizer_instrumentation": "absent"},
+            "collection_protocol": {
+                "workload_family": "open_loop",
+                "environment_variable": "ORT_DISABLE_TELEMETRY=1",
+                "analysis_protocol_version": 3,
+                "latency_metric": "pre_publication",
+                "arrival_fidelity_p95_max_nanoseconds": 1000,
+                "arrival_fidelity_max_lag_nanoseconds": 1000,
+                "measurement": {
+                    "duration_ms": 1000,
+                    "max_offered": 100,
+                    "max_outstanding": 64,
+                    "lag_tolerance_ms": 1000,
+                    "completion_timeout_ms": 5000,
+                },
+            },
+        }
+        left = fairness_record(environment, schema4_report(), {"workload_id": "low_open"})
+        other = schema4_report()
+        other["steady_clock_period_denominator"] = 1000
+        right = fairness_record(environment, other, {"workload_id": "low_open"})
+        self.assertIn("steady_clock_period_denominator", fairness_differences(left, right))
+        self.assertEqual(left["enable_completion_timing"], True)
+        self.assertEqual(left["latency_metric"], "pre_publication")
 
 
 if __name__ == "__main__":
