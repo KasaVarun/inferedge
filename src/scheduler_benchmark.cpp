@@ -1,12 +1,18 @@
 #include "inferedge/scheduler_benchmark.hpp"
 
+#include "inferedge/neural_reference.hpp"
+
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <condition_variable>
+#include <fstream>
 #include <future>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -48,16 +54,28 @@ struct JoinThreads {
     }
 };
 
+struct PreparedModel {
+    SchedulerBenchmarkModelId id{SchedulerBenchmarkModelId::kBatchAddF32};
+    bool neural{false};
+    NeuralWorkload workload{NeuralWorkload::kMlpSmall};
+    std::vector<float> weights;
+    std::filesystem::path weights_path;
+    std::string model_digest;
+    std::string weights_digest;
+};
+
 struct Inflight {
     std::uint64_t attempt_id{0};
     std::chrono::steady_clock::time_point scheduled{};
     std::chrono::steady_clock::time_point submit_start{};
     float expected_c0{0.F};
     float expected_c1{0.F};
+    std::vector<NamedTensor> inputs;
     std::future<SchedulerCompletion> completion;
 };
 
 struct SharedTrial {
+    std::shared_ptr<const PreparedModel> model;
     std::mutex mutex;
     std::condition_variable ready;
     std::vector<Inflight> inflight;
@@ -98,6 +116,7 @@ struct SharedTrial {
     std::uint64_t unchecked_attempt{0};
     float unchecked_c0{0.F};
     float unchecked_c1{0.F};
+    std::vector<NamedTensor> unchecked_inputs;
     std::vector<NamedTensor> unchecked_outputs;
     bool generators_done{false};
     bool shutdown_done{false};
@@ -262,16 +281,28 @@ void remember_error(SharedTrial& trial, std::uint64_t attempt_id, std::string ki
         SchedulerBenchmarkErrorRecord{attempt_id, std::move(kind), std::move(message)});
 }
 
-bool outputs_match(const SchedulerCompletion& completion, float expected_c0, float expected_c1) {
+SchedulerBenchmarkOutputCheck match_completion(const PreparedModel& model, const Inflight& item,
+                                               const SchedulerCompletion& completion) {
+    SchedulerBenchmarkOutputCheck failed;
     if (completion.outputs.size() != 1) {
-        return false;
+        failed.message = "output count is not 1";
+        return failed;
     }
-    const NamedTensor& output = completion.outputs.front();
-    if (output.name != "C" || output.shape.size() != 2 || output.shape[0] != 1 ||
-        output.shape[1] != 2 || output.values.size() != 2) {
-        return false;
+    if (!model.neural) {
+        const float expected[] = {item.expected_c0, item.expected_c1};
+        return scheduler_benchmark_check_output(model.id, completion.outputs.front(), expected);
     }
-    return output.values[0] == expected_c0 && output.values[1] == expected_c1;
+    if (item.inputs.size() != 1 || item.inputs.front().values.empty()) {
+        failed.message = "neural request did not keep its input row";
+        return failed;
+    }
+    const NeuralReferenceResult reference =
+        evaluate_neural_reference(model.workload, item.inputs.front().values, 1, model.weights);
+    if (reference.error.kind != NeuralReferenceErrorKind::kNone) {
+        failed.message = reference.error.message;
+        return failed;
+    }
+    return scheduler_benchmark_check_output(model.id, completion.outputs.front(), reference.values);
 }
 
 void note_terminal(SharedTrial& trial, CompletionStatus status) {
@@ -296,7 +327,8 @@ void note_terminal(SharedTrial& trial, CompletionStatus status) {
 
 void record_success_sample(SharedTrial& trial, const SchedulerBenchmarkConfig& config,
                            const Inflight& item, std::chrono::nanoseconds latency,
-                           const SchedulerCompletion& completion, bool is_last) {
+                           const SchedulerCompletion& completion, bool is_last,
+                           const std::optional<SchedulerBenchmarkOutputCheck>& prechecked) {
     trial.latencies.push_back(latency);
     const std::uint64_t index = trial.succeeded;
     const bool due = scheduler_benchmark_should_check(index, config.check_interval, is_last) ||
@@ -306,6 +338,7 @@ void record_success_sample(SharedTrial& trial, const SchedulerBenchmarkConfig& c
         trial.unchecked_attempt = item.attempt_id;
         trial.unchecked_c0 = item.expected_c0;
         trial.unchecked_c1 = item.expected_c1;
+        trial.unchecked_inputs = item.inputs;
         trial.unchecked_outputs = completion.outputs;
         return;
     }
@@ -317,24 +350,33 @@ void record_success_sample(SharedTrial& trial, const SchedulerBenchmarkConfig& c
         remember_error(trial, item.attempt_id, "correctness", "injected check failure");
         return;
     }
-    if (!outputs_match(completion, item.expected_c0, item.expected_c1)) {
+    if (!prechecked.has_value()) {
         ++trial.mismatches;
-        remember_error(trial, item.attempt_id, "correctness", "output C did not match the attempt");
+        remember_error(trial, item.attempt_id, "correctness", "completion was not checked");
+        return;
+    }
+    if (!prechecked->matched) {
+        ++trial.mismatches;
+        remember_error(trial, item.attempt_id, "correctness",
+                       prechecked->message.empty() ? "output did not match the attempt"
+                                                   : prechecked->message);
     }
 }
 
-bool take_rejection(SharedTrial& trial, Admission& admission, std::uint64_t attempt_id) {
+bool take_rejection(SharedTrial& trial, Admission& admission, std::uint64_t attempt_id,
+                    const std::vector<NamedTensor>& submitted) {
     ++trial.attempts;
     if (!admission.inputs.has_value() || admission.completion.has_value()) {
         remember_error(trial, attempt_id, "admission_ownership",
                        "rejection did not return input ownership");
         return false;
     }
-    const std::vector<NamedTensor>& inputs = *admission.inputs;
-    if (inputs.size() != 2 || inputs[0].name != "A" || inputs[1].name != "B" ||
-        inputs[0].values.size() != 2 || inputs[1].values.size() != 2) {
+    const SchedulerBenchmarkOutputCheck owned =
+        scheduler_benchmark_check_returned_inputs(*admission.inputs, submitted);
+    if (!owned.matched) {
         remember_error(trial, attempt_id, "admission_ownership",
-                       "returned inputs did not match the attempt");
+                       owned.message.empty() ? "returned inputs did not match the attempt"
+                                             : owned.message);
         return false;
     }
     if (admission.status == AdmissionStatus::kRejectedFull) {
@@ -367,7 +409,7 @@ void account_admission(SharedTrial& trial, Admission admission, Inflight item) {
         take_acceptance(trial, admission, std::move(item));
         return;
     }
-    take_rejection(trial, admission, item.attempt_id);
+    take_rejection(trial, admission, item.attempt_id, item.inputs);
 }
 
 std::chrono::steady_clock::time_point
@@ -420,10 +462,12 @@ void run_open_loop_generator(InferenceScheduler& scheduler, const SchedulerBench
                 continue;
             }
             const std::uint64_t attempt_id = static_cast<std::uint64_t>(index) + 1;
-            SchedulerBenchmarkTensors tensors = scheduler_benchmark_request(attempt_id);
+            SchedulerBenchmarkTensors tensors =
+                scheduler_benchmark_request(config.model_id, attempt_id);
             Inflight item;
             item.attempt_id = attempt_id;
             item.scheduled = scheduled;
+            item.inputs = tensors.inputs;
             item.expected_c0 = tensors.expected_c0;
             item.expected_c1 = tensors.expected_c1;
             item.submit_start = std::chrono::steady_clock::now();
@@ -484,6 +528,23 @@ void record_observed(SharedTrial& trial, const SchedulerBenchmarkConfig& config,
         remember_error(trial, item.attempt_id, "completion_exception", exception.what());
         return;
     }
+    // The observation stamp is already fixed. Neural reference work happens
+    // here, on the collector or closed-loop producer, after that stamp and
+    // outside the trial mutex. It can delay later observations and the next
+    // closed-loop submit. It is not engine-run time and it is not zero cost.
+    std::optional<SchedulerBenchmarkOutputCheck> prechecked;
+    if (completion.status == CompletionStatus::kSucceeded) {
+        try {
+            if (!trial.model) {
+                prechecked =
+                    SchedulerBenchmarkOutputCheck{false, "model identity was not prepared"};
+            } else {
+                prechecked = match_completion(*trial.model, item, completion);
+            }
+        } catch (const std::exception& exception) {
+            prechecked = SchedulerBenchmarkOutputCheck{false, exception.what()};
+        }
+    }
     std::lock_guard<std::mutex> lock(trial.mutex);
     if (observed < item.submit_start) {
         ++trial.failed_scheduler;
@@ -496,7 +557,8 @@ void record_observed(SharedTrial& trial, const SchedulerBenchmarkConfig& config,
     }
     note_terminal(trial, completion.status);
     if (completion.status == CompletionStatus::kSucceeded) {
-        record_success_sample(trial, config, item, observed - item.submit_start, completion, false);
+        record_success_sample(trial, config, item, observed - item.submit_start, completion, false,
+                              prechecked);
     }
     if (!config.enable_completion_timing) {
         return;
@@ -697,14 +759,19 @@ void run_closed_producer(InferenceScheduler& scheduler, const SchedulerBenchmark
             if (config.test_submit_delay.count() > 0) {
                 std::this_thread::sleep_for(config.test_submit_delay);
             }
-            SchedulerBenchmarkTensors tensors = scheduler_benchmark_request(attempt_id);
+            SchedulerBenchmarkTensors tensors =
+                scheduler_benchmark_request(config.model_id, attempt_id);
             const auto submit_start = std::chrono::steady_clock::now();
+            Inflight item;
+            item.attempt_id = attempt_id;
+            item.inputs = tensors.inputs;
+            item.expected_c0 = tensors.expected_c0;
+            item.expected_c1 = tensors.expected_c1;
+            item.submit_start = submit_start;
             Admission admission = scheduler.submit(std::move(tensors.inputs));
             if (admission.status != AdmissionStatus::kAccepted) {
                 std::lock_guard<std::mutex> lock(trial.mutex);
-                Inflight ignored;
-                ignored.attempt_id = attempt_id;
-                account_admission(trial, std::move(admission), std::move(ignored));
+                account_admission(trial, std::move(admission), std::move(item));
                 if (trial.outstanding > 0) {
                     --trial.outstanding;
                 }
@@ -737,11 +804,6 @@ void run_closed_producer(InferenceScheduler& scheduler, const SchedulerBenchmark
                     --trial.outstanding;
                 }
             } else {
-                Inflight item;
-                item.attempt_id = attempt_id;
-                item.submit_start = submit_start;
-                item.expected_c0 = tensors.expected_c0;
-                item.expected_c1 = tensors.expected_c1;
                 item.completion = std::move(*admission.completion);
                 {
                     std::lock_guard<std::mutex> lock(trial.mutex);
@@ -896,16 +958,29 @@ void check_last_success(SharedTrial& trial, const SchedulerBenchmarkConfig& conf
         return;
     }
     ++trial.checked;
-    if (!outputs_match(SchedulerCompletion{trial.unchecked_attempt,
-                                           0,
-                                           CompletionStatus::kSucceeded,
-                                           {},
-                                           trial.unchecked_outputs,
-                                           std::nullopt},
-                       trial.unchecked_c0, trial.unchecked_c1)) {
+    Inflight item;
+    item.attempt_id = trial.unchecked_attempt;
+    item.expected_c0 = trial.unchecked_c0;
+    item.expected_c1 = trial.unchecked_c1;
+    item.inputs = trial.unchecked_inputs;
+    SchedulerCompletion completion;
+    completion.status = CompletionStatus::kSucceeded;
+    completion.outputs = trial.unchecked_outputs;
+    SchedulerBenchmarkOutputCheck checked;
+    try {
+        if (!trial.model) {
+            checked.message = "model identity was not prepared";
+        } else {
+            checked = match_completion(*trial.model, item, completion);
+        }
+    } catch (const std::exception& exception) {
+        checked.message = exception.what();
+    }
+    if (!checked.matched) {
         ++trial.mismatches;
         remember_error(trial, trial.unchecked_attempt, "correctness",
-                       "output C did not match the attempt");
+                       checked.message.empty() ? "output did not match the attempt"
+                                               : checked.message);
     }
     (void)config;
 }
@@ -1057,10 +1132,15 @@ SchedulerBenchmarkReport make_report(const SchedulerBenchmarkConfig& config, Sha
         trial.attempts * 2 <= trial.scheduled) {
         add_reason(report.invalid_reasons, "outstanding_cap_suppressed_schedule");
     }
+    bool saw_request_identity = false;
+    bool saw_admission_ownership = false;
     for (const SchedulerBenchmarkErrorRecord& error : report.errors) {
-        if (error.kind == "request_identity") {
+        if (!saw_request_identity && error.kind == "request_identity") {
             add_reason(report.invalid_reasons, "missing_request_identity");
-            break;
+            saw_request_identity = true;
+        } else if (!saw_admission_ownership && error.kind == "admission_ownership") {
+            add_reason(report.invalid_reasons, "admission_ownership");
+            saw_admission_ownership = true;
         }
     }
     if (arrival_window.count() <= 0 || report.total_trial.count() <= 0) {
@@ -1146,7 +1226,7 @@ SchedulerBenchmarkRun warmup(const SchedulerBenchmarkConfig& config) {
         return fail_run(SchedulerBenchmarkErrorKind::kRuntime, started.message);
     }
     for (std::uint64_t index = 0; index < config.warmup_requests; ++index) {
-        SchedulerBenchmarkTensors tensors = scheduler_benchmark_request(index + 1);
+        SchedulerBenchmarkTensors tensors = scheduler_benchmark_request(config.model_id, index + 1);
         Admission admission = scheduler.submit(std::move(tensors.inputs));
         if (admission.status != AdmissionStatus::kAccepted || !admission.completion.has_value()) {
             (void)scheduler.shutdown(ShutdownPolicy::kDrain);
@@ -1177,12 +1257,15 @@ void submit_after_shutdown(InferenceScheduler& scheduler, SharedTrial& trial,
     if (!config.test_submit_after_shutdown) {
         return;
     }
-    SchedulerBenchmarkTensors tensors = scheduler_benchmark_request(1);
+    SchedulerBenchmarkTensors tensors = scheduler_benchmark_request(config.model_id, 1);
+    Inflight item;
+    item.attempt_id = 1;
+    item.inputs = tensors.inputs;
+    item.expected_c0 = tensors.expected_c0;
+    item.expected_c1 = tensors.expected_c1;
     Admission admission = scheduler.submit(std::move(tensors.inputs));
     std::lock_guard<std::mutex> lock(trial.mutex);
     ++trial.scheduled;
-    Inflight item;
-    item.attempt_id = 1;
     account_admission(trial, std::move(admission), std::move(item));
 }
 
@@ -1195,6 +1278,368 @@ SchedulerBenchmarkRun fail_from_start(const SchedulerError& started) {
         return fail_run(SchedulerBenchmarkErrorKind::kInvalidConfig, started.message);
     }
     return fail_run(SchedulerBenchmarkErrorKind::kRuntime, started.message);
+}
+
+constexpr std::uint32_t kSha256K[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+};
+
+constexpr char kAddOnnxSha256[] =
+    "f33bbe0ad5420419dd2dbb5322f4172e213b854f1124c660b1d732e8f8ce3b23";
+constexpr char kSmallOnnxSha256[] =
+    "bcf02cac789c65cb12785ccfd175827cb21f89574ef298af009b74d7131df1bd";
+constexpr char kMediumOnnxSha256[] =
+    "8d43a97b8d44d3d1f601570c8b09b08c90dda4977e6f8b7123eea8c0455024dd";
+constexpr char kGemmOnnxSha256[] =
+    "a6203020b870eb04f9fd8e836cf4ccd930a57156a026d2a50163121d83debf32";
+constexpr char kSmallWeightsSha256[] =
+    "b6335064c4e2c89add3ed54452e27dacf3ea7d485be6adbdd24fae1e2e5f1899";
+constexpr char kMediumWeightsSha256[] =
+    "d3dd2f6148a6684288d4f25b0c426eefde7227468be9120ddd08cd99cbb9059e";
+constexpr char kGemmWeightsSha256[] =
+    "a335c8b12defcb885f8bada9ef1092655d024d5586fe011a9336ad2d472f82b6";
+
+struct ModelPin {
+    const char* input_name;
+    const char* output_name;
+    std::size_t input_width;
+    std::size_t output_width;
+    const char* onnx_sha256;
+    const char* weights_file;
+    const char* weights_sha256;
+    bool neural;
+    NeuralWorkload workload;
+};
+
+ModelPin pin_for(SchedulerBenchmarkModelId id) {
+    switch (id) {
+    case SchedulerBenchmarkModelId::kMlpSmallF32:
+        return {"features",
+                "logits",
+                32,
+                8,
+                kSmallOnnxSha256,
+                "mlp_small_f32.weights",
+                kSmallWeightsSha256,
+                true,
+                NeuralWorkload::kMlpSmall};
+    case SchedulerBenchmarkModelId::kMlpMediumF32:
+        return {"features",
+                "logits",
+                256,
+                16,
+                kMediumOnnxSha256,
+                "mlp_medium_f32.weights",
+                kMediumWeightsSha256,
+                true,
+                NeuralWorkload::kMlpMedium};
+    case SchedulerBenchmarkModelId::kGemmF32:
+        return {"features",
+                "product",
+                512,
+                512,
+                kGemmOnnxSha256,
+                "gemm_f32.weights",
+                kGemmWeightsSha256,
+                true,
+                NeuralWorkload::kGemm};
+    case SchedulerBenchmarkModelId::kBatchAddF32:
+        break;
+    }
+    return {"A", "C", 2, 2, kAddOnnxSha256, nullptr, nullptr, false, NeuralWorkload::kMlpSmall};
+}
+
+std::uint32_t rotate_right(std::uint32_t value, std::uint32_t bits) noexcept {
+    return (value >> bits) | (value << (32U - bits));
+}
+
+struct Sha256State {
+    std::uint32_t h[8]{0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
+                       0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U};
+    std::uint64_t bits{0};
+    std::uint8_t block[64]{};
+    std::size_t filled{0};
+    bool overflow{false};
+};
+
+void transform_block(Sha256State& state, const std::uint8_t block[64]) {
+    std::uint32_t words[64];
+    for (int index = 0; index < 16; ++index) {
+        const std::size_t offset = static_cast<std::size_t>(index) * 4U;
+        words[index] = (std::uint32_t{block[offset]} << 24U) |
+                       (std::uint32_t{block[offset + 1]} << 16U) |
+                       (std::uint32_t{block[offset + 2]} << 8U) | std::uint32_t{block[offset + 3]};
+    }
+    for (int index = 16; index < 64; ++index) {
+        const std::uint32_t small = rotate_right(words[index - 15], 7) ^
+                                    rotate_right(words[index - 15], 18) ^ (words[index - 15] >> 3U);
+        const std::uint32_t large = rotate_right(words[index - 2], 17) ^
+                                    rotate_right(words[index - 2], 19) ^ (words[index - 2] >> 10U);
+        words[index] = words[index - 16] + small + words[index - 7] + large;
+    }
+    std::uint32_t a = state.h[0];
+    std::uint32_t b = state.h[1];
+    std::uint32_t c = state.h[2];
+    std::uint32_t d = state.h[3];
+    std::uint32_t e = state.h[4];
+    std::uint32_t f = state.h[5];
+    std::uint32_t g = state.h[6];
+    std::uint32_t h = state.h[7];
+    for (int index = 0; index < 64; ++index) {
+        const std::uint32_t sum1 = rotate_right(e, 6) ^ rotate_right(e, 11) ^ rotate_right(e, 25);
+        const std::uint32_t choose = (e & f) ^ ((~e) & g);
+        const std::uint32_t temp1 = h + sum1 + choose + kSha256K[index] + words[index];
+        const std::uint32_t sum0 = rotate_right(a, 2) ^ rotate_right(a, 13) ^ rotate_right(a, 22);
+        const std::uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+        const std::uint32_t temp2 = sum0 + majority;
+        h = g;
+        g = f;
+        f = e;
+        e = d + temp1;
+        d = c;
+        c = b;
+        b = a;
+        a = temp1 + temp2;
+    }
+    state.h[0] += a;
+    state.h[1] += b;
+    state.h[2] += c;
+    state.h[3] += d;
+    state.h[4] += e;
+    state.h[5] += f;
+    state.h[6] += g;
+    state.h[7] += h;
+}
+
+bool absorb(Sha256State& state, const std::uint8_t* data, std::size_t length) {
+    for (std::size_t index = 0; index < length; ++index) {
+        state.block[state.filled++] = data[index];
+        if (state.filled != 64) {
+            continue;
+        }
+        if (state.bits > std::numeric_limits<std::uint64_t>::max() - 512U) {
+            state.overflow = true;
+            return false;
+        }
+        transform_block(state, state.block);
+        state.bits += 512U;
+        state.filled = 0;
+    }
+    return !state.overflow;
+}
+
+bool finish_sha256(Sha256State& state, std::uint8_t out[32]) {
+    if (state.overflow) {
+        return false;
+    }
+    const std::uint64_t total_bits = state.bits + static_cast<std::uint64_t>(state.filled) * 8U;
+    if (state.filled > 64) {
+        return false;
+    }
+    state.block[state.filled++] = 0x80U;
+    if (state.filled > 56) {
+        while (state.filled < 64) {
+            state.block[state.filled++] = 0;
+        }
+        transform_block(state, state.block);
+        state.filled = 0;
+    }
+    while (state.filled < 56) {
+        state.block[state.filled++] = 0;
+    }
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        state.block[state.filled++] = static_cast<std::uint8_t>(total_bits >> shift);
+    }
+    transform_block(state, state.block);
+    for (int word = 0; word < 8; ++word) {
+        const std::uint32_t value = state.h[word];
+        out[word * 4] = static_cast<std::uint8_t>(value >> 24U);
+        out[word * 4 + 1] = static_cast<std::uint8_t>(value >> 16U);
+        out[word * 4 + 2] = static_cast<std::uint8_t>(value >> 8U);
+        out[word * 4 + 3] = static_cast<std::uint8_t>(value);
+    }
+    return true;
+}
+
+std::string hex_digest(const std::uint8_t bytes[32]) {
+    constexpr char kHex[] = "0123456789abcdef";
+    std::string hex(64, '0');
+    for (int index = 0; index < 32; ++index) {
+        hex[static_cast<std::size_t>(index) * 2U] = kHex[bytes[index] >> 4U];
+        hex[static_cast<std::size_t>(index) * 2U + 1U] = kHex[bytes[index] & 0x0fU];
+    }
+    return hex;
+}
+
+SchedulerBenchmarkDigest hash_regular_file(const std::filesystem::path& path) {
+    SchedulerBenchmarkDigest digest;
+    std::error_code status_error;
+    const std::filesystem::file_status status = std::filesystem::symlink_status(path, status_error);
+    if (status_error) {
+        digest.message = status_error == std::errc::no_such_file_or_directory
+                             ? "file is missing"
+                             : "file status could not be read";
+        return digest;
+    }
+    if (status.type() == std::filesystem::file_type::not_found) {
+        digest.message = "file is missing";
+        return digest;
+    }
+    if (status.type() != std::filesystem::file_type::regular) {
+        digest.message = "file is not a regular file";
+        return digest;
+    }
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        digest.message = "file could not be opened";
+        return digest;
+    }
+    Sha256State state;
+    std::array<char, 8192> buffer{};
+    while (true) {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const std::streamsize count = input.gcount();
+        if (count > 0) {
+            if (!absorb(state, reinterpret_cast<const std::uint8_t*>(buffer.data()),
+                        static_cast<std::size_t>(count))) {
+                digest.message = "file length exceeds SHA-256";
+                return digest;
+            }
+        }
+        if (input.eof()) {
+            break;
+        }
+        if (!input) {
+            digest.message = "file could not be read";
+            return digest;
+        }
+    }
+    std::uint8_t raw[32];
+    if (!finish_sha256(state, raw)) {
+        digest.message = "file length exceeds SHA-256";
+        return digest;
+    }
+    digest.ok = true;
+    digest.hex = hex_digest(raw);
+    return digest;
+}
+
+bool static_batch_row(const TensorMetadata& metadata, std::int64_t width) {
+    return metadata.element_type == ElementType::kFloat32 && metadata.dimensions.size() == 2 &&
+           metadata.dimensions[0] < 0 && metadata.dimensions[1] == width;
+}
+
+std::string metadata_matches(const InferenceEngine& engine, const ModelPin& pin,
+                             SchedulerBenchmarkModelId id) {
+    const std::vector<TensorMetadata>& inputs = engine.inputs();
+    const std::vector<TensorMetadata>& outputs = engine.outputs();
+    if (!pin.neural) {
+        if (inputs.size() != 2 || outputs.size() != 1 || inputs[0].name != "A" ||
+            inputs[1].name != "B" || outputs[0].name != "C" || !static_batch_row(inputs[0], 2) ||
+            !static_batch_row(inputs[1], 2) || !static_batch_row(outputs[0], 2)) {
+            return "model metadata does not match batch_add_f32";
+        }
+        return {};
+    }
+    if (inputs.size() != 1 || outputs.size() != 1 || inputs[0].name != pin.input_name ||
+        outputs[0].name != pin.output_name ||
+        !static_batch_row(inputs[0], static_cast<std::int64_t>(pin.input_width)) ||
+        !static_batch_row(outputs[0], static_cast<std::int64_t>(pin.output_width))) {
+        return std::string{"model metadata does not match "} +
+               (id == SchedulerBenchmarkModelId::kMlpSmallF32    ? "mlp_small_f32"
+                : id == SchedulerBenchmarkModelId::kMlpMediumF32 ? "mlp_medium_f32"
+                                                                 : "gemm_f32");
+    }
+    return {};
+}
+
+struct PrepareResult {
+    std::string error;
+    std::shared_ptr<PreparedModel> model;
+};
+
+PrepareResult prepare_model(const SchedulerBenchmarkConfig& config) {
+    PrepareResult result;
+    const ModelPin pin = pin_for(config.model_id);
+    const SchedulerBenchmarkDigest model_digest = hash_regular_file(config.model_path);
+    if (!model_digest.ok) {
+        result.error = "model " + model_digest.message;
+        return result;
+    }
+    if (model_digest.hex != pin.onnx_sha256) {
+        result.error = "model SHA-256 mismatch for the selected model id";
+        return result;
+    }
+    EngineLoad loaded = load_inference_engine(config.model_path);
+    if (loaded.error.kind != InferenceErrorKind::kNone || !loaded.engine) {
+        result.error = loaded.error.message.empty() ? "model metadata could not be loaded"
+                                                    : loaded.error.message;
+        return result;
+    }
+    const std::string metadata = metadata_matches(*loaded.engine, pin, config.model_id);
+    loaded.engine.reset();
+    if (!metadata.empty()) {
+        result.error = metadata;
+        return result;
+    }
+    auto prepared = std::make_shared<PreparedModel>();
+    prepared->id = config.model_id;
+    prepared->neural = pin.neural;
+    prepared->workload = pin.workload;
+    prepared->model_digest = model_digest.hex;
+    if (pin.neural) {
+        prepared->weights_path =
+            std::filesystem::path{config.model_path}.parent_path() / "fixtures" / pin.weights_file;
+        const SchedulerBenchmarkDigest weights_digest = hash_regular_file(prepared->weights_path);
+        if (!weights_digest.ok) {
+            result.error = "weight sidecar " + weights_digest.message;
+            return result;
+        }
+        if (weights_digest.hex != pin.weights_sha256) {
+            result.error = "weight sidecar SHA-256 mismatch for the selected model id";
+            return result;
+        }
+        const NeuralContract contract = neural_contract(pin.workload);
+        const NeuralFloatFile weights =
+            load_float32_file(prepared->weights_path, contract.parameter_count);
+        if (weights.error.kind != NeuralReferenceErrorKind::kNone) {
+            result.error = weights.error.message.empty() ? "weight sidecar could not be loaded"
+                                                         : weights.error.message;
+            return result;
+        }
+        prepared->weights = std::move(weights.values);
+        prepared->weights_digest = weights_digest.hex;
+    }
+    result.model = std::move(prepared);
+    return result;
+}
+
+std::string recheck_identity(const PreparedModel& model, const SchedulerBenchmarkConfig& config) {
+    const SchedulerBenchmarkDigest model_digest = hash_regular_file(config.model_path);
+    if (!model_digest.ok) {
+        return "model " + model_digest.message;
+    }
+    if (model_digest.hex != model.model_digest) {
+        return "model bytes changed before measured execution";
+    }
+    if (!model.neural) {
+        return {};
+    }
+    const SchedulerBenchmarkDigest weights_digest = hash_regular_file(model.weights_path);
+    if (!weights_digest.ok) {
+        return "weight sidecar " + weights_digest.message;
+    }
+    if (weights_digest.hex != model.weights_digest) {
+        return "weight sidecar bytes changed before measured execution";
+    }
+    return {};
 }
 
 } // namespace
@@ -1284,16 +1729,112 @@ SchedulerBenchmarkLag measure_generator_lag(std::chrono::steady_clock::time_poin
     return measured;
 }
 
-SchedulerBenchmarkTensors scheduler_benchmark_request(std::uint64_t attempt_id) {
-    const float a0 = static_cast<float>(attempt_id % 1000U);
-    const float a1 = static_cast<float>((attempt_id / 1000U) % 1000U);
-    constexpr float b0 = 1.F;
-    constexpr float b1 = 2.F;
+SchedulerBenchmarkDigest scheduler_benchmark_sha256_file(const std::filesystem::path& path) {
+    return hash_regular_file(path);
+}
+
+SchedulerBenchmarkTensors scheduler_benchmark_request(SchedulerBenchmarkModelId model,
+                                                      std::uint64_t attempt_id) {
+    const ModelPin pin = pin_for(model);
     SchedulerBenchmarkTensors tensors;
-    tensors.inputs = {NamedTensor{"A", {1, 2}, {a0, a1}}, NamedTensor{"B", {1, 2}, {b0, b1}}};
-    tensors.expected_c0 = a0 + b0;
-    tensors.expected_c1 = a1 + b1;
+    if (!pin.neural) {
+        const float a0 = static_cast<float>(attempt_id % 1000U);
+        const float a1 = static_cast<float>((attempt_id / 1000U) % 1000U);
+        constexpr float b0 = 1.F;
+        constexpr float b1 = 2.F;
+        tensors.inputs = {NamedTensor{"A", {1, 2}, {a0, a1}}, NamedTensor{"B", {1, 2}, {b0, b1}}};
+        tensors.expected_c0 = a0 + b0;
+        tensors.expected_c1 = a1 + b1;
+        return tensors;
+    }
+    std::vector<float> values(pin.input_width);
+    for (std::size_t index = 0; index < pin.input_width; ++index) {
+        const std::uint32_t code =
+            static_cast<std::uint32_t>(attempt_id % 251U) + static_cast<std::uint32_t>(index);
+        values[index] = static_cast<float>(code) * 0x1p-10F;
+    }
+    tensors.inputs = {NamedTensor{
+        pin.input_name, {1, static_cast<std::int64_t>(pin.input_width)}, std::move(values)}};
     return tensors;
+}
+
+SchedulerBenchmarkTensors scheduler_benchmark_request(std::uint64_t attempt_id) {
+    return scheduler_benchmark_request(SchedulerBenchmarkModelId::kBatchAddF32, attempt_id);
+}
+
+SchedulerBenchmarkOutputCheck scheduler_benchmark_check_output(SchedulerBenchmarkModelId model,
+                                                               const NamedTensor& output,
+                                                               std::span<const float> reference) {
+    const ModelPin pin = pin_for(model);
+    SchedulerBenchmarkOutputCheck checked;
+    if (output.name != pin.output_name) {
+        checked.message = "output name mismatch";
+        return checked;
+    }
+    if (output.shape.size() != 2 || output.shape[0] != 1 ||
+        output.shape[1] != static_cast<std::int64_t>(pin.output_width) ||
+        output.values.size() != pin.output_width) {
+        checked.message = "output shape mismatch";
+        return checked;
+    }
+    if (reference.size() != pin.output_width) {
+        checked.message = "reference width mismatch";
+        return checked;
+    }
+    if (!pin.neural) {
+        if (output.values[0] != reference[0] || output.values[1] != reference[1]) {
+            checked.message = "output C did not match the attempt";
+            return checked;
+        }
+        checked.matched = true;
+        return checked;
+    }
+    for (const float value : output.values) {
+        if (!std::isfinite(value)) {
+            checked.message = "output is not finite";
+            return checked;
+        }
+    }
+    for (const float value : reference) {
+        if (!std::isfinite(value)) {
+            checked.message = "reference is not finite";
+            return checked;
+        }
+    }
+    const NeuralMismatch mismatch = neural_worst_mismatch(pin.workload, output.values, reference);
+    if (!mismatch.within) {
+        checked.message = "output exceeded the neural tolerance";
+        return checked;
+    }
+    checked.matched = true;
+    return checked;
+}
+
+SchedulerBenchmarkOutputCheck
+scheduler_benchmark_check_returned_inputs(std::span<const NamedTensor> returned,
+                                          std::span<const NamedTensor> submitted) {
+    SchedulerBenchmarkOutputCheck checked;
+    if (returned.size() != submitted.size()) {
+        checked.message = "returned input count mismatch";
+        return checked;
+    }
+    for (std::size_t index = 0; index < returned.size(); ++index) {
+        if (returned[index].name != submitted[index].name) {
+            checked.message = "returned input name mismatch";
+            return checked;
+        }
+        if (returned[index].shape != submitted[index].shape ||
+            returned[index].values.size() != submitted[index].values.size()) {
+            checked.message = "returned input shape mismatch";
+            return checked;
+        }
+        if (returned[index].values != submitted[index].values) {
+            checked.message = "returned input value mismatch";
+            return checked;
+        }
+    }
+    checked.matched = true;
+    return checked;
 }
 
 bool scheduler_benchmark_should_check(std::uint64_t one_based_index, std::uint32_t check_interval,
@@ -1339,9 +1880,25 @@ SchedulerBenchmarkRun run_scheduler_benchmark(const SchedulerBenchmarkConfig& co
         planned.error != SchedulerBenchmarkPlanError::kNone) {
         return fail_run(SchedulerBenchmarkErrorKind::kInvalidConfig, "arrival plan was rejected");
     }
+    PrepareResult prepared;
+    try {
+        prepared = prepare_model(config);
+    } catch (const std::bad_alloc&) {
+        return fail_run(SchedulerBenchmarkErrorKind::kRuntime, "allocation failed");
+    } catch (const std::exception& exception) {
+        return fail_run(SchedulerBenchmarkErrorKind::kRuntime, exception.what());
+    }
+    if (!prepared.error.empty() || !prepared.model) {
+        return fail_run(SchedulerBenchmarkErrorKind::kInvalidConfig,
+                        prepared.error.empty() ? "model identity was not prepared"
+                                               : prepared.error);
+    }
     if (const SchedulerBenchmarkRun warmed = warmup(config);
         warmed.kind != SchedulerBenchmarkErrorKind::kNone) {
         return warmed;
+    }
+    if (const std::string changed = recheck_identity(*prepared.model, config); !changed.empty()) {
+        return fail_run(SchedulerBenchmarkErrorKind::kInvalidConfig, changed);
     }
 
     InferenceScheduler scheduler(scheduler_config(config));
@@ -1351,6 +1908,7 @@ SchedulerBenchmarkRun run_scheduler_benchmark(const SchedulerBenchmarkConfig& co
     }
 
     SharedTrial trial;
+    trial.model = prepared.model;
     trial.inflight.reserve(config.max_outstanding);
     trial.latencies.reserve(static_cast<std::size_t>(
         std::min(config.max_offered, static_cast<std::uint64_t>(config.max_outstanding))));

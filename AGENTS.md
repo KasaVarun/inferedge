@@ -4,7 +4,7 @@ InferEdge is a C++20 inference runtime. ONNX Runtime 1.31.0 CPU is a pinned conf
 
 ## Current scope
 
-Build the `inferedge` executable, `inferedge-bench`, `inferedge-bench-concurrent`, their unit tests, the ONNX Runtime tests, the `inferedge_onnx` library, the `inferedge_concurrent` library, the `inferedge_concurrent_benchmark` library, the `inferedge_concurrent_benchmark_cli` library, the latency statistics calculator, the synchronous benchmark runner, the committed Add, int64 Identity, rank-2 float32, and MNIST MLP fixtures, and Linux CI. `inferedge_concurrent` gives each worker its own `InferenceEngine` and checks outputs. `inferedge_concurrent_benchmark` measures those workers inside one synchronized window. `inferedge-bench-concurrent` prepares Add or MNIST, copies one assignment per worker, and calls that runner. `--format json` writes schema version 2. One `InferenceEngine` is still single-threaded. There is no collected concurrent performance baseline. `BoundedFifoQueue` is the waiting-work queue. `inferedge_scheduler` is the Phase 5.2.2 scheduler: one model path, one `InferenceEngine` per worker, drain shutdown, and cancel-pending shutdown. Cancel-pending completes requests still waiting in the queue and leaves an in-flight `run()` with its worker. There is no dynamic batching.
+Build the `inferedge` executable, `inferedge-bench`, `inferedge-bench-concurrent`, their unit tests, the ONNX Runtime tests, the `inferedge_onnx` library, the `inferedge_concurrent` library, the `inferedge_concurrent_benchmark` library, the `inferedge_concurrent_benchmark_cli` library, the latency statistics calculator, the synchronous benchmark runner, the committed Add, int64 Identity, rank-2 float32, MNIST MLP, batch Add, and dynamic neural fixtures, and Linux CI. `inferedge_concurrent` gives each worker its own `InferenceEngine` and checks outputs. `inferedge_concurrent_benchmark` measures those workers inside one synchronized window. `inferedge-bench-concurrent` prepares Add or MNIST, copies one assignment per worker, and calls that runner. `--format json` writes schema version 2. One `InferenceEngine` is still single-threaded. There is no collected concurrent performance baseline. `BoundedFifoQueue` is the waiting-work queue. `inferedge_scheduler` is the Phase 5.2.2 scheduler: one model path, one `InferenceEngine` per worker, drain shutdown, and cancel-pending shutdown. Cancel-pending completes requests still waiting in the queue and leaves an in-flight `run()` with its worker. Configured batching is available. There is no shared session pool and no dynamic batching that regroups across models.
 
 ## Scheduler benchmark
 
@@ -32,15 +32,31 @@ Producer-observed latency is the comparable end-to-end field. Pre-publication la
 
 Run directories live under `benchmarks/scheduler_runs/`. Raw stdout, raw stderr, the execution plan, and trial metadata are kept. Directories and trial files are created exclusively. There is no overwrite, no selective retry, and no deletion of a failed block. `benchmarks/baselines/`, `benchmarks/concurrent_runs/`, and `models/experiments/` stay out of this evidence.
 
+### Dynamic neural ONNX workloads
+
+Three deterministic dynamic-batch float32 models are committed for scheduler correctness:
+
+- Small MLP (`mlp_small_f32`): features `[batch, 32]` → logits `[batch, 8]`. Layers 32→64→32→8 with ReLU after the first two MatMul+Add pairs
+- Medium MLP (`mlp_medium_f32`): features `[batch, 256]` → logits `[batch, 16]`. Layers 256→256→128→16 with the same ReLU pattern
+- GEMM (`gemm_f32`): features `[batch, 512]` → product `[batch, 512]`. One Gemm, alpha 1, beta 0, no bias input
+
+All three use ONNX opset 13, IR version 10, producer `inferedge`, and a symbolic batch axis named `batch` on dimension 0. ONNX Runtime 1.31.0 CPU loads them. The scheduler maximum configured batch size remains 32. Each submitted request uses batch axis 1. Generation depends only on `onnx==1.22.0` from `models/requirements.txt`. Weight draws use SplitMix64 with seed `20261015`. Weights are little-endian float32. Committed sidecars under `models/fixtures/<id>.weights` mirror the ONNX initializers. Known-answer fixtures under `models/fixtures/<id>/` are independent of ONNX Runtime. CMake pins the ONNX and sidecar SHA-256 digests at configure time. Normal CI does not regenerate models. A model change requires reviewed regeneration of the ONNX artifact, sidecar, fixtures, and recorded hash pins.
+
+`inferedge-bench-scheduler` accepts `--model-id` with `batch_add_f32` (default), `mlp_small_f32`, `mlp_medium_f32`, or `gemm_f32`. `--model` remains the required ONNX path. `--workload` remains the traffic selector (`open_loop_constant`, `open_loop_burst`, `closed_loop`) and is not replaced by `--model-id`. Add requests keep tensors `A` and `B` and output `C` with exact float equality. Neural requests use one `features` row `[1, width]` and check `logits` or `product` against the independent C++ reference with fixed tolerances (MLP `atol=rtol=2e-4`, GEMM `atol=rtol=1e-4`). Before warmup the runner hashes the model file, and for neural ids the sidecar beside `dirname(model)/fixtures/<id>.weights`, then checks loaded metadata. Runtime SHA-256 detects accidental artifact mismatch. Hashing and loading use separate opens and do not certify protection against malicious concurrent file replacement.
+
+Neural expected outputs are computed after the observation stamp on a collector or closed-loop producer thread. That CPU work can delay later observations or the next closed-loop submit. Producer-observed latency still includes observation delay. Arrival fidelity is not certified for neural workloads. Those runs are correctness evidence, not calibrated performance evidence. The previous overhead study applies only to the Add model at low load with batching disabled. Do not extrapolate it to neural inference. Do not publish speedup or zero-overhead claims for instrumentation or reference checking.
+
+`benchmarks/collect_scheduler.py` and `benchmarks/collect_overhead.py` remain pinned to `models/batch_add_f32.onnx`. Direct CLI `--model-id` selection is not a validated multi-model collection protocol. A neural measurement campaign needs a separately reviewed collection and fairness design. Schemas 1–4 and analysis protocols 1–3 are unchanged. Schema documents do not gain a `model_id` field from this work.
+
 ## Do not add yet
 
 - Published speed figures. `inferedge-bench` calls `run_benchmark` for one loaded `InferenceEngine` on the calling thread and can print that report as text or JSON. `summarize_latencies` still only reduces injected durations. JSON schema version 1 does not include raw samples, hardware, build type, or a model hash. `benchmarks/collect_baseline.py` can launch that executable and validate the JSON. `benchmarks/analyze_baseline.py` reduces one completed run set to `aggregate.json`. Neither script infers, and `benchmarks/baselines/` stays untracked until a measured run set is reviewed
-- Dynamic batching or a shared session pool. Do not call `InferenceEngine::run` concurrently on one engine. Do not add a collected concurrent baseline. `inferedge-bench-concurrent` and JSON schema version 2 exist. They are not a production server, and no concurrency speedup has been measured
+- A shared session pool or concurrent `InferenceEngine::run` on one engine. Do not add a collected concurrent baseline. Do not add a collected neural scheduler campaign. `inferedge-bench-concurrent` and JSON schema version 2 exist. They are not a production server, and no concurrency speedup has been measured
 - CUDA, TensorRT, or CoreML execution provider configuration
 - HTTP APIs, databases, frontends, or Python bindings
 - Dependencies beyond the C++ standard library, CMake, Ninja, GoogleTest fetched by CMake, the pinned ONNX Runtime 1.31.0 CPU archives, and clang-format
 
-`onnx==1.22.0` regenerates `models/add_f32.onnx`, `models/int64_echo.onnx`, and `models/rank2_f32.onnx`. It is not a CMake dependency. Do not install it during configuration.
+`onnx==1.22.0` regenerates `models/add_f32.onnx`, `models/int64_echo.onnx`, `models/rank2_f32.onnx`, `models/batch_add_f32.onnx`, `models/mlp_small_f32.onnx`, `models/mlp_medium_f32.onnx`, and `models/gemm_f32.onnx`, plus matching sidecars and fixtures where those generators emit them. It is not a CMake dependency. Do not install it during configuration.
 
 ## Build and test
 

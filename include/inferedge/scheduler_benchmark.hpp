@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <span>
 #include <string>
 #include <vector>
@@ -29,6 +30,17 @@ enum class SchedulerWorkloadKind {
     kOpenLoopConstant,
     kOpenLoopBurst,
     kClosedLoop,
+};
+
+// Omitted --model-id selects batch_add_f32. The benchmark hashes the model
+// file before warm-up. A neural id also hashes models/fixtures/<id>.weights
+// beside that model file. Those reads are not a lock: a later replacement is
+// not a malicious-substitution defense.
+enum class SchedulerBenchmarkModelId {
+    kBatchAddF32,
+    kMlpSmallF32,
+    kMlpMediumF32,
+    kGemmF32,
 };
 
 // Open-loop catch-up is stop-and-record. The generator sleeps until the
@@ -71,6 +83,8 @@ struct SchedulerBenchmarkConfig {
     // completion and writes schema 4. It does not record a post-publication time.
     bool enable_completion_timing{false};
     SchedulerWorkloadKind workload{SchedulerWorkloadKind::kOpenLoopConstant};
+    // Default keeps the Add request, exact C check, and schema documents.
+    SchedulerBenchmarkModelId model_id{SchedulerBenchmarkModelId::kBatchAddF32};
     double target_requests_per_second{0.0};
     double burst_high_requests_per_second{0.0};
     double burst_low_requests_per_second{0.0};
@@ -134,8 +148,23 @@ struct SchedulerBenchmarkLag {
 
 struct SchedulerBenchmarkTensors {
     std::vector<NamedTensor> inputs;
+    // Exact Add outputs. Neural requests leave these at zero and compare
+    // completion values with evaluate_neural_reference after observation.
     float expected_c0{0.F};
     float expected_c1{0.F};
+};
+
+// ok is true only for a regular file that was read completely. hex is then
+// 64 lowercase characters. A missing, nonregular, or unreadable file is not ok.
+struct SchedulerBenchmarkDigest {
+    bool ok{false};
+    std::string hex;
+    std::string message;
+};
+
+struct SchedulerBenchmarkOutputCheck {
+    bool matched{false};
+    std::string message;
 };
 
 enum class SchedulerBenchmarkErrorKind {
@@ -327,9 +356,33 @@ measure_generator_lag(std::chrono::steady_clock::time_point scheduled,
                       std::chrono::steady_clock::time_point actual,
                       std::chrono::nanoseconds tolerance) noexcept;
 
+// Streams the file in fixed blocks. Does not read it into one allocation.
+// Follows the FIPS 180-4 SHA-256 padding and big-endian length rules.
+[[nodiscard]] SchedulerBenchmarkDigest
+scheduler_benchmark_sha256_file(const std::filesystem::path& path);
+
 // attempt_id selects deterministic float32[1, 2] inputs for batch_add_f32.
 // Expected C is the exact integer sum of those inputs.
 [[nodiscard]] SchedulerBenchmarkTensors scheduler_benchmark_request(std::uint64_t attempt_id);
+
+// batch_add_f32 keeps the one-argument request. Neural ids use one features
+// row, float32(uint32(attempt_id % 251 + index)) * 0x1p-10. The values repeat
+// every 251 attempt ids and are not globally unique. Neural expected outputs
+// are not stored here.
+[[nodiscard]] SchedulerBenchmarkTensors scheduler_benchmark_request(SchedulerBenchmarkModelId model,
+                                                                    std::uint64_t attempt_id);
+
+// Add compares C exactly. Neural compares logits or product with the approved
+// tolerance. Non-finite values do not match. reference is the expected row.
+[[nodiscard]] SchedulerBenchmarkOutputCheck
+scheduler_benchmark_check_output(SchedulerBenchmarkModelId model, const NamedTensor& output,
+                                 std::span<const float> reference);
+
+// Returned tensors must equal the submitted tensors in order, name, shape,
+// and value. A shorter, renamed, or altered return does not match.
+[[nodiscard]] SchedulerBenchmarkOutputCheck
+scheduler_benchmark_check_returned_inputs(std::span<const NamedTensor> returned,
+                                          std::span<const NamedTensor> submitted);
 
 // True when this success is checked. one_based_index starts at 1. The last
 // success is checked even when it is off the interval.

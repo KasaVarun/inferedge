@@ -126,6 +126,8 @@ std::string scheduler_benchmark_help_message() {
            "\n"
            "Options:\n"
            "  --model <path>                 ONNX model (required)\n"
+           "  --model-id <id>                batch_add_f32 (default), mlp_small_f32,\n"
+           "                                 mlp_medium_f32, or gemm_f32\n"
            "  --workers <n>                  1..64 (required)\n"
            "  --queue-capacity <n>           1..1024 (required)\n"
            "  --workload <name>              open_loop_constant, open_loop_burst, or closed_loop\n"
@@ -142,7 +144,7 @@ std::string scheduler_benchmark_help_message() {
            "  --completion-timeout-ms <n>    1..60000 (required)\n"
            "  --lag-tolerance-ms <n>         open-loop lateness limit (default 1000)\n"
            "  --check-interval <n>           success checks (default 1)\n"
-           "  --enable-batching              batch on models/batch_add_f32.onnx\n"
+           "  --enable-batching              batch ready requests up to --max-batch-size\n"
            "  --max-batch-size <n>           1..32 (default 1)\n"
            "  --max-batch-delay-ms <n>       0..1000 (default 0)\n"
            "  --disable-metrics              leave scheduler metrics off\n"
@@ -185,6 +187,7 @@ parse_scheduler_benchmark_cli(const std::vector<std::string_view>& args) {
     parsed.config.check_interval = 1;
     parsed.config.lag_tolerance = std::chrono::milliseconds{1000};
     bool saw_model = false;
+    bool saw_model_id = false;
     bool saw_workers = false;
     bool saw_queue = false;
     bool saw_workload = false;
@@ -237,6 +240,23 @@ parse_scheduler_benchmark_cli(const std::vector<std::string_view>& args) {
                 return error_result(duplicated);
             }
             parsed.config.enable_metrics = false;
+            continue;
+        }
+        if (argument == "--model-id" || argument.starts_with("--model-id=")) {
+            if (const std::string error = take("--model-id", saw_model_id); !error.empty()) {
+                return error_result(error);
+            }
+            if (value == "batch_add_f32") {
+                parsed.config.model_id = SchedulerBenchmarkModelId::kBatchAddF32;
+            } else if (value == "mlp_small_f32") {
+                parsed.config.model_id = SchedulerBenchmarkModelId::kMlpSmallF32;
+            } else if (value == "mlp_medium_f32") {
+                parsed.config.model_id = SchedulerBenchmarkModelId::kMlpMediumF32;
+            } else if (value == "gemm_f32") {
+                parsed.config.model_id = SchedulerBenchmarkModelId::kGemmF32;
+            } else {
+                return error_result("error: unsupported model id '" + std::string{value} + "'\n");
+            }
             continue;
         }
         if (argument == "--model" || argument.starts_with("--model=")) {

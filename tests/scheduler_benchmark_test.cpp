@@ -6,6 +6,8 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <gtest/gtest.h>
 #include <limits>
@@ -13,6 +15,7 @@
 #include <spawn.h>
 #include <string>
 #include <string_view>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <utility>
@@ -429,8 +432,9 @@ TEST(SchedulerBenchmarkTest, MissingModelReturnsNonzero) {
     SchedulerBenchmarkConfig config = MeasuredConfig();
     config.model_path = INFEREDGE_INVALID_MODEL_PATH;
     const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
-    EXPECT_EQ(run.kind, SchedulerBenchmarkErrorKind::kModelLoad);
-    EXPECT_EQ(inferedge::scheduler_benchmark_status(run), 1);
+    EXPECT_EQ(run.kind, SchedulerBenchmarkErrorKind::kInvalidConfig);
+    EXPECT_NE(run.message.find("SHA-256"), std::string::npos);
+    EXPECT_EQ(inferedge::scheduler_benchmark_status(run), 2);
 }
 
 TEST(SchedulerBenchmarkTest, MalformedConfigIsRejected) {
@@ -542,9 +546,11 @@ TEST(SchedulerBenchmarkProcessTest, MissingModelProcessExitsNonzero) {
                                               "1000",
                                               "--format",
                                               "json"});
-    EXPECT_EQ(process.status, 1);
+    EXPECT_EQ(process.status, 2);
     EXPECT_NE(process.output.find("\"schema_version\": 3"), std::string::npos);
-    EXPECT_NE(process.output.find("\"error\": \"model_load\""), std::string::npos);
+    EXPECT_NE(process.output.find("\"error\": \"invalid_config\""), std::string::npos);
+    EXPECT_NE(process.output.find("SHA-256"), std::string::npos);
+    EXPECT_EQ(process.output.find("\"model_id\""), std::string::npos);
 }
 
 TEST(SchedulerBenchmarkProcessTest, JsonTrialExitsZero) {
@@ -711,4 +717,377 @@ TEST(SchedulerBenchmarkProcessTest, CompletionTimingSelectsSchema4) {
               std::optional<std::int64_t>{1});
     EXPECT_EQ(JsonIntAfter(process.output, "successful_e2e_latency", "sample_count"),
               std::optional<std::int64_t>{1});
+}
+
+std::filesystem::path ModelsDirectory() {
+    return std::filesystem::path{INFEREDGE_BATCH_ADD_MODEL_PATH}.parent_path();
+}
+
+std::filesystem::path ModelFile(const char* name) {
+    return ModelsDirectory() / name;
+}
+
+void ExpectDigest(const std::filesystem::path& path, const char* expected) {
+    const inferedge::SchedulerBenchmarkDigest digest =
+        inferedge::scheduler_benchmark_sha256_file(path);
+    ASSERT_TRUE(digest.ok) << digest.message;
+    EXPECT_EQ(digest.hex, expected);
+    EXPECT_EQ(digest.hex.size(), 64U);
+    const inferedge::SchedulerBenchmarkDigest again =
+        inferedge::scheduler_benchmark_sha256_file(path);
+    ASSERT_TRUE(again.ok);
+    EXPECT_EQ(again.hex, digest.hex);
+}
+
+class TempDirectory {
+public:
+    TempDirectory() {
+        path_ = std::filesystem::temp_directory_path() /
+                ("inferedge-c4-" + std::to_string(static_cast<long long>(::getpid())));
+        std::filesystem::remove_all(path_);
+        std::filesystem::create_directory(path_);
+    }
+
+    ~TempDirectory() { std::filesystem::remove_all(path_); }
+
+    const std::filesystem::path& path() const { return path_; }
+
+private:
+    std::filesystem::path path_;
+};
+
+void WriteBytes(const std::filesystem::path& path, const std::string& bytes) {
+    std::ofstream output(path, std::ios::binary);
+    ASSERT_TRUE(output);
+    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    ASSERT_TRUE(output);
+}
+
+SchedulerBenchmarkConfig NeuralRun(const char* model_file, inferedge::SchedulerBenchmarkModelId id,
+                                   bool batching) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.model_path = ModelFile(model_file).string();
+    config.model_id = id;
+    config.max_offered = batching ? 4 : 2;
+    config.max_outstanding = config.max_offered;
+    config.queue_capacity = 8;
+    config.enable_batching = batching;
+    config.max_batch_size = batching ? 4 : 1;
+    config.warmup_requests = 0;
+    return config;
+}
+
+TEST(SchedulerBenchmarkSha256Test, KnownVectorsAndBlockBoundaries) {
+    TempDirectory directory;
+    const std::pair<const char*, std::string> cases[] = {
+        {"empty", std::string{}},
+        {"abc", std::string{"abc"}},
+        {"nist",
+         std::string{"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmn"
+                     "opjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"}},
+        {"nulls", std::string("\x00\x00\xff\x00", 4)},
+        {"a55", std::string(55, 'a')},
+        {"a56", std::string(56, 'a')},
+        {"a63", std::string(63, 'a')},
+        {"a64", std::string(64, 'a')},
+        {"a65", std::string(65, 'a')},
+    };
+    const char* expected[] = {
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1",
+        "bf4571113cd8c2262425e5bc5c38ace8909f4215569f49ad115f87445d596d02",
+        "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318",
+        "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a",
+        "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34",
+        "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+        "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0",
+    };
+    for (std::size_t index = 0; index < 9; ++index) {
+        const std::filesystem::path file = directory.path() / cases[index].first;
+        WriteBytes(file, cases[index].second);
+        ExpectDigest(file, expected[index]);
+    }
+    const std::filesystem::path abc = directory.path() / "abc";
+    std::fstream mutated(abc, std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(mutated);
+    mutated.seekp(0);
+    mutated.put('d');
+    mutated.close();
+    const inferedge::SchedulerBenchmarkDigest changed =
+        inferedge::scheduler_benchmark_sha256_file(abc);
+    ASSERT_TRUE(changed.ok);
+    EXPECT_NE(changed.hex, expected[1]);
+    EXPECT_FALSE(inferedge::scheduler_benchmark_sha256_file(directory.path() / "missing").ok);
+    EXPECT_EQ(inferedge::scheduler_benchmark_sha256_file(directory.path() / "missing").message,
+              "file is missing");
+    EXPECT_FALSE(inferedge::scheduler_benchmark_sha256_file(directory.path()).ok);
+    EXPECT_EQ(inferedge::scheduler_benchmark_sha256_file(directory.path()).message,
+              "file is not a regular file");
+    const std::filesystem::path locked = directory.path() / "locked";
+    WriteBytes(locked, std::string{"abc"});
+    ASSERT_EQ(::chmod(locked.c_str(), 0), 0);
+    const inferedge::SchedulerBenchmarkDigest unreadable =
+        inferedge::scheduler_benchmark_sha256_file(locked);
+    EXPECT_FALSE(unreadable.ok);
+    EXPECT_EQ(::chmod(locked.c_str(), 0600), 0);
+}
+
+TEST(SchedulerBenchmarkSha256Test, PinnedArtifactsMatchReviewedDigests) {
+    ExpectDigest(INFEREDGE_BATCH_ADD_MODEL_PATH,
+                 "f33bbe0ad5420419dd2dbb5322f4172e213b854f1124c660b1d732e8f8ce3b23");
+    ExpectDigest(ModelFile("mlp_small_f32.onnx"),
+                 "bcf02cac789c65cb12785ccfd175827cb21f89574ef298af009b74d7131df1bd");
+    ExpectDigest(ModelFile("mlp_medium_f32.onnx"),
+                 "8d43a97b8d44d3d1f601570c8b09b08c90dda4977e6f8b7123eea8c0455024dd");
+    ExpectDigest(ModelFile("gemm_f32.onnx"),
+                 "a6203020b870eb04f9fd8e836cf4ccd930a57156a026d2a50163121d83debf32");
+    ExpectDigest(ModelsDirectory() / "fixtures" / "mlp_small_f32.weights",
+                 "b6335064c4e2c89add3ed54452e27dacf3ea7d485be6adbdd24fae1e2e5f1899");
+    ExpectDigest(ModelsDirectory() / "fixtures" / "mlp_medium_f32.weights",
+                 "d3dd2f6148a6684288d4f25b0c426eefde7227468be9120ddd08cd99cbb9059e");
+    ExpectDigest(ModelsDirectory() / "fixtures" / "gemm_f32.weights",
+                 "a335c8b12defcb885f8bada9ef1092655d024d5586fe011a9336ad2d472f82b6");
+}
+
+TEST(SchedulerBenchmarkCliTest, ModelIdDefaultsToAddAndRejectsBadSelectors) {
+    const auto omitted = inferedge::parse_scheduler_benchmark_cli(
+        {"--model", "model.onnx", "--workers", "1", "--queue-capacity", "1", "--workload",
+         "closed_loop", "--max-offered", "1", "--max-outstanding", "1", "--duration-ms", "10",
+         "--completion-timeout-ms", "10"});
+    EXPECT_EQ(omitted.action, SchedulerBenchmarkCliAction::kRun);
+    EXPECT_EQ(omitted.config.model_id, inferedge::SchedulerBenchmarkModelId::kBatchAddF32);
+    const auto explicit_add = inferedge::parse_scheduler_benchmark_cli(
+        {"--model-id=batch_add_f32", "--model", "model.onnx", "--workers", "1", "--queue-capacity",
+         "1", "--workload", "closed_loop", "--max-offered", "1", "--max-outstanding", "1",
+         "--duration-ms", "10", "--completion-timeout-ms", "10"});
+    EXPECT_EQ(explicit_add.config.model_id, inferedge::SchedulerBenchmarkModelId::kBatchAddF32);
+    const auto small = inferedge::parse_scheduler_benchmark_cli(
+        {"--model", "model.onnx", "--model-id", "mlp_small_f32", "--workers", "1",
+         "--queue-capacity", "1", "--workload", "closed_loop", "--max-offered", "1",
+         "--max-outstanding", "1", "--duration-ms", "10", "--completion-timeout-ms", "10"});
+    EXPECT_EQ(small.config.model_id, inferedge::SchedulerBenchmarkModelId::kMlpSmallF32);
+    const auto missing = inferedge::parse_scheduler_benchmark_cli({"--model-id"});
+    EXPECT_EQ(missing.action, SchedulerBenchmarkCliAction::kError);
+    EXPECT_NE(missing.message.find("missing value for --model-id"), std::string::npos);
+    const auto unknown = inferedge::parse_scheduler_benchmark_cli(
+        {"--model-id", "resnet", "--model", "model.onnx", "--workers", "1", "--queue-capacity", "1",
+         "--workload", "closed_loop", "--max-offered", "1", "--max-outstanding", "1",
+         "--duration-ms", "10", "--completion-timeout-ms", "10"});
+    EXPECT_EQ(unknown.action, SchedulerBenchmarkCliAction::kError);
+    EXPECT_NE(unknown.message.find("unsupported model id"), std::string::npos);
+    const auto duplicated = inferedge::parse_scheduler_benchmark_cli({"--model-id",
+                                                                      "gemm_f32",
+                                                                      "--model-id",
+                                                                      "gemm_f32",
+                                                                      "--model",
+                                                                      "model.onnx",
+                                                                      "--workers",
+                                                                      "1",
+                                                                      "--queue-capacity",
+                                                                      "1",
+                                                                      "--workload",
+                                                                      "closed_loop",
+                                                                      "--max-offered",
+                                                                      "1",
+                                                                      "--max-outstanding",
+                                                                      "1",
+                                                                      "--duration-ms",
+                                                                      "10",
+                                                                      "--completion-timeout-ms",
+                                                                      "10"});
+    EXPECT_EQ(duplicated.action, SchedulerBenchmarkCliAction::kError);
+    EXPECT_NE(duplicated.message.find("specified more than once"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkNeuralTest, RequestsUseTheAttemptFormula) {
+    const auto first = inferedge::scheduler_benchmark_request(
+        inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, 1000);
+    ASSERT_EQ(first.inputs.size(), 1U);
+    EXPECT_EQ(first.inputs[0].name, "features");
+    EXPECT_EQ(first.inputs[0].shape, (std::vector<std::int64_t>{1, 32}));
+    EXPECT_FLOAT_EQ(first.inputs[0].values[0], static_cast<float>(1000 % 251) * 0x1p-10F);
+    EXPECT_FLOAT_EQ(first.inputs[0].values[31], static_cast<float>(1000 % 251 + 31) * 0x1p-10F);
+    const auto wrapped = inferedge::scheduler_benchmark_request(
+        inferedge::SchedulerBenchmarkModelId::kGemmF32, 1000 + 251);
+    EXPECT_EQ(wrapped.inputs[0].values[0], first.inputs[0].values[0]);
+    const auto add = inferedge::scheduler_benchmark_request(
+        inferedge::SchedulerBenchmarkModelId::kBatchAddF32, 1001);
+    EXPECT_EQ(add.inputs.size(), 2U);
+    EXPECT_FLOAT_EQ(add.expected_c0, 2.F);
+}
+
+TEST(SchedulerBenchmarkNeuralTest, OutputAndRejectionChecksRejectCorruptRows) {
+    const auto request = inferedge::scheduler_benchmark_request(
+        inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, 3);
+    inferedge::NamedTensor output{"logits", {1, 8}, std::vector<float>(8, 0.F)};
+    const std::vector<float> reference(8, 0.F);
+    EXPECT_TRUE(inferedge::scheduler_benchmark_check_output(
+                    inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, output, reference)
+                    .matched);
+    output.values[0] = 1e-6F;
+    EXPECT_TRUE(inferedge::scheduler_benchmark_check_output(
+                    inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, output, reference)
+                    .matched);
+    output.values[0] = 1.F;
+    EXPECT_FALSE(inferedge::scheduler_benchmark_check_output(
+                     inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, output, reference)
+                     .matched);
+    output.values[0] = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_FALSE(inferedge::scheduler_benchmark_check_output(
+                     inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, output, reference)
+                     .matched);
+    output.values.assign(8, 0.F);
+    output.values[3] = std::numeric_limits<float>::infinity();
+    EXPECT_FALSE(inferedge::scheduler_benchmark_check_output(
+                     inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, output, reference)
+                     .matched);
+    output.name = "scores";
+    output.values.assign(8, 0.F);
+    EXPECT_FALSE(inferedge::scheduler_benchmark_check_output(
+                     inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, output, reference)
+                     .matched);
+    output.name = "logits";
+    output.shape = {1, 7};
+    output.values.assign(7, 0.F);
+    EXPECT_FALSE(inferedge::scheduler_benchmark_check_output(
+                     inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, output, reference)
+                     .matched);
+    const inferedge::NamedTensor submitted = request.inputs[0];
+    EXPECT_TRUE(inferedge::scheduler_benchmark_check_returned_inputs(
+                    std::span<const inferedge::NamedTensor>{&submitted, 1}, request.inputs)
+                    .matched);
+    inferedge::NamedTensor renamed = submitted;
+    renamed.name = "image";
+    EXPECT_FALSE(inferedge::scheduler_benchmark_check_returned_inputs(
+                     std::span<const inferedge::NamedTensor>{&renamed, 1}, request.inputs)
+                     .matched);
+    inferedge::NamedTensor reshaped = submitted;
+    reshaped.shape = {1, 16};
+    reshaped.values.resize(16);
+    EXPECT_FALSE(inferedge::scheduler_benchmark_check_returned_inputs(
+                     std::span<const inferedge::NamedTensor>{&reshaped, 1}, request.inputs)
+                     .matched);
+    inferedge::NamedTensor altered = submitted;
+    altered.values[0] += 1.F;
+    EXPECT_FALSE(inferedge::scheduler_benchmark_check_returned_inputs(
+                     std::span<const inferedge::NamedTensor>{&altered, 1}, request.inputs)
+                     .matched);
+    EXPECT_FALSE(inferedge::scheduler_benchmark_check_returned_inputs({}, request.inputs).matched);
+    const float add_expected[] = {2.F, 3.F};
+    inferedge::NamedTensor add_output{"C", {1, 2}, {2.F, 3.F}};
+    EXPECT_TRUE(inferedge::scheduler_benchmark_check_output(
+                    inferedge::SchedulerBenchmarkModelId::kBatchAddF32, add_output, add_expected)
+                    .matched);
+    add_output.values[1] = 4.F;
+    EXPECT_FALSE(inferedge::scheduler_benchmark_check_output(
+                     inferedge::SchedulerBenchmarkModelId::kBatchAddF32, add_output, add_expected)
+                     .matched);
+}
+
+void ExpectNeuralTrial(const char* file, inferedge::SchedulerBenchmarkModelId id, bool batching) {
+    const SchedulerBenchmarkRun run =
+        inferedge::run_scheduler_benchmark(NeuralRun(file, id, batching));
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.valid) << (run.report.invalid_reasons.empty()
+                                          ? std::string{}
+                                          : run.report.invalid_reasons.front());
+    EXPECT_EQ(run.report.succeeded, batching ? 4U : 2U);
+    EXPECT_EQ(run.report.correctness_mismatches, 0U);
+    EXPECT_EQ(run.report.correctness_checked, run.report.succeeded);
+    EXPECT_EQ(run.report.failed_inference, 0U);
+    EXPECT_TRUE(run.report.metrics.finalized);
+    ExpectAccounting(run.report);
+    ExpectHistogram(run.report);
+    if (!batching) {
+        EXPECT_EQ(run.report.metrics.batch_size_histogram[1], run.report.succeeded);
+    }
+    for (std::size_t size = batching ? 5 : 2; size < run.report.metrics.batch_size_histogram.size();
+         ++size) {
+        EXPECT_EQ(run.report.metrics.batch_size_histogram[size], 0U);
+    }
+    const auto json = inferedge::write_scheduler_benchmark_json(run.report, "0.1.0");
+    EXPECT_TRUE(json.error.empty());
+    EXPECT_NE(json.text.find("\"schema_version\": 3"), std::string::npos);
+    EXPECT_EQ(json.text.find("\"model_id\""), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkNeuralTest, UnbatchedAndBatchedRunsMatchTheReference) {
+    ExpectNeuralTrial("mlp_small_f32.onnx", inferedge::SchedulerBenchmarkModelId::kMlpSmallF32,
+                      false);
+    ExpectNeuralTrial("mlp_small_f32.onnx", inferedge::SchedulerBenchmarkModelId::kMlpSmallF32,
+                      true);
+    ExpectNeuralTrial("mlp_medium_f32.onnx", inferedge::SchedulerBenchmarkModelId::kMlpMediumF32,
+                      false);
+    ExpectNeuralTrial("mlp_medium_f32.onnx", inferedge::SchedulerBenchmarkModelId::kMlpMediumF32,
+                      true);
+    ExpectNeuralTrial("gemm_f32.onnx", inferedge::SchedulerBenchmarkModelId::kGemmF32, false);
+    ExpectNeuralTrial("gemm_f32.onnx", inferedge::SchedulerBenchmarkModelId::kGemmF32, true);
+}
+
+TEST(SchedulerBenchmarkNeuralTest, WrongIdentityDoesNotWarmUpOrSubmit) {
+    SchedulerBenchmarkConfig missing = MeasuredConfig();
+    missing.model_path = (ModelsDirectory() / "missing-model.onnx").string();
+    missing.warmup_requests = 3;
+    const SchedulerBenchmarkRun absent = inferedge::run_scheduler_benchmark(missing);
+    EXPECT_EQ(absent.kind, SchedulerBenchmarkErrorKind::kInvalidConfig);
+    EXPECT_NE(absent.message.find("file is missing"), std::string::npos);
+    EXPECT_EQ(absent.report.succeeded, 0U);
+
+    SchedulerBenchmarkConfig swapped =
+        NeuralRun("mlp_small_f32.onnx", inferedge::SchedulerBenchmarkModelId::kGemmF32, false);
+    swapped.warmup_requests = 2;
+    const SchedulerBenchmarkRun wrong_id = inferedge::run_scheduler_benchmark(swapped);
+    EXPECT_EQ(wrong_id.kind, SchedulerBenchmarkErrorKind::kInvalidConfig);
+    EXPECT_NE(wrong_id.message.find("SHA-256"), std::string::npos);
+    EXPECT_EQ(wrong_id.report.succeeded, 0U);
+
+    TempDirectory directory;
+    const std::filesystem::path copied = directory.path() / "mlp_small_f32.onnx";
+    std::filesystem::copy_file(ModelFile("mlp_small_f32.onnx"), copied);
+    std::fstream model(copied, std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(model);
+    model.seekp(-1, std::ios::end);
+    model.put('\x5a');
+    model.close();
+    SchedulerBenchmarkConfig mutated =
+        NeuralRun("mlp_small_f32.onnx", inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, false);
+    mutated.model_path = copied.string();
+    mutated.warmup_requests = 4;
+    const SchedulerBenchmarkRun bad_model = inferedge::run_scheduler_benchmark(mutated);
+    EXPECT_EQ(bad_model.kind, SchedulerBenchmarkErrorKind::kInvalidConfig);
+    EXPECT_NE(bad_model.message.find("model SHA-256 mismatch"), std::string::npos);
+    EXPECT_EQ(bad_model.report.succeeded, 0U);
+
+    const std::filesystem::path good_model = directory.path() / "mlp_small_f32.onnx";
+    std::filesystem::remove(good_model);
+    std::filesystem::copy_file(ModelFile("mlp_small_f32.onnx"), good_model);
+    std::filesystem::create_directory(directory.path() / "fixtures");
+    const std::filesystem::path sidecar = directory.path() / "fixtures" / "mlp_small_f32.weights";
+    std::filesystem::copy_file(ModelsDirectory() / "fixtures" / "mlp_small_f32.weights", sidecar);
+    std::fstream weights(sidecar, std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(weights);
+    weights.seekp(0);
+    weights.put('\x11');
+    weights.close();
+    mutated.model_path = good_model.string();
+    const SchedulerBenchmarkRun bad_weights = inferedge::run_scheduler_benchmark(mutated);
+    EXPECT_EQ(bad_weights.kind, SchedulerBenchmarkErrorKind::kInvalidConfig);
+    EXPECT_NE(bad_weights.message.find("weight sidecar SHA-256 mismatch"), std::string::npos);
+    EXPECT_EQ(bad_weights.report.succeeded, 0U);
+}
+
+TEST(SchedulerBenchmarkNeuralTest, ClosedRejectionRestoresTheFeaturesRow) {
+    SchedulerBenchmarkConfig config =
+        NeuralRun("mlp_small_f32.onnx", inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, false);
+    config.max_offered = 1;
+    config.max_outstanding = 1;
+    config.test_submit_after_shutdown = true;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_EQ(run.report.succeeded, 1U);
+    EXPECT_EQ(run.report.rejections.closed, 1U);
+    EXPECT_EQ(run.report.correctness_mismatches, 0U);
+    EXPECT_EQ(run.report.error_count, 0U);
+    EXPECT_FALSE(run.report.valid);
 }

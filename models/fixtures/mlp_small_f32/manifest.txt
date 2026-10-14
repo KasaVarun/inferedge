@@ -1,0 +1,10 @@
+# inferedge float32 fixtures
+# little-endian float32 values, no file header, no padding
+# batch input_file expected_file input_width output_width attempt_base
+# model mlp_small_f32
+1 b01.input.f32 b01.expected.f32 32 8 1000
+2 b02.input.f32 b02.expected.f32 32 8 1000
+4 b04.input.f32 b04.expected.f32 32 8 1000
+8 b08.input.f32 b08.expected.f32 32 8 1000
+16 b16.input.f32 b16.expected.f32 32 8 1000
+32 b32.input.f32 b32.expected.f32 32 8 1000

@@ -42,6 +42,15 @@ jobs:
       - name: Run Python benchmark tooling tests
         run: python3 -m unittest benchmarks.test_collect_baseline benchmarks.test_analyze_baseline benchmarks.test_collect_concurrent benchmarks.test_analyze_concurrent benchmarks.test_collect_scheduler benchmarks.test_analyze_scheduler benchmarks.test_collect_overhead benchmarks.test_analyze_overhead
 
+      # models/requirements.txt pins onnx==1.22.0 for generators and fixture checks.
+      # A throwaway venv keeps that pin off the system interpreter used above.
+      - name: Run dynamic neural workload Python tests
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/inferedge-onnx"
+          "${RUNNER_TEMP}/inferedge-onnx/bin/python" -m pip install -r models/requirements.txt
+          "${RUNNER_TEMP}/inferedge-onnx/bin/python" -c "import onnx; assert onnx.__version__ == '1.22.0', onnx.__version__"
+          "${RUNNER_TEMP}/inferedge-onnx/bin/python" -m unittest models.test_dynamic_workloads
+
       - name: Check formatting
         run: |
           clang-format --version

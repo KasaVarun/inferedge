@@ -93,14 +93,40 @@ set(INFEREDGE_MNIST_MODEL_SHA256 "3473a4b2673fe4353c2b3a04a7d432717a4dfcdc42fc21
 set(INFEREDGE_BATCH_ADD_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/models/batch_add_f32.onnx")
 set(INFEREDGE_BATCH_ADD_MODEL_SHA256
     "f33bbe0ad5420419dd2dbb5322f4172e213b854f1124c660b1d732e8f8ce3b23")
+set(INFEREDGE_MLP_SMALL_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/models/mlp_small_f32.onnx")
+set(INFEREDGE_MLP_SMALL_MODEL_SHA256
+    "bcf02cac789c65cb12785ccfd175827cb21f89574ef298af009b74d7131df1bd")
+set(INFEREDGE_MLP_MEDIUM_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/models/mlp_medium_f32.onnx")
+set(INFEREDGE_MLP_MEDIUM_MODEL_SHA256
+    "8d43a97b8d44d3d1f601570c8b09b08c90dda4977e6f8b7123eea8c0455024dd")
+set(INFEREDGE_GEMM_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/models/gemm_f32.onnx")
+set(INFEREDGE_GEMM_MODEL_SHA256
+    "a6203020b870eb04f9fd8e836cf4ccd930a57156a026d2a50163121d83debf32")
+set(INFEREDGE_MLP_SMALL_WEIGHTS "${CMAKE_CURRENT_SOURCE_DIR}/models/fixtures/mlp_small_f32.weights")
+set(INFEREDGE_MLP_SMALL_WEIGHTS_SHA256
+    "b6335064c4e2c89add3ed54452e27dacf3ea7d485be6adbdd24fae1e2e5f1899")
+set(INFEREDGE_MLP_MEDIUM_WEIGHTS "${CMAKE_CURRENT_SOURCE_DIR}/models/fixtures/mlp_medium_f32.weights")
+set(INFEREDGE_MLP_MEDIUM_WEIGHTS_SHA256
+    "d3dd2f6148a6684288d4f25b0c426eefde7227468be9120ddd08cd99cbb9059e")
+set(INFEREDGE_GEMM_WEIGHTS "${CMAKE_CURRENT_SOURCE_DIR}/models/fixtures/gemm_f32.weights")
+set(INFEREDGE_GEMM_WEIGHTS_SHA256
+    "a335c8b12defcb885f8bada9ef1092655d024d5586fe011a9336ad2d472f82b6")
 set(INFEREDGE_MNIST_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/models/fixtures/mnist")
+set(INFEREDGE_MLP_SMALL_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/models/fixtures/mlp_small_f32")
+set(INFEREDGE_MLP_MEDIUM_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/models/fixtures/mlp_medium_f32")
+set(INFEREDGE_GEMM_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/models/fixtures/gemm_f32")
 set(INFEREDGE_MODEL_PATHS
     "${INFEREDGE_ADD_MODEL}" "${INFEREDGE_INT64_MODEL}" "${INFEREDGE_RANK2_MODEL}"
-    "${INFEREDGE_MNIST_MODEL}" "${INFEREDGE_BATCH_ADD_MODEL}")
+    "${INFEREDGE_MNIST_MODEL}" "${INFEREDGE_BATCH_ADD_MODEL}"
+    "${INFEREDGE_MLP_SMALL_MODEL}" "${INFEREDGE_MLP_MEDIUM_MODEL}" "${INFEREDGE_GEMM_MODEL}")
 set(INFEREDGE_MODEL_HASHES
     "${INFEREDGE_ADD_MODEL_SHA256}" "${INFEREDGE_INT64_MODEL_SHA256}" "${INFEREDGE_RANK2_MODEL_SHA256}"
-    "${INFEREDGE_MNIST_MODEL_SHA256}" "${INFEREDGE_BATCH_ADD_MODEL_SHA256}")
-set(INFEREDGE_MODEL_LABELS "Add" "int64 Identity" "rank-2 float32" "MNIST MLP" "batch Add")
+    "${INFEREDGE_MNIST_MODEL_SHA256}" "${INFEREDGE_BATCH_ADD_MODEL_SHA256}"
+    "${INFEREDGE_MLP_SMALL_MODEL_SHA256}" "${INFEREDGE_MLP_MEDIUM_MODEL_SHA256}"
+    "${INFEREDGE_GEMM_MODEL_SHA256}")
+set(INFEREDGE_MODEL_LABELS
+    "Add" "int64 Identity" "rank-2 float32" "MNIST MLP" "batch Add"
+    "small MLP" "medium MLP" "GEMM")
 foreach(model_path expected_hash model_label IN ZIP_LISTS
         INFEREDGE_MODEL_PATHS INFEREDGE_MODEL_HASHES INFEREDGE_MODEL_LABELS)
     if(NOT EXISTS "${model_path}")
@@ -117,10 +143,39 @@ foreach(model_path expected_hash model_label IN ZIP_LISTS
     endif()
 endforeach()
 
+set(INFEREDGE_WEIGHT_PATHS
+    "${INFEREDGE_MLP_SMALL_WEIGHTS}" "${INFEREDGE_MLP_MEDIUM_WEIGHTS}" "${INFEREDGE_GEMM_WEIGHTS}")
+set(INFEREDGE_WEIGHT_HASHES
+    "${INFEREDGE_MLP_SMALL_WEIGHTS_SHA256}" "${INFEREDGE_MLP_MEDIUM_WEIGHTS_SHA256}"
+    "${INFEREDGE_GEMM_WEIGHTS_SHA256}")
+set(INFEREDGE_WEIGHT_LABELS "small MLP" "medium MLP" "GEMM")
+foreach(weight_path expected_hash weight_label IN ZIP_LISTS
+        INFEREDGE_WEIGHT_PATHS INFEREDGE_WEIGHT_HASHES INFEREDGE_WEIGHT_LABELS)
+    if(NOT EXISTS "${weight_path}")
+        message(FATAL_ERROR "Weight sidecar is missing for ${weight_label}: ${weight_path}")
+    endif()
+    file(SHA256 "${weight_path}" actual_hash)
+    if(NOT actual_hash STREQUAL expected_hash)
+        message(FATAL_ERROR
+            "Weight sidecar SHA-256 mismatch for ${weight_label}.\n"
+            "  expected: ${expected_hash}\n"
+            "  actual:   ${actual_hash}"
+        )
+    endif()
+endforeach()
+
 add_library(
     inferedge_onnx
     src/inference_engine.cpp
     src/tensor_batch.cpp
+    src/neural_reference.cpp
+)
+if(NOT CMAKE_CXX_COMPILER_ID MATCHES "AppleClang|Clang|GNU")
+    message(FATAL_ERROR "neural_reference.cpp requires -ffp-contract=off")
+endif()
+set_source_files_properties(
+    src/neural_reference.cpp
+    PROPERTIES COMPILE_OPTIONS "-ffp-contract=off"
 )
 target_include_directories(inferedge_onnx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(inferedge_onnx PUBLIC cxx_std_20)
@@ -263,6 +318,8 @@ add_executable(
     tests/inference_engine_test.cpp
     tests/tensor_batch_test.cpp
     tests/mnist_inference_test.cpp
+    tests/neural_reference_test.cpp
+    tests/dynamic_workload_inference_test.cpp
     tests/benchmark_runner_test.cpp
     tests/concurrent_inference_test.cpp
     tests/concurrent_benchmark_test.cpp
@@ -285,6 +342,15 @@ target_compile_definitions(
         "INFEREDGE_MNIST_MODEL_PATH=\"${INFEREDGE_MNIST_MODEL}\""
         "INFEREDGE_MNIST_FIXTURE_DIR=\"${INFEREDGE_MNIST_FIXTURE_DIR}\""
         "INFEREDGE_BATCH_ADD_MODEL_PATH=\"${INFEREDGE_BATCH_ADD_MODEL}\""
+        "INFEREDGE_MLP_SMALL_MODEL_PATH=\"${INFEREDGE_MLP_SMALL_MODEL}\""
+        "INFEREDGE_MLP_MEDIUM_MODEL_PATH=\"${INFEREDGE_MLP_MEDIUM_MODEL}\""
+        "INFEREDGE_GEMM_MODEL_PATH=\"${INFEREDGE_GEMM_MODEL}\""
+        "INFEREDGE_MLP_SMALL_WEIGHTS_PATH=\"${INFEREDGE_MLP_SMALL_WEIGHTS}\""
+        "INFEREDGE_MLP_MEDIUM_WEIGHTS_PATH=\"${INFEREDGE_MLP_MEDIUM_WEIGHTS}\""
+        "INFEREDGE_GEMM_WEIGHTS_PATH=\"${INFEREDGE_GEMM_WEIGHTS}\""
+        "INFEREDGE_MLP_SMALL_FIXTURE_DIR=\"${INFEREDGE_MLP_SMALL_FIXTURE_DIR}\""
+        "INFEREDGE_MLP_MEDIUM_FIXTURE_DIR=\"${INFEREDGE_MLP_MEDIUM_FIXTURE_DIR}\""
+        "INFEREDGE_GEMM_FIXTURE_DIR=\"${INFEREDGE_GEMM_FIXTURE_DIR}\""
 )
 set_target_properties(inferedge_onnx_smoke PROPERTIES
     BUILD_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"
@@ -459,7 +525,11 @@ gtest_discover_tests(
     PROPERTIES TIMEOUT 30
 )
 
-add_executable(inferedge_scheduler_tests tests/inference_scheduler_test.cpp)
+add_executable(
+    inferedge_scheduler_tests
+    tests/inference_scheduler_test.cpp
+    tests/scheduler_neural_batch_test.cpp
+)
 target_link_libraries(
     inferedge_scheduler_tests
     PRIVATE
@@ -475,6 +545,12 @@ target_compile_definitions(
         "INFEREDGE_MNIST_MODEL_PATH=\"${INFEREDGE_MNIST_MODEL}\""
         "INFEREDGE_MNIST_FIXTURE_DIR=\"${INFEREDGE_MNIST_FIXTURE_DIR}\""
         "INFEREDGE_BATCH_ADD_MODEL_PATH=\"${INFEREDGE_BATCH_ADD_MODEL}\""
+        "INFEREDGE_MLP_SMALL_MODEL_PATH=\"${INFEREDGE_MLP_SMALL_MODEL}\""
+        "INFEREDGE_MLP_MEDIUM_MODEL_PATH=\"${INFEREDGE_MLP_MEDIUM_MODEL}\""
+        "INFEREDGE_GEMM_MODEL_PATH=\"${INFEREDGE_GEMM_MODEL}\""
+        "INFEREDGE_MLP_SMALL_WEIGHTS_PATH=\"${INFEREDGE_MLP_SMALL_WEIGHTS}\""
+        "INFEREDGE_MLP_MEDIUM_WEIGHTS_PATH=\"${INFEREDGE_MLP_MEDIUM_WEIGHTS}\""
+        "INFEREDGE_GEMM_WEIGHTS_PATH=\"${INFEREDGE_GEMM_WEIGHTS}\""
 )
 set_target_properties(
     inferedge_scheduler_tests
