@@ -20,6 +20,18 @@ Protocol 2 and protocol 3 keep paired experimental blocks, within-profile cyclic
 
 Disabled timing still changes the `SchedulerCompletion` layout. Instrumentation overhead is uncalibrated and is not subtracted. No performance gain has been established. Prebuilt ONNX Runtime is not instrumented by the project's sanitizer builds.
 
+### Instrumentation overhead study
+
+`benchmarks/collect_overhead.py` and `benchmarks/analyze_overhead.py` measure `completion_timing_overhead`: the incremental effect of enabling completion timing in the current Release binary. OFF omits `--completion-timing` and must emit schema 3. ON passes `--completion-timing` and must emit schema 4. Both arms use the same executable and model. Completion timing is the only intended experimental variable. `analysis_protocol_version = 0` is an overhead metadata sentinel. It is not analysis protocol 1, 2, or 3. The batching analyzer keeps rejecting this experiment. Protocols 1, 2, and 3 are unchanged.
+
+The first configuration is scheduler cell A with batching disabled, profile `low_open`, and 50 offered requests per second. One uncounted pilot pair always runs OFF then ON and never enters the paired sample. Counted `block_index` starts at 0. Even blocks run OFF then ON. Odd blocks run ON then OFF. A reportable study uses 20 complete counted blocks. `paired_block_bootstrap_mean` uses seed `20261014`, 10000 replicates, and a 95% interval. The experimental unit is the paired block. An interval needs at least 10 complete counted blocks. Requests are not resampled as independent blocks. Smoke output is correctness evidence only. A smoke pair cannot become a counted block, and a smoke aggregate has no confidence interval. No measured overhead result has been produced. Do not claim a speedup or zero overhead.
+
+Both arms require strict 100% generator delivery. Schema 3 has no signed generator-lag percentiles, so the study does not claim identical certified arrival-percentile fidelity. The default 1000 ms lag tolerance is not a precise arrival-fidelity certificate. The Add model is a synthetic low-load workload. A measured result does not generalize to saturation, high concurrency, or other model architectures.
+
+Producer-observed latency is the comparable end-to-end field. Pre-publication latency and pre-publication-to-observation delay exist only on the ON arm. No OFF precision-only value is invented, and no instrumentation correction is subtracted. The contrast is the cost of enabling timing in the current binary. It does not measure `SchedulerCompletion` layout cost against the older binary. `winner_declared` stays false. An interval that contains zero does not prove zero overhead.
+
+Run directories live under `benchmarks/scheduler_runs/`. Raw stdout, raw stderr, the execution plan, and trial metadata are kept. Directories and trial files are created exclusively. There is no overwrite, no selective retry, and no deletion of a failed block. `benchmarks/baselines/`, `benchmarks/concurrent_runs/`, and `models/experiments/` stay out of this evidence.
+
 ## Do not add yet
 
 - Published speed figures. `inferedge-bench` calls `run_benchmark` for one loaded `InferenceEngine` on the calling thread and can print that report as text or JSON. `summarize_latencies` still only reduces injected durations. JSON schema version 1 does not include raw samples, hardware, build type, or a model hash. `benchmarks/collect_baseline.py` can launch that executable and validate the JSON. `benchmarks/analyze_baseline.py` reduces one completed run set to `aggregate.json`. Neither script infers, and `benchmarks/baselines/` stays untracked until a measured run set is reviewed
