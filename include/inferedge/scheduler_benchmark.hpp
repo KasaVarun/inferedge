@@ -148,8 +148,10 @@ struct SchedulerBenchmarkLag {
 
 struct SchedulerBenchmarkTensors {
     std::vector<NamedTensor> inputs;
-    // Exact Add outputs. Neural requests leave these at zero and compare
-    // completion values with evaluate_neural_reference after observation.
+    // Exact Add outputs. Neural requests leave these at zero. Independent
+    // neural expected rows are prepared before submit_start, stored with the
+    // request, and compared after observation without recomputing the
+    // reference on the observation path.
     float expected_c0{0.F};
     float expected_c1{0.F};
 };

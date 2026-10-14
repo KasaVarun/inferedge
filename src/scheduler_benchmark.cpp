@@ -70,6 +70,8 @@ struct Inflight {
     std::chrono::steady_clock::time_point submit_start{};
     float expected_c0{0.F};
     float expected_c1{0.F};
+    // Neural expected row prepared before submit_start. Empty for Add.
+    std::vector<float> expected_outputs;
     std::vector<NamedTensor> inputs;
     std::future<SchedulerCompletion> completion;
 };
@@ -116,6 +118,7 @@ struct SharedTrial {
     std::uint64_t unchecked_attempt{0};
     float unchecked_c0{0.F};
     float unchecked_c1{0.F};
+    std::vector<float> unchecked_expected_outputs;
     std::vector<NamedTensor> unchecked_inputs;
     std::vector<NamedTensor> unchecked_outputs;
     bool generators_done{false};
@@ -281,6 +284,36 @@ void remember_error(SharedTrial& trial, std::uint64_t attempt_id, std::string ki
         SchedulerBenchmarkErrorRecord{attempt_id, std::move(kind), std::move(message)});
 }
 
+// Builds inputs and, for neural models, the independent expected row. Must run
+// before submit_start. Does not call the engine. weights are borrowed from the
+// prepared model for the whole trial.
+std::string prepare_inflight_expectation(const PreparedModel& model,
+                                         SchedulerBenchmarkModelId model_id,
+                                         std::uint64_t attempt_id, Inflight& item) {
+    SchedulerBenchmarkTensors tensors = scheduler_benchmark_request(model_id, attempt_id);
+    item.inputs = tensors.inputs;
+    item.expected_c0 = tensors.expected_c0;
+    item.expected_c1 = tensors.expected_c1;
+    item.expected_outputs.clear();
+    if (!model.neural) {
+        return {};
+    }
+    if (item.inputs.size() != 1 || item.inputs.front().values.empty()) {
+        return "neural request input row is empty";
+    }
+    const NeuralReferenceResult reference =
+        evaluate_neural_reference(model.workload, item.inputs.front().values, 1, model.weights);
+    if (reference.error.kind != NeuralReferenceErrorKind::kNone) {
+        return reference.error.message.empty() ? "neural reference preparation failed"
+                                               : reference.error.message;
+    }
+    if (reference.values.empty()) {
+        return "neural reference preparation returned no values";
+    }
+    item.expected_outputs = std::move(reference.values);
+    return {};
+}
+
 SchedulerBenchmarkOutputCheck match_completion(const PreparedModel& model, const Inflight& item,
                                                const SchedulerCompletion& completion) {
     SchedulerBenchmarkOutputCheck failed;
@@ -292,17 +325,12 @@ SchedulerBenchmarkOutputCheck match_completion(const PreparedModel& model, const
         const float expected[] = {item.expected_c0, item.expected_c1};
         return scheduler_benchmark_check_output(model.id, completion.outputs.front(), expected);
     }
-    if (item.inputs.size() != 1 || item.inputs.front().values.empty()) {
-        failed.message = "neural request did not keep its input row";
+    if (item.expected_outputs.empty()) {
+        failed.message = "neural expected output was not prepared before submit";
         return failed;
     }
-    const NeuralReferenceResult reference =
-        evaluate_neural_reference(model.workload, item.inputs.front().values, 1, model.weights);
-    if (reference.error.kind != NeuralReferenceErrorKind::kNone) {
-        failed.message = reference.error.message;
-        return failed;
-    }
-    return scheduler_benchmark_check_output(model.id, completion.outputs.front(), reference.values);
+    return scheduler_benchmark_check_output(model.id, completion.outputs.front(),
+                                            item.expected_outputs);
 }
 
 void note_terminal(SharedTrial& trial, CompletionStatus status) {
@@ -338,6 +366,7 @@ void record_success_sample(SharedTrial& trial, const SchedulerBenchmarkConfig& c
         trial.unchecked_attempt = item.attempt_id;
         trial.unchecked_c0 = item.expected_c0;
         trial.unchecked_c1 = item.expected_c1;
+        trial.unchecked_expected_outputs = item.expected_outputs;
         trial.unchecked_inputs = item.inputs;
         trial.unchecked_outputs = completion.outputs;
         return;
@@ -462,18 +491,33 @@ void run_open_loop_generator(InferenceScheduler& scheduler, const SchedulerBench
                 continue;
             }
             const std::uint64_t attempt_id = static_cast<std::uint64_t>(index) + 1;
-            SchedulerBenchmarkTensors tensors =
-                scheduler_benchmark_request(config.model_id, attempt_id);
+            if (!trial.model) {
+                std::lock_guard<std::mutex> lock(trial.mutex);
+                trial.runtime_failed = true;
+                trial.runtime_message = "model identity was not prepared";
+                trial.generators_done = true;
+                trial.ready.notify_all();
+                return;
+            }
             Inflight item;
             item.attempt_id = attempt_id;
             item.scheduled = scheduled;
-            item.inputs = tensors.inputs;
-            item.expected_c0 = tensors.expected_c0;
-            item.expected_c1 = tensors.expected_c1;
+            const std::string prepared =
+                prepare_inflight_expectation(*trial.model, config.model_id, attempt_id, item);
+            if (!prepared.empty()) {
+                std::lock_guard<std::mutex> lock(trial.mutex);
+                trial.runtime_failed = true;
+                trial.runtime_message = prepared;
+                trial.generators_done = true;
+                trial.ready.notify_all();
+                return;
+            }
+            // Expected outputs are fixed before this stamp. Preparation cost can
+            // make the generator late for this or later arrivals.
             item.submit_start = std::chrono::steady_clock::now();
             const SchedulerBenchmarkLag submit_lag =
                 measure_generator_lag(scheduled, item.submit_start, config.lag_tolerance);
-            Admission admission = scheduler.submit(std::move(tensors.inputs));
+            Admission admission = scheduler.submit(item.inputs);
             {
                 std::lock_guard<std::mutex> lock(trial.mutex);
                 trial.lags.push_back(submit_lag.lag);
@@ -528,10 +572,9 @@ void record_observed(SharedTrial& trial, const SchedulerBenchmarkConfig& config,
         remember_error(trial, item.attempt_id, "completion_exception", exception.what());
         return;
     }
-    // The observation stamp is already fixed. Neural reference work happens
-    // here, on the collector or closed-loop producer, after that stamp and
-    // outside the trial mutex. It can delay later observations and the next
-    // closed-loop submit. It is not engine-run time and it is not zero cost.
+    // The observation stamp is already fixed. Neural expected outputs were
+    // prepared before submit_start. Matching here only compares stored floats
+    // to the completion and must not call evaluate_neural_reference.
     std::optional<SchedulerBenchmarkOutputCheck> prechecked;
     if (completion.status == CompletionStatus::kSucceeded) {
         try {
@@ -759,16 +802,28 @@ void run_closed_producer(InferenceScheduler& scheduler, const SchedulerBenchmark
             if (config.test_submit_delay.count() > 0) {
                 std::this_thread::sleep_for(config.test_submit_delay);
             }
-            SchedulerBenchmarkTensors tensors =
-                scheduler_benchmark_request(config.model_id, attempt_id);
-            const auto submit_start = std::chrono::steady_clock::now();
+            if (!trial.model) {
+                std::lock_guard<std::mutex> lock(trial.mutex);
+                trial.runtime_failed = true;
+                trial.runtime_message = "model identity was not prepared";
+                trial.ready.notify_all();
+                return;
+            }
             Inflight item;
             item.attempt_id = attempt_id;
-            item.inputs = tensors.inputs;
-            item.expected_c0 = tensors.expected_c0;
-            item.expected_c1 = tensors.expected_c1;
-            item.submit_start = submit_start;
-            Admission admission = scheduler.submit(std::move(tensors.inputs));
+            const std::string prepared =
+                prepare_inflight_expectation(*trial.model, config.model_id, attempt_id, item);
+            if (!prepared.empty()) {
+                std::lock_guard<std::mutex> lock(trial.mutex);
+                trial.runtime_failed = true;
+                trial.runtime_message = prepared;
+                trial.ready.notify_all();
+                return;
+            }
+            // Expected outputs are fixed before this stamp. Preparation can
+            // delay the next closed-loop submit on this producer.
+            item.submit_start = std::chrono::steady_clock::now();
+            Admission admission = scheduler.submit(item.inputs);
             if (admission.status != AdmissionStatus::kAccepted) {
                 std::lock_guard<std::mutex> lock(trial.mutex);
                 account_admission(trial, std::move(admission), std::move(item));
@@ -962,6 +1017,7 @@ void check_last_success(SharedTrial& trial, const SchedulerBenchmarkConfig& conf
     item.attempt_id = trial.unchecked_attempt;
     item.expected_c0 = trial.unchecked_c0;
     item.expected_c1 = trial.unchecked_c1;
+    item.expected_outputs = trial.unchecked_expected_outputs;
     item.inputs = trial.unchecked_inputs;
     SchedulerCompletion completion;
     completion.status = CompletionStatus::kSucceeded;
@@ -1257,13 +1313,23 @@ void submit_after_shutdown(InferenceScheduler& scheduler, SharedTrial& trial,
     if (!config.test_submit_after_shutdown) {
         return;
     }
-    SchedulerBenchmarkTensors tensors = scheduler_benchmark_request(config.model_id, 1);
     Inflight item;
     item.attempt_id = 1;
-    item.inputs = tensors.inputs;
-    item.expected_c0 = tensors.expected_c0;
-    item.expected_c1 = tensors.expected_c1;
-    Admission admission = scheduler.submit(std::move(tensors.inputs));
+    if (trial.model) {
+        const std::string prepared =
+            prepare_inflight_expectation(*trial.model, config.model_id, 1, item);
+        if (!prepared.empty()) {
+            std::lock_guard<std::mutex> lock(trial.mutex);
+            remember_error(trial, 1, "reference_preparation", prepared);
+            return;
+        }
+    } else {
+        SchedulerBenchmarkTensors tensors = scheduler_benchmark_request(config.model_id, 1);
+        item.inputs = tensors.inputs;
+        item.expected_c0 = tensors.expected_c0;
+        item.expected_c1 = tensors.expected_c1;
+    }
+    Admission admission = scheduler.submit(item.inputs);
     std::lock_guard<std::mutex> lock(trial.mutex);
     ++trial.scheduled;
     account_admission(trial, std::move(admission), std::move(item));

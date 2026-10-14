@@ -1091,3 +1091,123 @@ TEST(SchedulerBenchmarkNeuralTest, ClosedRejectionRestoresTheFeaturesRow) {
     EXPECT_EQ(run.report.error_count, 0U);
     EXPECT_FALSE(run.report.valid);
 }
+
+TEST(SchedulerBenchmarkNeuralTest, ClosedLoopAndBatchedOpenLoopStayCorrect) {
+    SchedulerBenchmarkConfig closed =
+        NeuralRun("mlp_small_f32.onnx", inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, false);
+    closed.workload = SchedulerWorkloadKind::kClosedLoop;
+    closed.producer_count = 1;
+    closed.max_offered = 3;
+    closed.max_outstanding = 2;
+    closed.target_requests_per_second = 0.0;
+    const SchedulerBenchmarkRun closed_run = inferedge::run_scheduler_benchmark(closed);
+    ASSERT_EQ(closed_run.kind, SchedulerBenchmarkErrorKind::kNone) << closed_run.message;
+    EXPECT_TRUE(closed_run.report.valid);
+    EXPECT_EQ(closed_run.report.succeeded, 3U);
+    EXPECT_EQ(closed_run.report.correctness_mismatches, 0U);
+    EXPECT_EQ(closed_run.report.correctness_checked, 3U);
+    EXPECT_EQ(closed_run.report.failed_inference, 0U);
+    ExpectAccounting(closed_run.report);
+
+    SchedulerBenchmarkConfig gemm =
+        NeuralRun("gemm_f32.onnx", inferedge::SchedulerBenchmarkModelId::kGemmF32, true);
+    gemm.workload = SchedulerWorkloadKind::kClosedLoop;
+    gemm.producer_count = 1;
+    gemm.max_offered = 2;
+    gemm.max_outstanding = 1;
+    gemm.target_requests_per_second = 0.0;
+    const SchedulerBenchmarkRun gemm_run = inferedge::run_scheduler_benchmark(gemm);
+    ASSERT_EQ(gemm_run.kind, SchedulerBenchmarkErrorKind::kNone) << gemm_run.message;
+    EXPECT_TRUE(gemm_run.report.valid);
+    EXPECT_EQ(gemm_run.report.succeeded, 2U);
+    EXPECT_EQ(gemm_run.report.correctness_mismatches, 0U);
+    ExpectAccounting(gemm_run.report);
+}
+
+TEST(SchedulerBenchmarkNeuralTest, CheckIntervalStillChecksTheLastSuccess) {
+    SchedulerBenchmarkConfig config =
+        NeuralRun("mlp_small_f32.onnx", inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, false);
+    config.max_offered = 4;
+    config.max_outstanding = 4;
+    config.check_interval = 3;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.valid);
+    EXPECT_EQ(run.report.succeeded, 4U);
+    EXPECT_EQ(run.report.correctness_mismatches, 0U);
+    EXPECT_GE(run.report.correctness_checked, 2U);
+    EXPECT_LE(run.report.correctness_checked, 4U);
+}
+
+TEST(SchedulerBenchmarkNeuralTest, SchemaFourKeysStayUnchangedForNeural) {
+    SchedulerBenchmarkConfig config =
+        NeuralRun("mlp_small_f32.onnx", inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, false);
+    config.enable_completion_timing = true;
+    config.max_offered = 1;
+    config.max_outstanding = 1;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.valid);
+    EXPECT_EQ(run.report.succeeded, 1U);
+    EXPECT_EQ(run.report.correctness_mismatches, 0U);
+    const auto json = inferedge::write_scheduler_benchmark_json(run.report, "0.1.0");
+    EXPECT_TRUE(json.error.empty());
+    EXPECT_NE(json.text.find("\"schema_version\": 4"), std::string::npos);
+    EXPECT_NE(json.text.find("\"pre_publication_latency\""), std::string::npos);
+    EXPECT_NE(json.text.find("\"pre_publication_to_observation_delay\""), std::string::npos);
+    EXPECT_EQ(json.text.find("\"model_id\""), std::string::npos);
+    EXPECT_EQ(json.text.find("post_publication"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkNeuralTest, AddRegressionStillUsesExactEquality) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.max_offered = 3;
+    config.max_outstanding = 3;
+    config.model_id = inferedge::SchedulerBenchmarkModelId::kBatchAddF32;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.valid);
+    EXPECT_EQ(run.report.succeeded, 3U);
+    EXPECT_EQ(run.report.correctness_mismatches, 0U);
+    const auto json = inferedge::write_scheduler_benchmark_json(run.report, "0.1.0");
+    EXPECT_TRUE(json.error.empty());
+    EXPECT_NE(json.text.find("\"schema_version\": 3"), std::string::npos);
+    EXPECT_EQ(json.text.find("\"model_id\""), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkNeuralTest, InjectedCheckFailureDoesNotFalsePass) {
+    SchedulerBenchmarkConfig config =
+        NeuralRun("mlp_small_f32.onnx", inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, false);
+    config.max_offered = 1;
+    config.max_outstanding = 1;
+    config.test_fail_checked_successes = 1;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_FALSE(run.report.valid);
+    EXPECT_GT(run.report.correctness_mismatches, 0U);
+    EXPECT_EQ(inferedge::scheduler_benchmark_status(run), 1);
+}
+
+TEST(SchedulerBenchmarkNeuralTest, DistinctAttemptRowsFailWhenSwapped) {
+    const auto early = inferedge::scheduler_benchmark_request(
+        inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, 1);
+    const auto late = inferedge::scheduler_benchmark_request(
+        inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, 200);
+    ASSERT_NE(early.inputs[0].values[0], late.inputs[0].values[0]);
+    // Distinct stored expected rows must not match under the MLP tolerance.
+    // Full end-to-end prep-before-submit association is covered by open/closed
+    // neural trials that pass only when each Inflight keeps its own expected row.
+    const std::vector<float> expected_early(8, 0.F);
+    std::vector<float> expected_late(8, 0.F);
+    expected_late[0] = 1.F;
+    inferedge::NamedTensor late_as_early{"logits", {1, 8}, expected_late};
+    EXPECT_FALSE(
+        inferedge::scheduler_benchmark_check_output(
+            inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, late_as_early, expected_early)
+            .matched);
+    inferedge::NamedTensor early_as_early{"logits", {1, 8}, expected_early};
+    EXPECT_TRUE(
+        inferedge::scheduler_benchmark_check_output(
+            inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, early_as_early, expected_early)
+            .matched);
+}
