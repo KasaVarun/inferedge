@@ -28,9 +28,16 @@ inline constexpr std::size_t kMaxSchedulerQueueCapacity = 1024;
 // dynamic batch axis, and a worker may run several validated requests in one
 // InferenceEngine::run(). max_batch_size is 1 through 32. max_batch_delay is
 // 0 through 1000 milliseconds. Both bounds are checked either way.
-// enable_metrics collects worker-local engine-run counts, batch-size
-// histogram bins, and assembly/run/split duration totals. The default is
-// false: workers do not read a clock and do not update metric storage.
+// adaptive_batching is an opt-in early-seal policy for the fill loop. The
+// default is false and preserves fixed-delay waiting. When true, a worker may
+// seal once it owns at least kAdaptiveMinTargetBatch validated requests and
+// the queue is empty, without waiting out the remainder of max_batch_delay.
+// It does not estimate arrival rate. enable_metrics collects worker-local
+// engine-run counts, batch-size histogram bins, and assembly/run/split
+// duration totals. The default is false: workers do not read a clock and do
+// not update metric storage.
+inline constexpr std::size_t kAdaptiveMinTargetBatch = 2;
+
 struct SchedulerConfig {
     std::filesystem::path model_path;
     std::uint32_t worker_count{1};
@@ -38,6 +45,10 @@ struct SchedulerConfig {
     bool enable_batching{false};
     std::uint32_t max_batch_size{1};
     std::chrono::milliseconds max_batch_delay{0};
+    // Opt-in. When false, RunBatch keeps fixed-delay fill behavior. When true,
+    // start() requires enable_batching, max_batch_size >= kAdaptiveMinTargetBatch,
+    // and max_batch_delay > 0.
+    bool adaptive_batching{false};
     bool enable_metrics{false};
     // When true, each published completion carries one steady_clock time point
     // taken immediately before promise::set_value. The default reads no clock

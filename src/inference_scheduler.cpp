@@ -142,6 +142,20 @@ SchedulerError ValidateConfig(const SchedulerConfig& config) {
         return MakeError(SchedulerErrorKind::kInvalidConfig,
                          "max_batch_delay must be from 0 through 1000 milliseconds");
     }
+    if (config.adaptive_batching) {
+        if (!config.enable_batching) {
+            return MakeError(SchedulerErrorKind::kInvalidConfig,
+                             "adaptive_batching requires enable_batching");
+        }
+        if (config.max_batch_size < kAdaptiveMinTargetBatch) {
+            return MakeError(SchedulerErrorKind::kInvalidConfig,
+                             "adaptive_batching requires max_batch_size >= 2");
+        }
+        if (config.max_batch_delay <= std::chrono::milliseconds::zero()) {
+            return MakeError(SchedulerErrorKind::kInvalidConfig,
+                             "adaptive_batching requires max_batch_delay > 0");
+        }
+    }
     return {};
 }
 
@@ -833,6 +847,12 @@ BatchStep InferenceScheduler::Impl::RunBatch(std::uint32_t index, InferenceEngin
                 continue;
             }
             if (taken.result == QueueTakeResult::kClosed) {
+                break;
+            }
+            // Open and empty. Opt-in early seal: stop waiting once enough
+            // validated requests are owned. Invalid entries published alone
+            // never enter owned and do not satisfy this threshold.
+            if (config_.adaptive_batching && owned.size() >= kAdaptiveMinTargetBatch) {
                 break;
             }
             if (!wait_for_more || std::chrono::steady_clock::now() >= deadline) {
