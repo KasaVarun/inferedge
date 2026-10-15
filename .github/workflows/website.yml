@@ -1,0 +1,37 @@
+name: Website
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Typecheck and production build
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Install website dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run website tests
+        run: npm test
+
+      - name: Production build
+        run: npm run build

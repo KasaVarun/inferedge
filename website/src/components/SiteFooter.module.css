@@ -1,0 +1,20 @@
+.footer {
+  border-top: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+
+.inner {
+  max-width: var(--content-max);
+  margin: 0 auto;
+  padding: var(--space-5);
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+
+.inner p {
+  margin: 0 0 var(--space-2);
+}
+
+.inner p:last-child {
+  margin-bottom: 0;
+}

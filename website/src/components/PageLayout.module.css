@@ -1,0 +1,33 @@
+.main {
+  flex: 1;
+  width: 100%;
+}
+
+.article {
+  max-width: var(--content-max);
+  margin: 0 auto;
+  padding: var(--space-6) var(--space-5) var(--space-7);
+}
+
+.kicker {
+  margin: 0 0 var(--space-2);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.card {
+  margin-top: var(--space-5);
+  padding: var(--space-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow);
+}
+
+.note {
+  margin: 0;
+  color: var(--text-muted);
+}

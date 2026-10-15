@@ -1,0 +1,26 @@
+:root {
+  color-scheme: dark;
+  --font-sans: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "SFMono-Regular", Menlo, Consolas, monospace;
+  --bg: #0c1016;
+  --bg-elevated: #151b24;
+  --bg-muted: #1c2430;
+  --border: #2b3645;
+  --text: #e8eef6;
+  --text-muted: #a8b4c4;
+  --accent: #7dd3c0;
+  --accent-strong: #4db8a4;
+  --focus: #f0c674;
+  --danger: #f2a3a3;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+  --radius: 0.5rem;
+  --shadow: 0 1px 0 rgb(255 255 255 / 4%) inset, 0 8px 24px rgb(0 0 0 / 28%);
+  --content-max: 68rem;
+  --header-height: 4rem;
+}
