@@ -90,9 +90,11 @@ REPORTABLE_CELLS = ("A", "C")
 REPORTABLE_BASELINE = "A"
 REPORTABLE_ALTERNATIVE = "C"
 
-# Neural-local delay / adaptive probes. Not part of the historical Add CELL_BY_ID
-# registry. Distinct from shared cell G (max_batch_size 8, delay 1) and H (max 16, delay 1).
+# Neural-local delay / adaptive / arrival-aware probes. Not part of the historical
+# Add CELL_BY_ID registry. Distinct from shared cell G (max_batch_size 8, delay 1)
+# and H (max 16, delay 1).
 # G3 is minimum-target early-sealing (C++ kAdaptiveMinTargetBatch=2); no CLI for the target.
+# G4 is arrival-aware early seal (EWMA alpha=1/8); no estimator tuning CLI.
 NEURAL_LOCAL_CELLS = (
     {"id": "G1", "enable_batching": True, "max_batch_size": 4, "max_batch_delay_ms": 1},
     {"id": "G2", "enable_batching": True, "max_batch_size": 4, "max_batch_delay_ms": 2},
@@ -103,20 +105,42 @@ NEURAL_LOCAL_CELLS = (
         "max_batch_delay_ms": 2,
         "adaptive_batching": True,
     },
+    {
+        "id": "G4",
+        "enable_batching": True,
+        "max_batch_size": 4,
+        "max_batch_delay_ms": 2,
+        "adaptive_batching": False,
+        "arrival_aware_batching": True,
+    },
 )
 NEURAL_LOCAL_CELL_BY_ID = {cell["id"]: cell for cell in NEURAL_LOCAL_CELLS}
 # G1 stays calibration-only. G2 is calibration-only except the frozen A/G2
 # reportable contrast. G3 is calibration-only except the frozen A/G2/G3
-# three-arm reportable contrast.
+# three-arm reportable contrast. G4 is calibration-only with no reportable contrast.
 CALIBRATION_ONLY_NEURAL_CELLS = frozenset(NEURAL_LOCAL_CELL_BY_ID)
 CALIBRATION_VARIANT_NONZERO_BATCH_DELAY_V1 = "nonzero_batch_delay_v1"
 CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1 = "adaptive_early_seal_v1"
+CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1 = "arrival_aware_batching_v1"
 ADAPTIVE_EARLY_SEAL_CELLS = ("A", "G2", "G3")
+ARRIVAL_AWARE_BATCHING_CELLS = ("A", "G2", "G3", "G4")
 ADAPTIVE_EARLY_SEAL_RATE = 1000.0
 ADAPTIVE_EARLY_SEAL_COUNTED_RUNS = 1
+ARRIVAL_AWARE_BATCHING_RATE = 1000.0
+ARRIVAL_AWARE_BATCHING_COUNTED_RUNS = 1
+STRICT_CALIBRATION_VARIANTS = frozenset(
+    {
+        CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1,
+        CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1,
+    }
+)
 CELL_DEFINITION_KEYS = ("id", "enable_batching", "max_batch_size", "max_batch_delay_ms")
 CELL_DEFINITION_ADAPTIVE_KEY = "adaptive_batching"
-CELL_DEFINITION_ALLOWED_KEYS = CELL_DEFINITION_KEYS + (CELL_DEFINITION_ADAPTIVE_KEY,)
+CELL_DEFINITION_ARRIVAL_KEY = "arrival_aware_batching"
+CELL_DEFINITION_ALLOWED_KEYS = CELL_DEFINITION_KEYS + (
+    CELL_DEFINITION_ADAPTIVE_KEY,
+    CELL_DEFINITION_ARRIVAL_KEY,
+)
 
 CONTRAST_ID_AC = "gemm_f32_A_vs_C"
 CONTRAST_ID_AG2 = "gemm_f32_A_vs_G2_delay2ms_rps1000"
@@ -290,16 +314,24 @@ def model_contract(model_id: str) -> dict:
         raise NeuralCollectorError(f"unsupported model_id {model_id!r}; known: {known}") from exc
 
 
-def resolve_neural_cell(cell_id: str, *, allow_g3: bool = False) -> dict:
+def resolve_neural_cell(
+    cell_id: str, *, allow_g3: bool = False, allow_g4: bool = False
+) -> dict:
     """Resolve one cell id to an independent dict copy.
 
-    G1/G2/G3 come from neural-local definitions. All other ids come from the
+    G1/G2/G3/G4 come from neural-local definitions. All other ids come from the
     shared Add CELL_BY_ID registry. The shared registry is never mutated.
 
-    Bare resolve_neural_cell("G3") is rejected so G3 cannot be treated as a
-    general cell. Callers must resolve G3 through resolve_neural_cells with
-    mode='calibration' or the allowlisted A/G2/G3 reportable contrast.
+    Bare resolve_neural_cell("G3") / ("G4") is rejected so those cells cannot be
+    treated as general. Callers must resolve them through resolve_neural_cells
+    with mode='calibration' (G4), or calibration / allowlisted A/G2/G3 reportable
+    (G3).
     """
+    if cell_id == "G4" and not allow_g4:
+        raise NeuralCollectorError(
+            "G4 is calibration-only unless resolved via resolve_neural_cells "
+            "for calibration mode"
+        )
     if cell_id == "G3" and not allow_g3:
         raise NeuralCollectorError(
             "G3 is calibration-only unless resolved via resolve_neural_cells "
@@ -327,7 +359,8 @@ def resolve_neural_cells(
 
     G1 remains calibration-only. G2 is calibration-only except the frozen A/G2
     reportable contrast. G3 is calibration-only except the frozen A/G2/G3
-    reportable contrast. Smoke never accepts G3. Duplicates are rejected.
+    reportable contrast. G4 is calibration-only with no reportable contrast.
+    Smoke never accepts G3 or G4. Duplicates are rejected.
     """
     if not cell_ids:
         raise NeuralCollectorError("cells are required")
@@ -352,7 +385,11 @@ def resolve_neural_cells(
                 f"neural-local cells {', '.join(disallowed)} are not permitted in mode {mode!r}"
             )
     allow_g3 = mode == "calibration" or "G3" in allowed_local
-    return [resolve_neural_cell(cell_id, allow_g3=allow_g3) for cell_id in cell_ids]
+    allow_g4 = mode == "calibration"
+    return [
+        resolve_neural_cell(cell_id, allow_g3=allow_g3, allow_g4=allow_g4)
+        for cell_id in cell_ids
+    ]
 
 
 def _require_json_bool(value: object, label: str) -> bool:
@@ -364,8 +401,9 @@ def _require_json_bool(value: object, label: str) -> bool:
 def adaptive_batching_for_cell(cell: dict) -> bool:
     """Return the effective adaptive_batching policy for a neural cell.
 
-    G3 must explicitly declare adaptive_batching=true. Historical A/C/G1/G2
+    G3 must explicitly declare adaptive_batching=true. Historical A/C/G1/G2/G4
     default to false when the key is absent. Non-boolean values are rejected.
+    G4 cannot set adaptive_batching=true.
     """
     if not isinstance(cell, dict):
         raise NeuralCollectorError("cell definition is not an object")
@@ -393,14 +431,63 @@ def adaptive_batching_for_cell(cell: dict) -> bool:
     return False
 
 
+def arrival_aware_batching_for_cell(cell: dict) -> bool:
+    """Return the effective arrival_aware_batching policy for a neural cell.
+
+    G4 must explicitly declare arrival_aware_batching=true with adaptive false.
+    G3 and historical cells default to false when the key is absent. G3 cannot
+    set arrival_aware_batching=true. Non-boolean values are rejected.
+    """
+    if not isinstance(cell, dict):
+        raise NeuralCollectorError("cell definition is not an object")
+    cell_id = str(cell.get("id", ""))
+    if cell_id == "G4":
+        if CELL_DEFINITION_ARRIVAL_KEY not in cell:
+            raise NeuralCollectorError("G4 requires arrival_aware_batching=true")
+        value = _require_json_bool(cell[CELL_DEFINITION_ARRIVAL_KEY], "arrival_aware_batching")
+        if value is not True:
+            raise NeuralCollectorError("G4 requires arrival_aware_batching=true")
+        if cell.get("enable_batching") is not True:
+            raise NeuralCollectorError("G4 requires enable_batching=true")
+        if int(cell.get("max_batch_size", -1)) != 4:
+            raise NeuralCollectorError("G4 requires max_batch_size=4")
+        if int(cell.get("max_batch_delay_ms", -1)) != 2:
+            raise NeuralCollectorError("G4 requires max_batch_delay_ms=2")
+        if CELL_DEFINITION_ADAPTIVE_KEY in cell:
+            adaptive = _require_json_bool(
+                cell[CELL_DEFINITION_ADAPTIVE_KEY], "adaptive_batching"
+            )
+            if adaptive is True:
+                raise NeuralCollectorError("G4 requires adaptive_batching=false")
+        return True
+    if cell_id == "G3":
+        if CELL_DEFINITION_ARRIVAL_KEY in cell:
+            value = _require_json_bool(
+                cell[CELL_DEFINITION_ARRIVAL_KEY], "arrival_aware_batching"
+            )
+            if value is True:
+                raise NeuralCollectorError("G3 cannot set arrival_aware_batching=true")
+            return False
+        return False
+    if CELL_DEFINITION_ARRIVAL_KEY in cell:
+        value = _require_json_bool(cell[CELL_DEFINITION_ARRIVAL_KEY], "arrival_aware_batching")
+        if value is True:
+            raise NeuralCollectorError(
+                f"cell {cell_id!r} cannot set arrival_aware_batching=true (G4 only)"
+            )
+        return False
+    return False
+
+
 def normalize_cell_definition(cell: dict) -> dict:
     """Normalize a cell definition for comparison and in-memory use.
 
-    Base four keys are always required. adaptive_batching is optional for
-    historical cells (effective false) and mandatory true for G3. Unknown keys
-    are rejected. The normalized form always carries adaptive_batching so
-    analyzer imports comparing four-key historical definitions still match
-    after defaulting the missing field to false.
+    Base four keys are always required. adaptive_batching and
+    arrival_aware_batching are optional for historical cells (effective false),
+    mandatory true for G3 and G4 respectively. Unknown keys are rejected. The
+    normalized form always carries both policy booleans so analyzer imports
+    comparing four-key or five-key historical definitions still match after
+    defaulting missing fields to false.
     """
     missing = [key for key in CELL_DEFINITION_KEYS if key not in cell]
     if missing:
@@ -414,21 +501,43 @@ def normalize_cell_definition(cell: dict) -> dict:
         "max_batch_size": int(cell["max_batch_size"]),
         "max_batch_delay_ms": int(cell["max_batch_delay_ms"]),
     }
+    probe = dict(base)
     if CELL_DEFINITION_ADAPTIVE_KEY in cell:
-        probe = {**base, CELL_DEFINITION_ADAPTIVE_KEY: cell[CELL_DEFINITION_ADAPTIVE_KEY]}
-    else:
-        probe = dict(base)
+        probe[CELL_DEFINITION_ADAPTIVE_KEY] = cell[CELL_DEFINITION_ADAPTIVE_KEY]
+    if CELL_DEFINITION_ARRIVAL_KEY in cell:
+        probe[CELL_DEFINITION_ARRIVAL_KEY] = cell[CELL_DEFINITION_ARRIVAL_KEY]
     adaptive = adaptive_batching_for_cell(probe)
-    return {**base, CELL_DEFINITION_ADAPTIVE_KEY: adaptive}
+    arrival = arrival_aware_batching_for_cell(probe)
+    if adaptive and arrival:
+        raise NeuralCollectorError(
+            "adaptive_batching and arrival_aware_batching are mutually exclusive"
+        )
+    return {
+        **base,
+        CELL_DEFINITION_ADAPTIVE_KEY: adaptive,
+        CELL_DEFINITION_ARRIVAL_KEY: arrival,
+    }
 
 
-def serialize_cell_definitions(cells: list[dict], *, include_adaptive: bool) -> list[dict]:
+def serialize_cell_definitions(
+    cells: list[dict],
+    *,
+    include_adaptive: bool,
+    include_arrival_aware: bool = False,
+) -> list[dict]:
     """Serialize cell_definitions for environment metadata.
 
     Historical A/C and A/G2 reportable keep four-key on-disk shapes.
     adaptive_early_seal_v1 calibration and the A/G2/G3 reportable contrast
-    require five-key definitions for every cell.
+    require five-key definitions for every cell. arrival_aware_batching_v1
+    requires six-key definitions for every cell. Format is chosen by the
+    caller from the validated calibration / reportable variant, not inferred
+    from arbitrary cell dictionary keys.
     """
+    if include_arrival_aware and not include_adaptive:
+        raise NeuralCollectorError(
+            "six-key cell_definitions require include_adaptive with include_arrival_aware"
+        )
     serialized: list[dict] = []
     for cell in cells:
         normalized = normalize_cell_definition(cell)
@@ -440,6 +549,8 @@ def serialize_cell_definitions(cells: list[dict], *, include_adaptive: bool) -> 
         }
         if include_adaptive:
             entry[CELL_DEFINITION_ADAPTIVE_KEY] = bool(normalized[CELL_DEFINITION_ADAPTIVE_KEY])
+        if include_arrival_aware:
+            entry[CELL_DEFINITION_ARRIVAL_KEY] = bool(normalized[CELL_DEFINITION_ARRIVAL_KEY])
         serialized.append(entry)
     return serialized
 
@@ -455,13 +566,42 @@ def resolve_calibration_variant(
 ) -> str | None:
     """Return a named calibration variant or None.
 
-    adaptive_early_seal_v1 is exact-set only: gemm_f32 A,G2,G3 at 1000 RPS,
-    workers=1, duration_ms=1000, counted_runs=1. Other neural-local delay
-    calibrations keep nonzero_batch_delay_v1.
+    arrival_aware_batching_v1 is exact-set only: gemm_f32 A,G2,G3,G4 at 1000 RPS,
+    workers=1, duration_ms=1000, counted_runs=1. It is selected before the G3
+    adaptive_early_seal_v1 branch. adaptive_early_seal_v1 remains gemm_f32
+    A,G2,G3 at the same measurement shape. Other neural-local delay calibrations
+    keep nonzero_batch_delay_v1.
     """
     if mode != "calibration":
         return None
     cell_ids = tuple(str(cell["id"]) for cell in cells)
+    if "G4" in cell_ids or cell_ids == ARRIVAL_AWARE_BATCHING_CELLS:
+        if cell_ids != ARRIVAL_AWARE_BATCHING_CELLS:
+            raise NeuralCollectorError(
+                "arrival_aware_batching_v1 requires cells A,G2,G3,G4 in that order; "
+                f"got {','.join(cell_ids)!r}"
+            )
+        if model_id != REPORTABLE_MODEL_ID:
+            raise NeuralCollectorError(
+                f"arrival_aware_batching_v1 requires model_id {REPORTABLE_MODEL_ID}"
+            )
+        rate = profile.get("target_rps")
+        if not isinstance(rate, (int, float)) or float(rate) != ARRIVAL_AWARE_BATCHING_RATE:
+            raise NeuralCollectorError(
+                f"arrival_aware_batching_v1 requires target_rps {ARRIVAL_AWARE_BATCHING_RATE:g}"
+            )
+        if int(measurement.get("worker_count", -1)) != 1:
+            raise NeuralCollectorError("arrival_aware_batching_v1 requires worker_count=1")
+        if int(measurement.get("duration_ms", -1)) != 1000:
+            raise NeuralCollectorError("arrival_aware_batching_v1 requires duration_ms=1000")
+        if counted_runs != ARRIVAL_AWARE_BATCHING_COUNTED_RUNS:
+            raise NeuralCollectorError(
+                f"arrival_aware_batching_v1 requires counted_runs="
+                f"{ARRIVAL_AWARE_BATCHING_COUNTED_RUNS}"
+            )
+        for cell in cells:
+            normalize_cell_definition(cell)
+        return CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1
     if "G3" in cell_ids or cell_ids == ADAPTIVE_EARLY_SEAL_CELLS:
         if cell_ids != ADAPTIVE_EARLY_SEAL_CELLS:
             raise NeuralCollectorError(
@@ -551,6 +691,35 @@ def multi_request_batch_fraction(document: dict) -> tuple[float | None, list[str
         if size >= 2 and type(count) is int and count > 0:
             multi += size * count
     return float(multi) / float(entered), problems
+
+
+def multi_size_batch_fraction(document: dict) -> tuple[float | None, list[str]]:
+    """Fraction of sealed batches with size >= 2.
+
+    Diagnostic only. Does not certify early-seal events.
+    """
+    mean, problems = realized_mean_batch_size(document)
+    if problems and mean is None:
+        return None, problems
+    metrics = document.get("metrics")
+    if not isinstance(metrics, dict):
+        return None, ["metrics object is missing"]
+    histogram = metrics.get("batch_size_histogram")
+    if not isinstance(histogram, list) or not histogram:
+        return None, ["batch_size_histogram is missing"]
+    sealed = 0
+    multi = 0
+    for size, count in enumerate(histogram):
+        if size == 0:
+            continue
+        if type(count) is not int or count < 0:
+            return None, [f"batch_size_histogram[{size}] is invalid"]
+        sealed += count
+        if size >= 2:
+            multi += count
+    if sealed <= 0:
+        return None, ["no sealed batches are recorded"]
+    return float(multi) / float(sealed), problems
 
 
 def arrival_screen_problems(document: dict, max_lag_ns: int) -> list[str]:
@@ -755,8 +924,16 @@ def neural_scheduler_command(
         raise NeuralCollectorError("Add scheduler_command unexpectedly emitted --model-id")
     model_index = command.index("--model")
     command[model_index:model_index] = ["--model-id", model_id]
-    if adaptive_batching_for_cell(cell):
+    adaptive = adaptive_batching_for_cell(cell)
+    arrival = arrival_aware_batching_for_cell(cell)
+    if adaptive and arrival:
+        raise NeuralCollectorError(
+            "adaptive_batching and arrival_aware_batching are mutually exclusive"
+        )
+    if adaptive:
         command.append("--adaptive-batching")
+    if arrival:
+        command.append("--arrival-aware-batching")
     return command
 
 
@@ -964,28 +1141,37 @@ def adaptive_identity_consistency_problems(
     """Require cell, command, expected launch, and runner JSON policy identity agree."""
     problems: list[str] = []
     try:
-        configured = adaptive_batching_for_cell(cell)
+        configured_adaptive = adaptive_batching_for_cell(cell)
+        configured_arrival = arrival_aware_batching_for_cell(cell)
     except NeuralCollectorError as exc:
         return [str(exc)]
-    flag_present = "--adaptive-batching" in command
-    if flag_present is not configured:
+    if configured_adaptive and configured_arrival:
+        problems.append("adaptive_batching and arrival_aware_batching are mutually exclusive")
+    adaptive_flag = "--adaptive-batching" in command
+    arrival_flag = "--arrival-aware-batching" in command
+    if adaptive_flag is not configured_adaptive:
         problems.append(
             "command adaptive flag "
-            f"{'present' if flag_present else 'absent'} disagrees with cell "
-            f"adaptive_batching={configured}"
+            f"{'present' if adaptive_flag else 'absent'} disagrees with cell "
+            f"adaptive_batching={configured_adaptive}"
         )
-    if "--arrival-aware-batching" in command:
-        problems.append("command must not emit --arrival-aware-batching before G4 cell support")
+    if arrival_flag is not configured_arrival:
+        problems.append(
+            "command arrival-aware flag "
+            f"{'present' if arrival_flag else 'absent'} disagrees with cell "
+            f"arrival_aware_batching={configured_arrival}"
+        )
     expected_adaptive = expected.get("adaptive_batching")
-    if type(expected_adaptive) is not bool or expected_adaptive is not configured:
+    if type(expected_adaptive) is not bool or expected_adaptive is not configured_adaptive:
         problems.append(
             f"expected launch adaptive_batching is {expected_adaptive!r}, "
-            f"disagrees with cell adaptive_batching={configured}"
+            f"disagrees with cell adaptive_batching={configured_adaptive}"
         )
     expected_arrival = expected.get("arrival_aware_batching")
-    if expected_arrival is not False:
+    if type(expected_arrival) is not bool or expected_arrival is not configured_arrival:
         problems.append(
-            f"expected launch arrival_aware_batching is {expected_arrival!r}, expected False"
+            f"expected launch arrival_aware_batching is {expected_arrival!r}, "
+            f"disagrees with cell arrival_aware_batching={configured_arrival}"
         )
     scheduler = document.get("scheduler")
     if not isinstance(scheduler, dict):
@@ -997,19 +1183,20 @@ def adaptive_identity_consistency_problems(
     reported = scheduler[CELL_DEFINITION_ADAPTIVE_KEY]
     if type(reported) is not bool:
         problems.append("scheduler.adaptive_batching is not a JSON boolean")
-    elif reported is not configured:
+    elif reported is not configured_adaptive:
         problems.append(
-            f"scheduler.adaptive_batching is {reported}, expected {configured}"
+            f"scheduler.adaptive_batching is {reported}, expected {configured_adaptive}"
         )
-    if "arrival_aware_batching" not in scheduler:
+    if CELL_DEFINITION_ARRIVAL_KEY not in scheduler:
         problems.append("scheduler.arrival_aware_batching is missing")
     else:
-        reported_arrival = scheduler["arrival_aware_batching"]
+        reported_arrival = scheduler[CELL_DEFINITION_ARRIVAL_KEY]
         if type(reported_arrival) is not bool:
             problems.append("scheduler.arrival_aware_batching is not a JSON boolean")
-        elif reported_arrival is not False:
+        elif reported_arrival is not configured_arrival:
             problems.append(
-                f"scheduler.arrival_aware_batching is {reported_arrival}, expected False"
+                f"scheduler.arrival_aware_batching is {reported_arrival}, "
+                f"expected {configured_arrival}"
             )
     return problems
 
@@ -1055,13 +1242,21 @@ def neural_preflight(
         measurement=measurement,
         counted_runs=counted_runs,
     )
-    include_adaptive_definitions = calibration_variant == CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1
+    include_arrival_aware_definitions = (
+        calibration_variant == CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1
+    )
+    include_adaptive_definitions = (
+        calibration_variant == CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1
+        or include_arrival_aware_definitions
+    )
     if reportable_contrast is not None and reportable_contrast.get(
         "require_five_key_cell_definitions"
     ):
         include_adaptive_definitions = True
     cell_definitions = serialize_cell_definitions(
-        cells, include_adaptive=include_adaptive_definitions
+        cells,
+        include_adaptive=include_adaptive_definitions,
+        include_arrival_aware=include_arrival_aware_definitions,
     )
     if reportable_contrast is not None:
         expected_cells = reportable_contrast.get("expected_cells")
@@ -1334,9 +1529,9 @@ def neural_preflight(
             "environment_variable": "ORT_DISABLE_TELEMETRY=1",
             "external_wall_timeout_seconds": wall_timeout_seconds(measurement),
             "zero_admission_rejection_required": mode == "reportable"
-            or calibration_variant == CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1,
+            or calibration_variant in STRICT_CALIBRATION_VARIANTS,
             "require_strict_generator_delivery": mode in {"smoke", "reportable"}
-            or calibration_variant == CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1,
+            or calibration_variant in STRICT_CALIBRATION_VARIANTS,
             **contrast_identity,
             **(
                 {"calibration_variant": calibration_variant}
@@ -1375,7 +1570,7 @@ def _expected_launch(checked: dict, cell: dict, profile: dict) -> dict:
         "max_batch_size": cell["max_batch_size"],
         "max_batch_delay_ms": cell["max_batch_delay_ms"],
         "adaptive_batching": adaptive_batching_for_cell(cell),
-        "arrival_aware_batching": False,
+        "arrival_aware_batching": arrival_aware_batching_for_cell(cell),
         "require_adaptive_batching_field": True,
         "require_arrival_aware_batching_field": True,
         "warmup_requests": measurement["warmup_requests"],
@@ -1410,9 +1605,7 @@ def execute_plan(
         checked["collection_protocol"].get("require_strict_generator_delivery")
     )
     calibration_variant = checked["collection_protocol"].get("calibration_variant")
-    hard_adaptive_calibration = (
-        calibration_variant == CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1
-    )
+    hard_policy_calibration = calibration_variant in STRICT_CALIBRATION_VARIANTS
     model = checked["paths"]["model"]
     model_id = checked["collection_protocol"]["model_id"]
     recorded_cells = {
@@ -1488,7 +1681,7 @@ def execute_plan(
                 require_strict_generator_delivery=require_strict,
             )
             problems.extend(trial_problems)
-            if document is not None and hard_adaptive_calibration:
+            if document is not None and hard_policy_calibration:
                 recorded = recorded_cells.get(str(trial["cell_id"]))
                 if recorded is None:
                     problems.append(
@@ -1503,6 +1696,13 @@ def execute_plan(
                                 f"{trial_id} recorded cell adaptive_batching disagrees "
                                 "with execution cell"
                             )
+                        if arrival_aware_batching_for_cell(
+                            recorded
+                        ) != arrival_aware_batching_for_cell(cell):
+                            problems.append(
+                                f"{trial_id} recorded cell arrival_aware_batching disagrees "
+                                "with execution cell"
+                            )
                     except NeuralCollectorError as exc:
                         problems.append(str(exc))
                 problems.extend(
@@ -1513,18 +1713,21 @@ def execute_plan(
                         document=document,
                     )
                 )
-                # Diagnostic only: surface mean batch size without failing plumbing.
+                # Diagnostic only: surface batch-formation stats without failing plumbing.
                 mean, mean_problems = realized_mean_batch_size(document)
                 if not mean_problems and mean is not None:
                     status = dict(status)
                     status["realized_mean_batch_size"] = mean
-                    fraction, fraction_problems = multi_request_batch_fraction(document)
-                    if not fraction_problems and fraction is not None:
-                        status["multi_request_batch_fraction"] = fraction
+                    request_fraction, request_problems = multi_request_batch_fraction(document)
+                    if not request_problems and request_fraction is not None:
+                        status["multi_request_batch_fraction"] = request_fraction
+                    batch_fraction, batch_problems = multi_size_batch_fraction(document)
+                    if not batch_problems and batch_fraction is not None:
+                        status["multi_size_batch_fraction"] = batch_fraction
             if (
                 mode == "calibration"
                 and document is not None
-                and not hard_adaptive_calibration
+                and not hard_policy_calibration
             ):
                 # Keep historical delay-calibration evidence when delivery is not strict.
                 soft = [
@@ -1575,6 +1778,13 @@ def execute_plan(
         }
         if "calibration_infeasible_markers" in status:
             meta["calibration_infeasible_markers"] = status["calibration_infeasible_markers"]
+        for diagnostic_key in (
+            "realized_mean_batch_size",
+            "multi_request_batch_fraction",
+            "multi_size_batch_fraction",
+        ):
+            if diagnostic_key in status:
+                meta[diagnostic_key] = status[diagnostic_key]
         write_json(runs / f"{trial_id}.meta.json", meta)
         if problems:
             _write_failure(
