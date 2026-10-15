@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <limits>
 #include <mutex>
@@ -17,6 +18,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace inferedge {
 
@@ -105,11 +107,25 @@ struct WorkerMetrics {
     std::uint64_t total_split_nanoseconds{0};
 };
 
+// Worker-local sealed-batch decision buffer. Allocated only when
+// enable_batch_decision_timing is true. Append-only; never overwritten.
+struct WorkerBatchDecisionState {
+    std::unique_ptr<BatchDecisionEvent[]> storage;
+    std::uint32_t capacity{0};
+    std::uint32_t recorded{0};
+    std::uint32_t local_seq{0};
+    std::uint64_t sealed_batches_total{0};
+    std::uint64_t events_dropped{0};
+    bool overflow{false};
+    bool stamp_order_invalid{false};
+};
+
 struct WorkerSlot {
     std::unique_ptr<InferenceEngine> engine;
     std::jthread thread;
     bool retired{false};
     WorkerMetrics metrics;
+    WorkerBatchDecisionState batch_decision;
 };
 
 namespace {
@@ -174,7 +190,106 @@ SchedulerError ValidateConfig(const SchedulerConfig& config) {
                              "arrival_aware_batching requires max_batch_delay > 0");
         }
     }
+    if (config.enable_batch_decision_timing) {
+        if (config.batch_decision_event_capacity < 1 ||
+            config.batch_decision_event_capacity > kMaxBatchDecisionEventCapacity) {
+            return MakeError(SchedulerErrorKind::kInvalidConfig,
+                             "batch_decision_event_capacity must be from 1 through 65536 when "
+                             "enable_batch_decision_timing is true");
+        }
+        if (!BatchDecisionAllocationFits(config.worker_count,
+                                         config.batch_decision_event_capacity)) {
+            return MakeError(SchedulerErrorKind::kInvalidConfig,
+                             "batch_decision_event_capacity allocation size overflows");
+        }
+    }
     return {};
+}
+
+std::int64_t SteadyClockNowNs() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+void RecordWorkerBatchDecision(WorkerBatchDecisionState& state, std::uint32_t worker_index,
+                               std::int64_t open_ns, std::int64_t seal_ns, std::uint32_t batch_size,
+                               BatchSealReason reason) noexcept {
+    ++state.sealed_batches_total;
+    if (seal_ns < open_ns) {
+        state.stamp_order_invalid = true;
+    }
+    if (state.local_seq == std::numeric_limits<std::uint32_t>::max()) {
+        ++state.events_dropped;
+        state.overflow = true;
+        return;
+    }
+    const std::uint32_t next_seq = state.local_seq + 1U;
+    if (state.recorded >= state.capacity || state.storage == nullptr) {
+        ++state.events_dropped;
+        state.overflow = true;
+        state.local_seq = next_seq;
+        return;
+    }
+    BatchDecisionEvent& event = state.storage[state.recorded];
+    event.batch_id = PackBatchDecisionId(worker_index, next_seq);
+    event.worker_index = worker_index;
+    event.batch_open_ns = open_ns;
+    event.batch_seal_ns = seal_ns;
+    event.batch_size = batch_size;
+    event.seal_reason = reason;
+    ++state.recorded;
+    state.local_seq = next_seq;
+}
+
+BatchDecisionTimingSnapshot MergeWorkerBatchDecisions(const std::vector<WorkerSlot>& workers,
+                                                      std::uint32_t capacity_per_worker) {
+    BatchDecisionTimingSnapshot snapshot;
+    snapshot.enabled = true;
+    snapshot.buffer_capacity_per_worker = capacity_per_worker;
+    std::uint64_t recorded = 0;
+    for (const WorkerSlot& worker : workers) {
+        recorded += worker.batch_decision.recorded;
+    }
+    snapshot.events.reserve(static_cast<std::size_t>(recorded));
+    bool overflow = false;
+    bool stamp_invalid = false;
+    for (std::uint32_t index = 0; index < static_cast<std::uint32_t>(workers.size()); ++index) {
+        const WorkerBatchDecisionState& local = workers[index].batch_decision;
+        snapshot.sealed_batches_total += local.sealed_batches_total;
+        snapshot.events_recorded += local.recorded;
+        snapshot.events_dropped += local.events_dropped;
+        overflow = overflow || local.overflow;
+        stamp_invalid = stamp_invalid || local.stamp_order_invalid;
+        for (std::uint32_t event_index = 0; event_index < local.recorded; ++event_index) {
+            snapshot.events.push_back(local.storage[event_index]);
+        }
+    }
+    snapshot.trace_overflow = overflow;
+    bool unique_ids = true;
+    for (std::size_t i = 0; i < snapshot.events.size(); ++i) {
+        const BatchDecisionEvent& event = snapshot.events[i];
+        if (event.batch_seal_ns < event.batch_open_ns) {
+            stamp_invalid = true;
+        }
+        if (event.batch_size == 0) {
+            stamp_invalid = true;
+        }
+        if (event.worker_index >= static_cast<std::uint32_t>(workers.size())) {
+            stamp_invalid = true;
+        }
+        for (std::size_t j = i + 1; j < snapshot.events.size(); ++j) {
+            if (snapshot.events[j].batch_id == event.batch_id) {
+                unique_ids = false;
+            }
+        }
+    }
+    const bool counts_ok =
+        snapshot.events_recorded + snapshot.events_dropped == snapshot.sealed_batches_total;
+    snapshot.timing_data_valid = !overflow && snapshot.events_dropped == 0 && !stamp_invalid &&
+                                 counts_ok && unique_ids &&
+                                 snapshot.events_recorded == snapshot.events.size();
+    return snapshot;
 }
 
 std::chrono::milliseconds ArrivalIdleThreshold(std::chrono::milliseconds max_batch_delay) {
@@ -493,6 +608,7 @@ struct InferenceScheduler::Impl {
     ShutdownResult Shutdown(ShutdownPolicy policy);
     SchedulerStats Stats() const;
     SchedulerMetrics Metrics() const;
+    BatchDecisionTimingSnapshot BatchDecisionTiming() const;
 
     SchedulerError StartWorkers();
     SchedulerError AbortStart(SchedulerError error);
@@ -587,6 +703,9 @@ struct InferenceScheduler::Impl {
     // metrics() copies it under admission_ only when metrics_merged_ is true.
     WorkerMetrics published_metrics_{};
     bool metrics_merged_{false};
+    // Independent of metrics. Published only after a successful full join.
+    BatchDecisionTimingSnapshot published_batch_decision_{};
+    bool batch_decision_merged_{false};
 
     // queue_ is declared before workers_ so a joined jthread is destroyed
     // before the queue it waited on.
@@ -660,6 +779,24 @@ SchedulerError InferenceScheduler::Impl::StartWorkers() {
         }
         workers_.push_back(WorkerSlot{});
         workers_.back().engine = std::move(engines[static_cast<std::size_t>(index)]);
+        if (config_.enable_batch_decision_timing) {
+            // Allocate before the worker thread starts. Do not allocate under
+            // queue or admission locks.
+            try {
+                const std::uint32_t capacity = config_.batch_decision_event_capacity;
+                workers_.back().batch_decision.storage =
+                    std::make_unique<BatchDecisionEvent[]>(capacity);
+                workers_.back().batch_decision.capacity = capacity;
+            } catch (const std::bad_alloc&) {
+                return AbortStart(MakeError(SchedulerErrorKind::kWorkerStart,
+                                            "batch decision event buffer allocation failed"));
+            } catch (const std::exception& ex) {
+                return AbortStart(MakeError(SchedulerErrorKind::kWorkerStart, ex.what()));
+            } catch (...) {
+                return AbortStart(MakeError(SchedulerErrorKind::kWorkerStart,
+                                            "batch decision event buffer allocation failed"));
+            }
+        }
         InferenceEngine* const engine = workers_.back().engine.get();
         // The engine object is owned by this slot's unique_ptr. reserve() keeps
         // the slot stable, and the pointer stays valid across unique_ptr moves.
@@ -885,6 +1022,13 @@ BatchStep InferenceScheduler::Impl::RunBatch(std::uint32_t index, InferenceEngin
         if (!adopt()) {
             return BatchStep::kFault;
         }
+        WorkerBatchDecisionState* decision_state = nullptr;
+        std::int64_t batch_open_ns = 0;
+        std::optional<BatchSealReason> seal_reason;
+        if (config_.enable_batch_decision_timing && index < workers_.size()) {
+            decision_state = &workers_[index].batch_decision;
+            batch_open_ns = SteadyClockNowNs();
+        }
         std::size_t collect_fault = owned.size();
         if (throw_after_batch_collect_.compare_exchange_strong(collect_fault, kNoFault,
                                                                std::memory_order_acq_rel)) {
@@ -911,12 +1055,14 @@ BatchStep InferenceScheduler::Impl::RunBatch(std::uint32_t index, InferenceEngin
                 continue;
             }
             if (taken.result == QueueTakeResult::kClosed) {
+                seal_reason = BatchSealReason::kQueueClosed;
                 break;
             }
             // Open and empty. Opt-in early seal: stop waiting once enough
             // validated requests are owned. Invalid entries published alone
             // never enter owned and do not satisfy this threshold.
             if (config_.adaptive_batching && owned.size() >= kAdaptiveMinTargetBatch) {
+                seal_reason = BatchSealReason::kG3MinimumTarget;
                 break;
             }
             // G4: after try_pop released the queue mutex, snapshot EWMA under
@@ -936,17 +1082,24 @@ BatchStep InferenceScheduler::Impl::RunBatch(std::uint32_t index, InferenceEngin
                     const std::chrono::steady_clock::time_point now =
                         std::chrono::steady_clock::now();
                     if (now >= deadline) {
+                        seal_reason = BatchSealReason::kDeadlineExpired;
                         break;
                     }
                     const auto remaining_ns =
                         std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now)
                             .count();
-                    if (remaining_ns <= 0 || ewma_ns > remaining_ns) {
+                    if (remaining_ns <= 0) {
+                        seal_reason = BatchSealReason::kDeadlineExpired;
+                        break;
+                    }
+                    if (ewma_ns > remaining_ns) {
+                        seal_reason = BatchSealReason::kG4ArrivalAware;
                         break;
                     }
                 }
             }
             if (!wait_for_more || std::chrono::steady_clock::now() >= deadline) {
+                seal_reason = BatchSealReason::kDeadlineExpired;
                 break;
             }
             if (!signaled_wait) {
@@ -973,11 +1126,27 @@ BatchStep InferenceScheduler::Impl::RunBatch(std::uint32_t index, InferenceEngin
                 }
                 continue;
             }
+            if (waited.result == QueueWaitResult::kClosed) {
+                seal_reason = BatchSealReason::kQueueClosed;
+            } else {
+                // kTimeout: open, empty, and the deadline passed.
+                seal_reason = BatchSealReason::kDeadlineExpired;
+            }
             break;
         }
 
         if (owned.empty()) {
             return BatchStep::kContinue;
+        }
+        if (decision_state != nullptr) {
+            BatchSealReason reason = BatchSealReason::kShutdownOrOther;
+            if (seal_reason.has_value()) {
+                reason = *seal_reason;
+            } else if (owned.size() >= limit) {
+                reason = BatchSealReason::kCapacityReached;
+            }
+            RecordWorkerBatchDecision(*decision_state, index, batch_open_ns, SteadyClockNowNs(),
+                                      static_cast<std::uint32_t>(owned.size()), reason);
         }
 
         WorkerMetrics* metrics = nullptr;
@@ -1550,20 +1719,20 @@ void InferenceScheduler::Impl::JoinWorkers() noexcept {
         return;
     }
 
-    bool published = !config_.enable_metrics;
+    bool slots_publishable = true;
     if (config_.enable_metrics) {
         if (!metrics_merged_) {
             WorkerMetrics merged;
             for (const WorkerSlot& worker : workers_) {
                 MergeWorkerMetrics(merged, worker.metrics);
             }
-            auto publish = [this, &merged, &published] {
+            auto publish = [this, &merged, &slots_publishable] {
                 std::lock_guard<std::mutex> lock(admission_);
                 if (!metrics_merged_) {
                     published_metrics_ = merged;
                     metrics_merged_ = true;
                 }
-                published = metrics_merged_;
+                slots_publishable = metrics_merged_;
             };
             try {
                 publish();
@@ -1571,13 +1740,35 @@ void InferenceScheduler::Impl::JoinWorkers() noexcept {
                 try {
                     publish();
                 } catch (...) {
+                    slots_publishable = false;
                 }
             }
-        } else {
-            published = true;
         }
     }
-    if (!published) {
+    if (config_.enable_batch_decision_timing) {
+        if (!batch_decision_merged_) {
+            BatchDecisionTimingSnapshot merged =
+                MergeWorkerBatchDecisions(workers_, config_.batch_decision_event_capacity);
+            auto publish = [this, &merged, &slots_publishable] {
+                std::lock_guard<std::mutex> lock(admission_);
+                if (!batch_decision_merged_) {
+                    published_batch_decision_ = std::move(merged);
+                    batch_decision_merged_ = true;
+                }
+                slots_publishable = slots_publishable && batch_decision_merged_;
+            };
+            try {
+                publish();
+            } catch (...) {
+                try {
+                    publish();
+                } catch (...) {
+                    slots_publishable = false;
+                }
+            }
+        }
+    }
+    if (!slots_publishable) {
         return;
     }
     try {
@@ -1933,6 +2124,21 @@ SchedulerMetrics InferenceScheduler::Impl::Metrics() const {
     return snapshot;
 }
 
+BatchDecisionTimingSnapshot InferenceScheduler::Impl::BatchDecisionTiming() const {
+    BatchDecisionTimingSnapshot snapshot;
+    snapshot.enabled = config_.enable_batch_decision_timing;
+    snapshot.buffer_capacity_per_worker =
+        config_.enable_batch_decision_timing ? config_.batch_decision_event_capacity : 0;
+    std::lock_guard<std::mutex> lock(admission_);
+    if (!snapshot.enabled) {
+        return snapshot;
+    }
+    if (batch_decision_merged_) {
+        return published_batch_decision_;
+    }
+    return snapshot;
+}
+
 SchedulerStats InferenceScheduler::Impl::Stats() const {
     std::lock_guard<std::mutex> lock(admission_);
     SchedulerStats stats;
@@ -1976,6 +2182,10 @@ SchedulerStats InferenceScheduler::stats() const {
 
 SchedulerMetrics InferenceScheduler::metrics() const {
     return impl_->Metrics();
+}
+
+BatchDecisionTimingSnapshot InferenceScheduler::batch_decision_timing() const {
+    return impl_->BatchDecisionTiming();
 }
 
 void SchedulerTestAccess::SetStopAfterStartingWorkers(InferenceScheduler& scheduler,

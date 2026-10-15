@@ -39,14 +39,19 @@ namespace {
 
 using inferedge::Admission;
 using inferedge::AdmissionStatus;
+using inferedge::BatchDecisionEvent;
+using inferedge::BatchDecisionTimingSnapshot;
+using inferedge::BatchSealReason;
 using inferedge::CompletionStatus;
 using inferedge::ElementType;
 using inferedge::InferenceErrorKind;
 using inferedge::InferenceScheduler;
+using inferedge::kMaxBatchDecisionEventCapacity;
 using inferedge::kMaxSchedulerQueueCapacity;
 using inferedge::kMaxSchedulerWorkers;
 using inferedge::kSchedulerMetricsMaxBatchSize;
 using inferedge::NamedTensor;
+using inferedge::PackBatchDecisionId;
 using inferedge::SchedulerCompletion;
 using inferedge::SchedulerConfig;
 using inferedge::SchedulerError;
@@ -2050,6 +2055,8 @@ TEST_F(InferenceSchedulerTest, AggregateInitializationLeavesBatchingDisabled) {
     EXPECT_FALSE(config.arrival_aware_batching);
     EXPECT_EQ(inferedge::kAdaptiveMinTargetBatch, 2U);
     EXPECT_FALSE(config.enable_metrics);
+    EXPECT_FALSE(config.enable_batch_decision_timing);
+    EXPECT_EQ(config.batch_decision_event_capacity, 0U);
 }
 
 TEST_F(InferenceSchedulerTest, RejectsZeroBatchSize) {
@@ -2200,6 +2207,41 @@ std::unique_ptr<InferenceScheduler> MakeArrivalAwareBatch(std::uint32_t batch_si
     config.max_batch_delay = delay;
     config.arrival_aware_batching = true;
     return MakeScheduler(std::move(config));
+}
+
+std::unique_ptr<InferenceScheduler>
+MakeBatchDecisionTimed(std::uint32_t batch_size, std::chrono::milliseconds delay,
+                       std::size_t capacity, std::uint32_t event_capacity, bool adaptive = false,
+                       bool arrival_aware = false, std::uint32_t workers = 1) {
+    SchedulerConfig config{INFEREDGE_BATCH_ADD_MODEL_PATH, workers, capacity};
+    config.enable_batching = true;
+    config.max_batch_size = batch_size;
+    config.max_batch_delay = delay;
+    config.adaptive_batching = adaptive;
+    config.arrival_aware_batching = arrival_aware;
+    config.enable_batch_decision_timing = true;
+    config.batch_decision_event_capacity = event_capacity;
+    return MakeScheduler(std::move(config));
+}
+
+void ExpectValidBatchDecision(const BatchDecisionTimingSnapshot& snap, std::uint64_t sealed) {
+    EXPECT_TRUE(snap.enabled);
+    EXPECT_TRUE(snap.timing_data_valid);
+    EXPECT_FALSE(snap.trace_overflow);
+    EXPECT_EQ(snap.sealed_batches_total, sealed);
+    EXPECT_EQ(snap.events_recorded, sealed);
+    EXPECT_EQ(snap.events_dropped, 0U);
+    EXPECT_EQ(snap.events_recorded + snap.events_dropped, snap.sealed_batches_total);
+    ASSERT_EQ(snap.events.size(), sealed);
+    for (std::size_t i = 0; i < snap.events.size(); ++i) {
+        const BatchDecisionEvent& event = snap.events[i];
+        EXPECT_GE(event.batch_seal_ns, event.batch_open_ns);
+        EXPECT_GE(event.batch_size, 1U);
+        EXPECT_LE(event.batch_size, 32U);
+        for (std::size_t j = i + 1; j < snap.events.size(); ++j) {
+            EXPECT_NE(snap.events[j].batch_id, event.batch_id);
+        }
+    }
 }
 
 struct BatchRuns {
@@ -4750,6 +4792,265 @@ TEST_F(InferenceSchedulerTest, PublicationFailureBackstopCarriesItsOwnStamp) {
     EXPECT_EQ(failed.inference_error.message, "unsettled");
     ExpectPreStamp(failed);
     EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+}
+
+TEST_F(InferenceSchedulerTest, BatchDecisionTimingDefaultsOff) {
+    const BatchDecisionTimingSnapshot before =
+        MakeBatch(4, std::chrono::milliseconds{30}, 4)->batch_decision_timing();
+    EXPECT_FALSE(before.enabled);
+    EXPECT_FALSE(before.timing_data_valid);
+    EXPECT_TRUE(before.events.empty());
+
+    auto scheduler = MakeBatch(4, std::chrono::milliseconds{30}, 4);
+    RequireStart(*scheduler);
+    ExpectDynamicSum(Take(scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F))), 4.F, 6.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    const BatchDecisionTimingSnapshot after = scheduler->batch_decision_timing();
+    EXPECT_FALSE(after.enabled);
+    EXPECT_FALSE(after.timing_data_valid);
+    EXPECT_EQ(after.sealed_batches_total, 0U);
+    EXPECT_TRUE(after.events.empty());
+}
+
+TEST_F(InferenceSchedulerTest, RejectsBatchDecisionCapacityZeroWhenEnabled) {
+    SchedulerConfig config =
+        WithBatching(INFEREDGE_BATCH_ADD_MODEL_PATH, true, 4, std::chrono::milliseconds{10});
+    config.enable_batch_decision_timing = true;
+    config.batch_decision_event_capacity = 0;
+    ExpectIdleInvalidConfig(*MakeScheduler(std::move(config)));
+}
+
+TEST_F(InferenceSchedulerTest, RejectsBatchDecisionCapacityAboveMaximum) {
+    SchedulerConfig config =
+        WithBatching(INFEREDGE_BATCH_ADD_MODEL_PATH, true, 4, std::chrono::milliseconds{10});
+    config.enable_batch_decision_timing = true;
+    config.batch_decision_event_capacity = kMaxBatchDecisionEventCapacity + 1U;
+    ExpectIdleInvalidConfig(*MakeScheduler(std::move(config)));
+}
+
+TEST_F(InferenceSchedulerTest, AcceptsValidBatchDecisionTimingConfiguration) {
+    auto scheduler = MakeBatchDecisionTimed(4, std::chrono::milliseconds{10}, 4, 8);
+    RequireStart(*scheduler);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    const BatchDecisionTimingSnapshot snap = scheduler->batch_decision_timing();
+    EXPECT_TRUE(snap.enabled);
+    EXPECT_TRUE(snap.timing_data_valid);
+    EXPECT_EQ(snap.buffer_capacity_per_worker, 8U);
+    EXPECT_EQ(snap.sealed_batches_total, 0U);
+}
+
+TEST_F(InferenceSchedulerTest, BatchDecisionRecordsG2DeadlineSizeOne) {
+    auto scheduler = MakeBatchDecisionTimed(4, std::chrono::milliseconds{30}, 4, 8);
+    auto reached = std::make_shared<std::latch>(1);
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, reached);
+    RequireStart(*scheduler);
+    Admission admission = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    reached->wait();
+    ExpectDynamicSum(Take(std::move(admission)), 4.F, 6.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    const BatchDecisionTimingSnapshot snap = scheduler->batch_decision_timing();
+    ExpectValidBatchDecision(snap, 1);
+    EXPECT_EQ(snap.events[0].seal_reason, BatchSealReason::kDeadlineExpired);
+    EXPECT_EQ(snap.events[0].batch_size, 1U);
+    EXPECT_EQ(snap.events[0].worker_index, 0U);
+    EXPECT_EQ(snap.events[0].batch_id, PackBatchDecisionId(0, 1));
+}
+
+TEST_F(InferenceSchedulerTest, BatchDecisionRecordsG3MinimumTarget) {
+    auto scheduler = MakeBatchDecisionTimed(4, std::chrono::milliseconds{1000}, 4, 8, true, false);
+    auto blocked = std::make_shared<std::latch>(1);
+    auto timed_wait = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, timed_wait);
+    RequireStart(*scheduler);
+    Admission first = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission second = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    release.release();
+    ExpectDynamicSum(Take(std::move(first)), 4.F, 6.F);
+    ExpectDynamicSum(Take(std::move(second)), 12.F, 14.F);
+    EXPECT_FALSE(timed_wait->try_wait());
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    const BatchDecisionTimingSnapshot snap = scheduler->batch_decision_timing();
+    ExpectValidBatchDecision(snap, 1);
+    EXPECT_EQ(snap.events[0].seal_reason, BatchSealReason::kG3MinimumTarget);
+    EXPECT_EQ(snap.events[0].batch_size, 2U);
+}
+
+TEST_F(InferenceSchedulerTest, BatchDecisionRecordsG4ArrivalAwareEarlySeal) {
+    auto scheduler = MakeBatchDecisionTimed(4, std::chrono::milliseconds{1000}, 4, 8, false, true);
+    auto timed_wait = std::make_shared<std::latch>(1);
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, timed_wait);
+    RequireStart(*scheduler);
+    SchedulerTestAccess::SetArrivalEwmaNanoseconds(
+        *scheduler, std::chrono::nanoseconds{std::chrono::seconds{10}}.count());
+    Admission admission = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    ExpectDynamicSum(Take(std::move(admission)), 4.F, 6.F);
+    EXPECT_FALSE(timed_wait->try_wait());
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    const BatchDecisionTimingSnapshot snap = scheduler->batch_decision_timing();
+    ExpectValidBatchDecision(snap, 1);
+    EXPECT_EQ(snap.events[0].seal_reason, BatchSealReason::kG4ArrivalAware);
+    EXPECT_EQ(snap.events[0].batch_size, 1U);
+}
+
+TEST_F(InferenceSchedulerTest, BatchDecisionG4DeadlineIsNotArrivalAwareReason) {
+    auto scheduler = MakeBatchDecisionTimed(4, std::chrono::milliseconds{30}, 4, 8, false, true);
+    auto reached = std::make_shared<std::latch>(1);
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, reached);
+    RequireStart(*scheduler);
+    // Dense estimate: remaining deadline is large, so the worker waits and
+    // seals by deadline expiry rather than G4 early seal.
+    SchedulerTestAccess::SetArrivalEwmaNanoseconds(
+        *scheduler, std::chrono::nanoseconds{std::chrono::microseconds{1}}.count());
+    Admission admission = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    reached->wait();
+    ExpectDynamicSum(Take(std::move(admission)), 4.F, 6.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    const BatchDecisionTimingSnapshot snap = scheduler->batch_decision_timing();
+    ExpectValidBatchDecision(snap, 1);
+    EXPECT_EQ(snap.events[0].seal_reason, BatchSealReason::kDeadlineExpired);
+}
+
+TEST_F(InferenceSchedulerTest, BatchDecisionRecordsCapacityReached) {
+    auto scheduler = MakeBatchDecisionTimed(2, std::chrono::milliseconds{1000}, 8, 8);
+    auto blocked = std::make_shared<std::latch>(1);
+    auto timed_wait = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, timed_wait);
+    RequireStart(*scheduler);
+    Admission a = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission b = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    release.release();
+    ExpectDynamicSum(Take(std::move(a)), 4.F, 6.F);
+    ExpectDynamicSum(Take(std::move(b)), 12.F, 14.F);
+    EXPECT_FALSE(timed_wait->try_wait());
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    const BatchDecisionTimingSnapshot snap = scheduler->batch_decision_timing();
+    ExpectValidBatchDecision(snap, 1);
+    EXPECT_EQ(snap.events[0].seal_reason, BatchSealReason::kCapacityReached);
+    EXPECT_EQ(snap.events[0].batch_size, 2U);
+}
+
+TEST_F(InferenceSchedulerTest, BatchDecisionRecordsQueueClosedOnDrain) {
+    auto scheduler = MakeBatchDecisionTimed(4, std::chrono::milliseconds{1000}, 4, 8);
+    auto reached = std::make_shared<std::latch>(1);
+    auto hold = std::make_shared<std::latch>(1);
+    LatchRelease release{hold};
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, reached);
+    SchedulerTestAccess::SetBeforeBatchWait(*scheduler, hold);
+    RequireStart(*scheduler);
+    Admission admission = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    reached->wait();
+    const ShutdownResult shutdown =
+        ShutdownWhileBlocked(*scheduler, release, ShutdownPolicy::kDrain);
+    ExpectWinner(shutdown, ShutdownPolicy::kDrain, true);
+    ExpectDynamicSum(Take(std::move(admission)), 4.F, 6.F);
+    const BatchDecisionTimingSnapshot snap = scheduler->batch_decision_timing();
+    ExpectValidBatchDecision(snap, 1);
+    EXPECT_EQ(snap.events[0].seal_reason, BatchSealReason::kQueueClosed);
+    EXPECT_EQ(snap.events[0].batch_size, 1U);
+}
+
+TEST_F(InferenceSchedulerTest, BatchDecisionCancelDoesNotInventSealForQueuedRequest) {
+    auto scheduler = MakeBatchDecisionTimed(4, std::chrono::milliseconds{1000}, 4, 8);
+    auto reached = std::make_shared<std::latch>(1);
+    auto hold = std::make_shared<std::latch>(1);
+    LatchRelease release{hold};
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, reached);
+    SchedulerTestAccess::SetBeforeBatchWait(*scheduler, hold);
+    RequireStart(*scheduler);
+    Admission owned = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    reached->wait();
+    Admission queued = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    const ShutdownResult shutdown =
+        ShutdownWhileBlocked(*scheduler, release, ShutdownPolicy::kCancelPending);
+    ExpectWinner(shutdown, ShutdownPolicy::kCancelPending, true);
+    ExpectDynamicSum(Take(std::move(owned)), 4.F, 6.F);
+    ExpectCanceled(Take(std::move(queued)), 2);
+    const BatchDecisionTimingSnapshot snap = scheduler->batch_decision_timing();
+    ExpectValidBatchDecision(snap, 1);
+    EXPECT_EQ(snap.events[0].batch_size, 1U);
+}
+
+TEST_F(InferenceSchedulerTest, BatchDecisionUnbatchedPathEmitsNoEvents) {
+    SchedulerConfig config{INFEREDGE_ADD_MODEL_PATH, 1, 4};
+    config.enable_batch_decision_timing = true;
+    config.batch_decision_event_capacity = 8;
+    auto scheduler = MakeScheduler(std::move(config));
+    RequireStart(*scheduler);
+    ExpectSum(Take(scheduler->submit(AddInputs(1.F, 2.F, 3.F, 4.F))), 4.F, 6.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    const BatchDecisionTimingSnapshot snap = scheduler->batch_decision_timing();
+    EXPECT_TRUE(snap.enabled);
+    EXPECT_TRUE(snap.timing_data_valid);
+    EXPECT_EQ(snap.sealed_batches_total, 0U);
+    EXPECT_TRUE(snap.events.empty());
+}
+
+TEST_F(InferenceSchedulerTest, BatchDecisionOverflowIsStickyAndInvalid) {
+    auto scheduler = MakeBatchDecisionTimed(4, std::chrono::milliseconds{30}, 4, 1);
+    RequireStart(*scheduler);
+    ExpectDynamicSum(Take(scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F))), 4.F, 6.F);
+    ExpectDynamicSum(Take(scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F))), 12.F, 14.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    const BatchDecisionTimingSnapshot snap = scheduler->batch_decision_timing();
+    EXPECT_TRUE(snap.enabled);
+    EXPECT_FALSE(snap.timing_data_valid);
+    EXPECT_TRUE(snap.trace_overflow);
+    EXPECT_EQ(snap.sealed_batches_total, 2U);
+    EXPECT_EQ(snap.events_recorded, 1U);
+    EXPECT_EQ(snap.events_dropped, 1U);
+    EXPECT_EQ(snap.events_recorded + snap.events_dropped, snap.sealed_batches_total);
+    ASSERT_EQ(snap.events.size(), 1U);
+    ExpectQuiescent(*scheduler, 2, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, BatchDecisionUniqueIdsAcrossWorkers) {
+    auto scheduler =
+        MakeBatchDecisionTimed(2, std::chrono::milliseconds{30}, 8, 16, false, false, 2);
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    RequireStart(*scheduler);
+    Admission a = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission b = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    Admission c = scheduler->submit(DynamicAddInputs(9.F, 10.F, 11.F, 12.F));
+    Admission d = scheduler->submit(DynamicAddInputs(13.F, 14.F, 15.F, 16.F));
+    release.release();
+    ExpectDynamicSum(Take(std::move(a)), 4.F, 6.F);
+    ExpectDynamicSum(Take(std::move(b)), 12.F, 14.F);
+    ExpectDynamicSum(Take(std::move(c)), 20.F, 22.F);
+    ExpectDynamicSum(Take(std::move(d)), 28.F, 30.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    const BatchDecisionTimingSnapshot snap = scheduler->batch_decision_timing();
+    EXPECT_TRUE(snap.enabled);
+    EXPECT_GE(snap.sealed_batches_total, 2U);
+    ExpectValidBatchDecision(snap, snap.sealed_batches_total);
+    bool saw_worker0 = false;
+    bool saw_worker1 = false;
+    for (const BatchDecisionEvent& event : snap.events) {
+        EXPECT_LT(event.worker_index, 2U);
+        saw_worker0 = saw_worker0 || event.worker_index == 0U;
+        saw_worker1 = saw_worker1 || event.worker_index == 1U;
+        EXPECT_EQ(event.batch_id >> 32, static_cast<std::uint64_t>(event.worker_index));
+        EXPECT_EQ(event.batch_id,
+                  PackBatchDecisionId(event.worker_index,
+                                      static_cast<std::uint32_t>(event.batch_id & 0xffffffffULL)));
+    }
+    EXPECT_TRUE(saw_worker0);
+    EXPECT_TRUE(saw_worker1);
+}
+
+TEST_F(InferenceSchedulerTest, BatchDecisionDoesNotAlterMetricsWhenDisabled) {
+    auto with_timing = MakeBatchDecisionTimed(4, std::chrono::milliseconds{30}, 4, 8);
+    RequireStart(*with_timing);
+    ExpectDynamicSum(Take(with_timing->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F))), 4.F, 6.F);
+    EXPECT_EQ(with_timing->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    const SchedulerMetrics metrics = with_timing->metrics();
+    EXPECT_FALSE(metrics.enabled);
+    EXPECT_EQ(metrics.engine_run_count, 0U);
 }
 
 } // namespace

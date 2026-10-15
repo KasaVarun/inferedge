@@ -1,6 +1,7 @@
 #pragma once
 
 #include "inferedge/inference_engine.hpp"
+#include "inferedge/scheduler_batch_decision.hpp"
 #include "inferedge/scheduler_metrics.hpp"
 
 #include <chrono>
@@ -39,6 +40,12 @@ inline constexpr std::size_t kMaxSchedulerQueueCapacity = 1024;
 // enable_metrics collects worker-local engine-run counts, batch-size histogram
 // bins, and assembly/run/split duration totals. The default is false: workers
 // do not read a clock and do not update metric storage.
+// enable_batch_decision_timing records sealed-batch open/seal timestamps and
+// seal reasons into a bounded per-worker buffer. The default is false: no
+// buffer is allocated and RunBatch does not read clocks for that path.
+// batch_decision_event_capacity is the per-worker append-only event capacity
+// when timing is enabled (1 through kMaxBatchDecisionEventCapacity). When
+// timing is disabled the field is ignored and may be zero.
 inline constexpr std::size_t kAdaptiveMinTargetBatch = 2;
 
 struct SchedulerConfig {
@@ -61,6 +68,11 @@ struct SchedulerConfig {
     // taken immediately before promise::set_value. The default reads no clock
     // on that path. This is not a post-publication timestamp.
     bool enable_completion_timing{false};
+    // Opt-in sealed-batch decision timing. Default false.
+    bool enable_batch_decision_timing{false};
+    // Per-worker event capacity when enable_batch_decision_timing is true.
+    // Ignored when timing is disabled. Valid enabled range: 1..65536.
+    std::uint32_t batch_decision_event_capacity{0};
 };
 
 enum class SchedulerErrorKind {
@@ -200,6 +212,12 @@ public:
     // finalized once Idle or after a terminal state because they have no
     // worker-local data. See SchedulerMetrics.
     [[nodiscard]] SchedulerMetrics metrics() const;
+    // Copies the post-join batch-decision timing snapshot. Independent of
+    // metrics() and completion timing. When enable_batch_decision_timing is
+    // false, returns enabled false and empty events. When enabled, meaningful
+    // contents require a successful merge after every worker joined. See
+    // BatchDecisionTimingSnapshot.
+    [[nodiscard]] BatchDecisionTimingSnapshot batch_decision_timing() const;
 
 private:
     struct Impl;
