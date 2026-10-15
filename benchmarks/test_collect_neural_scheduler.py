@@ -13,13 +13,17 @@ from benchmarks.collect_neural_scheduler import (
     ADAPTIVE_EARLY_SEAL_CELLS,
     ADAPTIVE_EARLY_SEAL_RATE,
     AG2_OFFERED_RATE,
+    AG2G3_OFFERED_RATE,
     ARRIVAL_SCREEN_MAX_LAG_NS,
     CALIBRATION_ONLY_NEURAL_CELLS,
     CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1,
     CALIBRATION_VARIANT_NONZERO_BATCH_DELAY_V1,
     CELL_DEFINITION_KEYS,
     CONTRAST_ID_AG2,
+    CONTRAST_ID_AG2G3,
     CONTRAST_SIGN_G2_MINUS_A,
+    CONTRAST_SIGN_G3_MINUS_A,
+    CONTRAST_SIGN_G3_MINUS_G2,
     EXPERIMENT_KIND,
     NEURAL_LOCAL_CELLS,
     NEURAL_LOCAL_CELL_BY_ID,
@@ -27,7 +31,9 @@ from benchmarks.collect_neural_scheduler import (
     REFERENCE_CHECKING_POLICY,
     REPORTABLE_CONTRAST_AC,
     REPORTABLE_CONTRAST_AG2,
+    REPORTABLE_CONTRAST_AG2G3,
     REPORTABLE_MODEL_ID,
+    THREE_ARM_POSITION_COUNTS_20,
     NeuralCollectorError,
     adaptive_batching_for_cell,
     arrival_screen_problems,
@@ -43,6 +49,7 @@ from benchmarks.collect_neural_scheduler import (
     normalize_cell_definition,
     open_loop_profile,
     realized_mean_batch_size,
+    require_rotation_position_counts,
     resolve_calibration_variant,
     resolve_neural_cell,
     resolve_neural_cells,
@@ -235,6 +242,14 @@ class NeuralLocalCellTest(unittest.TestCase):
         g3 = resolve_neural_cells(["A", "G2", "G3"], "calibration")
         self.assertEqual([cell["id"] for cell in g3], ["A", "G2", "G3"])
         self.assertTrue(g3[2]["adaptive_batching"])
+        three = resolve_neural_cells(
+            ["A", "G2", "G3"], "reportable", reportable_contrast=REPORTABLE_CONTRAST_AG2G3
+        )
+        self.assertEqual([cell["id"] for cell in three], ["A", "G2", "G3"])
+        with self.assertRaises(NeuralCollectorError):
+            resolve_neural_cells(
+                ["A", "G2", "G3"], "smoke", reportable_contrast=REPORTABLE_CONTRAST_AG2G3
+            )
 
 
 class CommandAndPlanTest(unittest.TestCase):
@@ -417,7 +432,9 @@ class ValidationGateTest(unittest.TestCase):
         with self.assertRaises(NeuralCollectorError) as raised:
             validate_reportable_args(args)
         message = str(raised.exception)
-        self.assertTrue("A,C" in message or "A,G2" in message)
+        self.assertTrue(
+            "A,C" in message or "A,G2" in message or "A,G2,G3" in message
+        )
 
     def test_expected_launch_detects_wrong_reported_delay(self) -> None:
         document = sample_report(
@@ -635,7 +652,12 @@ class ArtifactAndCollectionTest(unittest.TestCase):
         with self.assertRaises(NeuralCollectorError) as raised:
             collect(args, runner=self.world.runner)
         message = str(raised.exception)
-        self.assertTrue("A,C" in message or "A,G2" in message or "not permitted" in message)
+        self.assertTrue(
+            "A,C" in message
+            or "A,G2" in message
+            or "A,G2,G3" in message
+            or "not permitted" in message
+        )
         self.assertEqual(self.world.trial_calls, [])
 
     def test_reportable_a_c_accepted_with_frozen_rate_preflight_path(self) -> None:
@@ -1412,6 +1434,211 @@ class G3AdaptiveCollectionTest(unittest.TestCase):
         for cell in protocol["cell_definitions"]:
             self.assertEqual(set(cell), set(CELL_DEFINITION_KEYS))
             self.assertNotIn("adaptive_batching", cell)
+
+
+class AG2G3ContrastCollectorTest(unittest.TestCase):
+    def test_exact_ag2g3_contrast_accepted(self) -> None:
+        contract = resolve_reportable_contrast(
+            model_id=REPORTABLE_MODEL_ID,
+            cell_ids=["A", "G2", "G3"],
+            baseline_cell="G2",
+            alternative_cell="G3",
+            target_rps=AG2G3_OFFERED_RATE,
+            counted_runs=20,
+            offered_rate_frozen=True,
+        )
+        self.assertEqual(contract["contrast_id"], CONTRAST_ID_AG2G3)
+        self.assertEqual(contract["contrast_sign_convention"], CONTRAST_SIGN_G3_MINUS_G2)
+        self.assertEqual(
+            contract["secondary_contrast_sign_convention"], CONTRAST_SIGN_G3_MINUS_A
+        )
+        self.assertTrue(contract["require_five_key_cell_definitions"])
+        self.assertEqual(contract["arrival_screen_max_lag_ns"], ARRIVAL_SCREEN_MAX_LAG_NS)
+        self.assertEqual(contract["expected_position_counts"], THREE_ARM_POSITION_COUNTS_20)
+
+    def test_wrong_combination_rate_and_blocks_rejected(self) -> None:
+        with self.assertRaises(NeuralCollectorError):
+            resolve_reportable_contrast(
+                model_id=REPORTABLE_MODEL_ID,
+                cell_ids=["A", "G3"],
+                baseline_cell="A",
+                alternative_cell="G3",
+                target_rps=AG2G3_OFFERED_RATE,
+                counted_runs=20,
+                offered_rate_frozen=True,
+            )
+        with self.assertRaises(NeuralCollectorError) as rate:
+            resolve_reportable_contrast(
+                model_id=REPORTABLE_MODEL_ID,
+                cell_ids=["A", "G2", "G3"],
+                baseline_cell="G2",
+                alternative_cell="G3",
+                target_rps=500.0,
+                counted_runs=20,
+                offered_rate_frozen=True,
+            )
+        self.assertIn("1000", str(rate.exception))
+        with self.assertRaises(NeuralCollectorError) as blocks:
+            resolve_reportable_contrast(
+                model_id=REPORTABLE_MODEL_ID,
+                cell_ids=["A", "G2", "G3"],
+                baseline_cell="G2",
+                alternative_cell="G3",
+                target_rps=AG2G3_OFFERED_RATE,
+                counted_runs=10,
+                offered_rate_frozen=True,
+            )
+        self.assertIn("20", str(blocks.exception))
+        with self.assertRaises(NeuralCollectorError):
+            resolve_reportable_contrast(
+                model_id=REPORTABLE_MODEL_ID,
+                cell_ids=["A", "G2", "G3"],
+                baseline_cell="A",
+                alternative_cell="G3",
+                target_rps=AG2G3_OFFERED_RATE,
+                counted_runs=20,
+                offered_rate_frozen=True,
+            )
+
+    def test_five_key_new_and_four_key_old(self) -> None:
+        five = serialize_cell_definitions(
+            [
+                resolve_neural_cell("A"),
+                resolve_neural_cell("G2"),
+                resolve_neural_cell("G3", allow_g3=True),
+            ],
+            include_adaptive=True,
+        )
+        self.assertEqual(len(five), 3)
+        for cell in five:
+            self.assertIn("adaptive_batching", cell)
+        self.assertIs(five[2]["adaptive_batching"], True)
+        four = serialize_cell_definitions(
+            [resolve_neural_cell("A"), resolve_neural_cell("G2")],
+            include_adaptive=False,
+        )
+        for cell in four:
+            self.assertNotIn("adaptive_batching", cell)
+        ac = serialize_cell_definitions(
+            [dict(REPORTABLE_CONTRAST_AC["expected_cells"]["A"]), dict(REPORTABLE_CONTRAST_AC["expected_cells"]["C"])],
+            include_adaptive=False,
+        )
+        for cell in ac:
+            self.assertEqual(set(cell), set(CELL_DEFINITION_KEYS))
+
+    def test_command_flags_and_63_trial_rotation(self) -> None:
+        binary = pathlib.Path("/tmp") / BINARY_NAME
+        model = pathlib.Path("/models/gemm_f32.onnx")
+        cells = {
+            "A": resolve_neural_cell("A"),
+            "G2": resolve_neural_cell("G2"),
+            "G3": resolve_neural_cell("G3", allow_g3=True),
+        }
+        profile = open_loop_profile("neural_open", AG2G3_OFFERED_RATE)
+        measurement = {
+            "worker_count": 1,
+            "queue_capacity": 64,
+            "duration_ms": 1000,
+            "max_offered": 10000,
+            "max_outstanding": 64,
+            "completion_timeout_ms": 5000,
+            "warmup_requests": 100,
+            "lag_tolerance_ms": 1000,
+            "check_interval": 1,
+        }
+        plan = bind_commands(
+            build_plan([cells["A"], cells["G2"], cells["G3"]], [profile], 20),
+            binary=binary,
+            model=model,
+            model_id="gemm_f32",
+            cells=cells,
+            profiles={profile["id"]: profile},
+            measurement=measurement,
+        )
+        self.assertEqual(len(plan), 63)
+        pilots = [trial for trial in plan if trial["pilot"]]
+        counted = [trial for trial in plan if not trial["pilot"]]
+        self.assertEqual([trial["cell_id"] for trial in pilots], ["A", "G2", "G3"])
+        self.assertEqual(len(counted), 60)
+        self.assertEqual(
+            [trial["cell_id"] for trial in counted if trial["block_index"] == 1],
+            ["A", "G2", "G3"],
+        )
+        self.assertEqual(
+            [trial["cell_id"] for trial in counted if trial["block_index"] == 2],
+            ["G2", "G3", "A"],
+        )
+        self.assertEqual(
+            [trial["cell_id"] for trial in counted if trial["block_index"] == 3],
+            ["G3", "A", "G2"],
+        )
+        counts = require_rotation_position_counts(plan, THREE_ARM_POSITION_COUNTS_20)
+        self.assertEqual(counts, THREE_ARM_POSITION_COUNTS_20)
+        by_id = {trial["trial_id"]: trial for trial in plan}
+        self.assertNotIn("--adaptive-batching", by_id["A-neural_open-01"]["command"])
+        self.assertNotIn("--enable-batching", by_id["A-neural_open-01"]["command"])
+        self.assertIn("--enable-batching", by_id["G2-neural_open-01"]["command"])
+        self.assertNotIn("--adaptive-batching", by_id["G2-neural_open-01"]["command"])
+        self.assertIn("--enable-batching", by_id["G3-neural_open-01"]["command"])
+        self.assertIn("--adaptive-batching", by_id["G3-neural_open-01"]["command"])
+
+    def test_g3_smoke_and_unrelated_reportable_rejected(self) -> None:
+        with self.assertRaises(NeuralCollectorError):
+            resolve_neural_cells(["A", "G2", "G3"], "smoke")
+        with self.assertRaises(NeuralCollectorError):
+            resolve_neural_cells(
+                ["A", "G2", "G3"], "reportable", reportable_contrast=REPORTABLE_CONTRAST_AG2
+            )
+        with self.assertRaises(NeuralCollectorError):
+            resolve_neural_cells(
+                ["A", "G1", "G2"], "reportable", reportable_contrast=REPORTABLE_CONTRAST_AG2G3
+            )
+
+    def test_no_shared_add_registry_changes(self) -> None:
+        self.assertNotIn("G3", CELL_BY_ID)
+        self.assertNotIn("G2", CELL_BY_ID)
+        self.assertEqual(set(REPORTABLE_CONTRAST_AG2G3["allow_neural_local_cells"]), {"G2", "G3"})
+
+    def test_validate_reportable_args_ag2g3_path(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "--binary",
+                "/tmp/x",
+                "--repo-root",
+                ".",
+                "--expected-commit",
+                COMMIT,
+                "--mode",
+                "reportable",
+                "--model-id",
+                REPORTABLE_MODEL_ID,
+                "--cells",
+                "A,G2,G3",
+                "--baseline-cell",
+                "G2",
+                "--alternative-cell",
+                "G3",
+                "--target-rps",
+                "1000",
+                "--counted-runs",
+                "20",
+                "--offered-rate-frozen",
+            ]
+        )
+        contract = validate_reportable_args(args)
+        self.assertEqual(contract["contrast_id"], CONTRAST_ID_AG2G3)
+
+    def test_wrong_rotation_rejected(self) -> None:
+        cells = [
+            resolve_neural_cell("A"),
+            resolve_neural_cell("G2"),
+            resolve_neural_cell("G3", allow_g3=True),
+        ]
+        plan = build_plan(cells, [open_loop_profile("neural_open", 1000.0)], 20)
+        plan[3]["cell_id"], plan[4]["cell_id"] = plan[4]["cell_id"], plan[3]["cell_id"]
+        with self.assertRaises(NeuralCollectorError):
+            require_rotation_position_counts(plan, THREE_ARM_POSITION_COUNTS_20)
 
 
 if __name__ == "__main__":

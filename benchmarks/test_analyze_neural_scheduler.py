@@ -20,22 +20,28 @@ from benchmarks.analyze_scheduler import analyze as analyze_add
 from benchmarks.analyze_scheduler import paired_block_bootstrap_mean
 from benchmarks.collect_neural_scheduler import (
     AG2_OFFERED_RATE,
+    AG2G3_OFFERED_RATE,
     ANALYSIS_PROTOCOL_VERSION,
     ARRIVAL_FIDELITY_STATUS_NOT_CERTIFIED,
     ARRIVAL_SCREEN_MAX_LAG_NS,
     ARRIVAL_SCREEN_POLICY_VERSION,
     CONTRAST_ID_AG2,
+    CONTRAST_ID_AG2G3,
     CONTRAST_SIGN_CONVENTION,
     CONTRAST_SIGN_G2_MINUS_A,
+    CONTRAST_SIGN_G3_MINUS_A,
+    CONTRAST_SIGN_G3_MINUS_G2,
     EXPERIMENT_KIND,
     NEURAL_MODELS,
     PHASE_BOUNDARY_FIDELITY_UNAVAILABLE,
     PERSISTENT_BATCHING_MIN_MEAN,
     REFERENCE_CHECKING_POLICY,
+    THREE_ARM_POSITION_COUNTS_20,
     bind_commands,
     build_plan,
     open_loop_profile,
     resolve_neural_cell,
+    serialize_cell_definitions,
 )
 from benchmarks.collect_scheduler import (
     BINARY_NAME,
@@ -53,36 +59,52 @@ BINARY_SHA = "ab" * 32
 GEMM = NEURAL_MODELS["gemm_f32"]
 PROFILE = open_loop_profile("neural_open", 90.0)
 AG2_PROFILE = open_loop_profile("neural_open", AG2_OFFERED_RATE)
+AG2G3_PROFILE = open_loop_profile("neural_open", AG2G3_OFFERED_RATE)
 
 
 def _cell(cell_id: str) -> dict:
+    if cell_id == "G3":
+        return resolve_neural_cell("G3", allow_g3=True)
     return resolve_neural_cell(cell_id)
 
 
-def _report(cell_id: str, block: int, *, lag_max: int = 1000, mean_batch: float | None = None) -> dict:
+def _report(
+    cell_id: str,
+    block: int,
+    *,
+    lag_max: int = 1000,
+    mean_batch: float | None = None,
+) -> dict:
     cell = _cell(cell_id)
     document = sample_report(model=str(MODEL))
     document["generator"]["warmup_requests"] = 100
     document["scheduler"]["enable_batching"] = cell["enable_batching"]
     document["scheduler"]["max_batch_size"] = cell["max_batch_size"]
     document["scheduler"]["max_batch_delay_ms"] = cell["max_batch_delay_ms"]
-    # A baseline stays lower; alternative is higher by a fixed offset.
+    document["scheduler"]["adaptive_batching"] = bool(cell.get("adaptive_batching", False))
+    if cell_id == "G3":
+        document["scheduler"]["adaptive_batching"] = True
+    # Fixed offsets yield deterministic primary/secondary differences.
     offset = 0.0
     if cell_id in {"C", "G2"}:
         offset = 5.0
+    elif cell_id == "G3":
+        offset = 2.0
     document["successful_e2e_latency"]["p50_microseconds"] = 10.0 + block + offset
     document["successful_e2e_latency"]["p95_microseconds"] = 20.0 + block
     document["generator_lag"]["maximum_nanoseconds"] = lag_max
-    if mean_batch is not None and mean_batch >= 2.0:
+    if mean_batch is not None:
         runs = 50
         entered = int(round(mean_batch * runs))
         document["metrics"]["engine_run_count"] = runs
         document["metrics"]["requests_entered_engine_runs"] = entered
         histogram = [0] * 33
-        # Prefer exact size-2 sealed batches when mean is 2.
         if abs(mean_batch - 2.0) < 1e-12:
             histogram[2] = runs
+        elif abs(mean_batch - 1.0) < 1e-12:
+            histogram[1] = runs
         else:
+            # Construct a valid sealed histogram near the requested mean.
             histogram[1] = max(0, 2 * runs - entered)
             histogram[2] = runs - histogram[1]
         document["metrics"]["batch_size_histogram"] = histogram
@@ -115,6 +137,7 @@ def _write_run(
     run_name: str = "neural-run",
     lag_max: int = 1000,
     g2_mean_batch: float = 2.0,
+    g3_mean_batch: float | None = None,
 ) -> pathlib.Path:
     run_set = root / run_name
     runs = run_set / "runs"
@@ -126,6 +149,7 @@ def _write_run(
         baseline = "A"
         alternative = "C"
         contrast_fields: dict = {}
+        five_key = False
     elif contrast == "ag2":
         cell_ids = ["A", "G2"]
         profile = AG2_PROFILE
@@ -141,6 +165,35 @@ def _write_run(
             "persistent_batching_cell": "G2",
             "persistent_batching_min_mean": PERSISTENT_BATCHING_MIN_MEAN,
         }
+        five_key = False
+    elif contrast == "ag2g3":
+        cell_ids = ["A", "G2", "G3"]
+        profile = AG2G3_PROFILE
+        sign = CONTRAST_SIGN_G3_MINUS_G2
+        baseline = "G2"
+        alternative = "G3"
+        contrast_fields = {
+            "contrast_id": CONTRAST_ID_AG2G3,
+            "arrival_fidelity_status": ARRIVAL_FIDELITY_STATUS_NOT_CERTIFIED,
+            "phase_boundary_fidelity": PHASE_BOUNDARY_FIDELITY_UNAVAILABLE,
+            "arrival_screen_max_lag_ns": ARRIVAL_SCREEN_MAX_LAG_NS,
+            "arrival_screen_policy_version": ARRIVAL_SCREEN_POLICY_VERSION,
+            "persistent_batching_cell": "G2",
+            "persistent_batching_min_mean": PERSISTENT_BATCHING_MIN_MEAN,
+            "unbatched_cell": "A",
+            "secondary_baseline_cell": "A",
+            "secondary_alternative_cell": "G3",
+            "secondary_contrast_sign_convention": CONTRAST_SIGN_G3_MINUS_A,
+            "secondary_comparison_class": "exploratory",
+            "secondary_multiple_comparisons_adjustment": "none_unadjusted",
+            "require_five_key_cell_definitions": True,
+            "legacy_adaptive_identity_prohibited": True,
+            "rotation_position_counts": {
+                cell_id: {str(position): count for position, count in sorted(positions.items())}
+                for cell_id, positions in sorted(THREE_ARM_POSITION_COUNTS_20.items())
+            },
+        }
+        five_key = True
     else:
         raise AssertionError(contrast)
     cells = [_cell(cell_id) for cell_id in cell_ids]
@@ -167,7 +220,12 @@ def _write_run(
     for trial in plan:
         cell_id = str(trial["cell_id"])
         block = 0 if trial["block_index"] is None else int(trial["block_index"])
-        mean_batch = g2_mean_batch if cell_id == "G2" and not trial["pilot"] else None
+        mean_batch = None
+        if not trial["pilot"]:
+            if cell_id == "G2":
+                mean_batch = g2_mean_batch
+            elif cell_id == "G3" and g3_mean_batch is not None:
+                mean_batch = g3_mean_batch
         report = _report(cell_id, block, lag_max=lag_max, mean_batch=mean_batch)
         trial_id = str(trial["trial_id"])
         (runs / f"{trial_id}.json").write_text(dump_report(report), encoding="utf-8")
@@ -214,7 +272,7 @@ def _write_run(
         "traffic_profile": profile["id"],
         "cells": cell_ids,
         "profiles": [profile["id"]],
-        "cell_definitions": cells,
+        "cell_definitions": serialize_cell_definitions(cells, include_adaptive=five_key),
         "profile_definitions": profiles,
         "measurement": _measurement(),
         "counted_runs_per_cell": counted_blocks,
@@ -626,6 +684,230 @@ class AG2AnalyzeTest(unittest.TestCase):
         document = json.loads(analyze(run_set).read_text(encoding="utf-8"))
         self.assertEqual(document["contrast_sign_convention"], "C_minus_A")
         self.assertEqual(document["effect_definition"], "difference = C_metric - A_metric")
+
+
+class AG2G3AnalyzeTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.temporary.name)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_complete_20_block_primary_and_secondary(self) -> None:
+        run_set = _write_run(self.root, 20, contrast="ag2g3", run_name="ag2g3-ok")
+        document = json.loads(analyze(run_set).read_text(encoding="utf-8"))
+        self.assertEqual(document["contrast_id"], CONTRAST_ID_AG2G3)
+        self.assertEqual(document["contrast_sign_convention"], CONTRAST_SIGN_G3_MINUS_G2)
+        self.assertEqual(document["effect_definition"], "difference = G3_metric - G2_metric")
+        self.assertEqual(document["secondary_contrast_sign_convention"], CONTRAST_SIGN_G3_MINUS_A)
+        self.assertEqual(document["experimental_unit"], "three_arm_paired_block")
+        self.assertFalse(document["winner_declared"])
+        self.assertFalse(document["superiority_claimed"])
+        latency = next(metric for metric in document["metrics"] if metric["metric"] == "p50_e2e_latency")
+        self.assertEqual(latency["contrast_role"], "primary")
+        self.assertTrue(all(block["difference"] == -3.0 for block in latency["blocks"]))
+        self.assertEqual(latency["paired_block_count"], 20)
+        self.assertTrue(latency["confidence_interval_computed"])
+        differences = [-3.0] * 20
+        reproduced = paired_block_bootstrap_mean(
+            differences,
+            seed=BOOTSTRAP_SEED,
+            replicates=BOOTSTRAP_REPLICATES,
+            level=CONFIDENCE_LEVEL,
+        )
+        self.assertEqual(document["bootstrap_reproduction"], reproduced)
+        secondary = document["secondary_metrics"][0]
+        self.assertEqual(secondary["comparison_class"], "exploratory")
+        self.assertIn("EXPLORATORY", secondary["interval_label"])
+        self.assertIn("UNADJUSTED", secondary["interval_label"])
+        self.assertTrue(all(block["difference"] == 2.0 for block in secondary["blocks"]))
+        self.assertEqual(
+            document["rotation_position_counts"]["A"],
+            {"0": 7, "1": 6, "2": 7},
+        )
+
+    def test_unknown_and_missing_g3_rejected(self) -> None:
+        run_set = _write_run(self.root, 20, contrast="ag2g3", run_name="bad-id")
+
+        def bad_id(doc: dict) -> None:
+            doc["collection_protocol"]["contrast_id"] = "unknown"
+            doc["source_defined_policy"]["contrast_id"] = "unknown"
+
+        _mutate_environment(run_set, bad_id)
+        with self.assertRaises(AnalyzerError):
+            analyze(run_set)
+        missing = _write_run(self.root, 20, contrast="ag2", run_name="no-g3")
+
+        def force_three(doc: dict) -> None:
+            doc["collection_protocol"]["cells"] = ["A", "G2", "G3"]
+            doc["collection_protocol"]["contrast_id"] = CONTRAST_ID_AG2G3
+
+        _mutate_environment(missing, force_three)
+        with self.assertRaises(AnalyzerError):
+            analyze(missing)
+
+    def test_adaptive_identity_gates(self) -> None:
+        false_g3 = _write_run(self.root, 20, contrast="ag2g3", run_name="g3-false")
+
+        def make_false(document: dict) -> None:
+            document["scheduler"]["adaptive_batching"] = False
+
+        _mutate_report(false_g3, "G3-neural_open-01", make_false)
+        with self.assertRaises(AnalyzerError) as raised_false:
+            analyze(false_g3)
+        self.assertIn("adaptive_batching", str(raised_false.exception))
+        missing = _write_run(self.root, 20, contrast="ag2g3", run_name="g3-missing")
+
+        def drop(document: dict) -> None:
+            del document["scheduler"]["adaptive_batching"]
+
+        _mutate_report(missing, "G3-neural_open-01", drop)
+        with self.assertRaises(AnalyzerError):
+            analyze(missing)
+        true_g2 = _write_run(self.root, 20, contrast="ag2g3", run_name="g2-true")
+
+        def make_true(document: dict) -> None:
+            document["scheduler"]["adaptive_batching"] = True
+
+        _mutate_report(true_g2, "G2-neural_open-01", make_true)
+        with self.assertRaises(AnalyzerError):
+            analyze(true_g2)
+
+    def test_batch_delay_cap_hash_and_rate_gates(self) -> None:
+        bad_delay = _write_run(self.root, 20, contrast="ag2g3", run_name="bad-delay")
+
+        def delay(doc: dict) -> None:
+            for cell in doc["collection_protocol"]["cell_definitions"]:
+                if cell["id"] == "G2":
+                    cell["max_batch_delay_ms"] = 1
+
+        _mutate_environment(bad_delay, delay)
+        with self.assertRaises(AnalyzerError):
+            analyze(bad_delay)
+        bad_cap = _write_run(self.root, 20, contrast="ag2g3", run_name="bad-cap")
+
+        def cap(doc: dict) -> None:
+            for cell in doc["collection_protocol"]["cell_definitions"]:
+                if cell["id"] == "G3":
+                    cell["max_batch_size"] = 8
+
+        _mutate_environment(bad_cap, cap)
+        with self.assertRaises(AnalyzerError):
+            analyze(bad_cap)
+        bad_hash = _write_run(self.root, 20, contrast="ag2g3", run_name="bad-bin")
+
+        def bin_hash(doc: dict) -> None:
+            doc["queried"]["benchmark_binary_sha256"] = "ff" * 32
+
+        _mutate_environment(bad_hash, bin_hash)
+        with self.assertRaises(AnalyzerError):
+            analyze(bad_hash)
+        bad_model = _write_run(self.root, 20, contrast="ag2g3", run_name="bad-model")
+
+        def model_hash(doc: dict) -> None:
+            doc["verified_configuration"]["model_sha256"] = "00" * 32
+            doc["collection_protocol"]["model_sha256"] = "00" * 32
+
+        _mutate_environment(bad_model, model_hash)
+        with self.assertRaises(AnalyzerError):
+            analyze(bad_model)
+        bad_side = _write_run(self.root, 20, contrast="ag2g3", run_name="bad-side")
+
+        def side_hash(doc: dict) -> None:
+            doc["verified_configuration"]["weight_sidecar_sha256"] = "11" * 32
+            doc["collection_protocol"]["weight_sidecar_sha256"] = "11" * 32
+
+        _mutate_environment(bad_side, side_hash)
+        with self.assertRaises(AnalyzerError):
+            analyze(bad_side)
+        bad_rate = _write_run(self.root, 20, contrast="ag2g3", run_name="bad-rate")
+
+        def rate(doc: dict) -> None:
+            doc["collection_protocol"]["offered_rate"] = 500.0
+
+        _mutate_environment(bad_rate, rate)
+        with self.assertRaises(AnalyzerError):
+            analyze(bad_rate)
+
+    def test_arrival_and_batch_gates(self) -> None:
+        bad_arrival = _write_run(self.root, 20, contrast="ag2g3", run_name="bad-arrival")
+
+        def arrival(doc: dict) -> None:
+            doc["collection_protocol"]["arrival_screen_max_lag_ns"] = 1_000_000
+
+        _mutate_environment(bad_arrival, arrival)
+        with self.assertRaises(AnalyzerError):
+            analyze(bad_arrival)
+        lag = _write_run(
+            self.root,
+            20,
+            contrast="ag2g3",
+            run_name="lag-over",
+            lag_max=ARRIVAL_SCREEN_MAX_LAG_NS + 1,
+        )
+        with self.assertRaises(AnalyzerError) as raised:
+            analyze(lag)
+        self.assertIn("arrival screen", str(raised.exception))
+        g2_low = _write_run(
+            self.root, 20, contrast="ag2g3", run_name="g2-low", g2_mean_batch=1.5
+        )
+
+        def mutate(document: dict) -> None:
+            document["metrics"]["engine_run_count"] = 80
+            document["metrics"]["requests_entered_engine_runs"] = 100
+            document["metrics"]["batch_size_histogram"] = [0, 60, 20] + [0] * 30
+
+        _mutate_report(g2_low, "G2-neural_open-01", mutate)
+        with self.assertRaises(AnalyzerError) as g2_raised:
+            analyze(g2_low)
+        self.assertIn("persistent-batching", str(g2_raised.exception))
+        g3_low = _write_run(
+            self.root,
+            20,
+            contrast="ag2g3",
+            run_name="g3-low-ok",
+            g3_mean_batch=1.5,
+        )
+        document = json.loads(analyze(g3_low).read_text(encoding="utf-8"))
+        self.assertEqual(document["contrast_id"], CONTRAST_ID_AG2G3)
+        self.assertFalse(document["winner_declared"])
+
+    def test_order_duplicate_partial_and_legacy(self) -> None:
+        bad_order = _write_run(self.root, 20, contrast="ag2g3", run_name="bad-order")
+        plan = json.loads((bad_order / "execution_plan.json").read_text(encoding="utf-8"))
+        counted = [trial for trial in plan["trials"] if not trial["pilot"]]
+        counted[0]["cell_id"], counted[1]["cell_id"] = counted[1]["cell_id"], counted[0]["cell_id"]
+        (bad_order / "execution_plan.json").write_text(json.dumps(plan) + "\n", encoding="utf-8")
+
+        def sync(doc: dict) -> None:
+            doc["collection_protocol"]["trial_order"] = [
+                str(trial["trial_id"]) for trial in plan["trials"]
+            ]
+
+        _mutate_environment(bad_order, sync)
+        with self.assertRaises(AnalyzerError):
+            analyze(bad_order)
+        partial = _write_run(self.root, 10, contrast="ag2g3", run_name="partial")
+        with self.assertRaises(AnalyzerError) as raised:
+            analyze(partial)
+        self.assertIn("20", str(raised.exception))
+        legacy = _write_run(self.root, 20, contrast="ag2g3", run_name="legacy-forbid")
+        with self.assertRaises(AnalyzerError) as legacy_raised:
+            analyze(legacy, legacy_pre_adaptive_identity=True)
+        self.assertIn("prohibited", str(legacy_raised.exception))
+
+    def test_historical_contrasts_still_valid(self) -> None:
+        ac = _write_run(self.root, 10, contrast="ac", run_name="hist-ac")
+        ag2 = _write_run(self.root, 20, contrast="ag2", run_name="hist-ag2")
+        self.assertEqual(
+            json.loads(analyze(ac).read_text(encoding="utf-8"))["contrast_sign_convention"],
+            "C_minus_A",
+        )
+        self.assertEqual(
+            json.loads(analyze(ag2).read_text(encoding="utf-8"))["contrast_id"],
+            CONTRAST_ID_AG2,
+        )
 
 
 class AddAnalyzerSafetyTest(unittest.TestCase):

@@ -2,9 +2,10 @@
 """Collect schema-3 neural scheduler trials for InferEdge.
 
 This module is additive. It does not teach the historical Add collector about
-neural models. Reportable mode allowlists gemm_f32 A versus C (C_minus_A) and
-the frozen A versus G2 contrast (G2_minus_A at 1000 RPS). Offered rate must be
-frozen before reportable mode. This collector does not run a real campaign by
+neural models. Reportable mode allowlists gemm_f32 A versus C (C_minus_A), the
+frozen A versus G2 contrast (G2_minus_A at 1000 RPS), and the three-arm
+A/G2/G3 adaptive contrast (G3_minus_G2 primary at 1000 RPS). Offered rate must
+be frozen before reportable mode. This collector does not run a real campaign by
 itself.
 """
 
@@ -104,8 +105,9 @@ NEURAL_LOCAL_CELLS = (
     },
 )
 NEURAL_LOCAL_CELL_BY_ID = {cell["id"]: cell for cell in NEURAL_LOCAL_CELLS}
-# G1 and G3 stay calibration-only. G2 is calibration-only except the frozen A/G2
-# reportable contrast. G3 is never reportable.
+# G1 stays calibration-only. G2 is calibration-only except the frozen A/G2
+# reportable contrast. G3 is calibration-only except the frozen A/G2/G3
+# three-arm reportable contrast.
 CALIBRATION_ONLY_NEURAL_CELLS = frozenset(NEURAL_LOCAL_CELL_BY_ID)
 CALIBRATION_VARIANT_NONZERO_BATCH_DELAY_V1 = "nonzero_batch_delay_v1"
 CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1 = "adaptive_early_seal_v1"
@@ -118,13 +120,25 @@ CELL_DEFINITION_ALLOWED_KEYS = CELL_DEFINITION_KEYS + (CELL_DEFINITION_ADAPTIVE_
 
 CONTRAST_ID_AC = "gemm_f32_A_vs_C"
 CONTRAST_ID_AG2 = "gemm_f32_A_vs_G2_delay2ms_rps1000"
+CONTRAST_ID_AG2G3 = "gemm_f32_A_G2_G3_adaptive_rps1000"
 CONTRAST_SIGN_G2_MINUS_A = "G2_minus_A"
+CONTRAST_SIGN_G3_MINUS_G2 = "G3_minus_G2"
+CONTRAST_SIGN_G3_MINUS_A = "G3_minus_A"
 ARRIVAL_FIDELITY_STATUS_NOT_CERTIFIED = "not_certified"
 PHASE_BOUNDARY_FIDELITY_UNAVAILABLE = "unavailable"
 ARRIVAL_SCREEN_POLICY_VERSION = "coarse_max_lag_v1"
 ARRIVAL_SCREEN_MAX_LAG_NS = 5_000_000
 PERSISTENT_BATCHING_MIN_MEAN = 2.0
 AG2_OFFERED_RATE = 1000.0
+AG2G3_OFFERED_RATE = 1000.0
+# Twenty counted blocks under within_profile_cyclic_rotation on (A,G2,G3).
+# Perfect three-position balance is impossible; record and enforce these counts.
+THREE_ARM_COUNTED_BLOCKS = PREFERRED_COUNTED_RUNS
+THREE_ARM_POSITION_COUNTS_20 = {
+    "A": {0: 7, 1: 6, 2: 7},
+    "G2": {0: 7, 1: 7, 2: 6},
+    "G3": {0: 6, 1: 7, 2: 7},
+}
 
 REPORTABLE_CONTRAST_AC = {
     "contrast_id": CONTRAST_ID_AC,
@@ -142,6 +156,7 @@ REPORTABLE_CONTRAST_AC = {
     "persistent_batching_cell": None,
     "persistent_batching_min_mean": None,
     "allow_neural_local_cells": frozenset(),
+    "require_five_key_cell_definitions": False,
     "expected_cells": {
         "A": {"id": "A", "enable_batching": False, "max_batch_size": 1, "max_batch_delay_ms": 0},
         "C": {"id": "C", "enable_batching": True, "max_batch_size": 4, "max_batch_delay_ms": 0},
@@ -164,15 +179,67 @@ REPORTABLE_CONTRAST_AG2 = {
     "persistent_batching_cell": "G2",
     "persistent_batching_min_mean": PERSISTENT_BATCHING_MIN_MEAN,
     "allow_neural_local_cells": frozenset({"G2"}),
+    "require_five_key_cell_definitions": False,
     "expected_cells": {
         "A": {"id": "A", "enable_batching": False, "max_batch_size": 1, "max_batch_delay_ms": 0},
         "G2": {"id": "G2", "enable_batching": True, "max_batch_size": 4, "max_batch_delay_ms": 2},
     },
 }
 
+REPORTABLE_CONTRAST_AG2G3 = {
+    "contrast_id": CONTRAST_ID_AG2G3,
+    "model_id": REPORTABLE_MODEL_ID,
+    "cells": ("A", "G2", "G3"),
+    "baseline_cell": "G2",
+    "alternative_cell": "G3",
+    "contrast_sign_convention": CONTRAST_SIGN_G3_MINUS_G2,
+    "secondary_baseline_cell": "A",
+    "secondary_alternative_cell": "G3",
+    "secondary_contrast_sign_convention": CONTRAST_SIGN_G3_MINUS_A,
+    "secondary_comparison_class": "exploratory",
+    "secondary_multiple_comparisons_adjustment": "none_unadjusted",
+    "required_counted_runs": THREE_ARM_COUNTED_BLOCKS,
+    "fixed_offered_rate": AG2G3_OFFERED_RATE,
+    "arrival_fidelity_status": ARRIVAL_FIDELITY_STATUS_NOT_CERTIFIED,
+    "phase_boundary_fidelity": PHASE_BOUNDARY_FIDELITY_UNAVAILABLE,
+    "arrival_screen_max_lag_ns": ARRIVAL_SCREEN_MAX_LAG_NS,
+    "arrival_screen_policy_version": ARRIVAL_SCREEN_POLICY_VERSION,
+    "persistent_batching_cell": "G2",
+    "persistent_batching_min_mean": PERSISTENT_BATCHING_MIN_MEAN,
+    "unbatched_cell": "A",
+    "allow_neural_local_cells": frozenset({"G2", "G3"}),
+    "require_five_key_cell_definitions": True,
+    "legacy_adaptive_identity_prohibited": True,
+    "expected_position_counts": THREE_ARM_POSITION_COUNTS_20,
+    "expected_cells": {
+        "A": {
+            "id": "A",
+            "enable_batching": False,
+            "max_batch_size": 1,
+            "max_batch_delay_ms": 0,
+            "adaptive_batching": False,
+        },
+        "G2": {
+            "id": "G2",
+            "enable_batching": True,
+            "max_batch_size": 4,
+            "max_batch_delay_ms": 2,
+            "adaptive_batching": False,
+        },
+        "G3": {
+            "id": "G3",
+            "enable_batching": True,
+            "max_batch_size": 4,
+            "max_batch_delay_ms": 2,
+            "adaptive_batching": True,
+        },
+    },
+}
+
 REPORTABLE_CONTRASTS_BY_ID = {
     CONTRAST_ID_AC: REPORTABLE_CONTRAST_AC,
     CONTRAST_ID_AG2: REPORTABLE_CONTRAST_AG2,
+    CONTRAST_ID_AG2G3: REPORTABLE_CONTRAST_AG2G3,
 }
 
 NEURAL_MODELS = {
@@ -229,15 +296,14 @@ def resolve_neural_cell(cell_id: str, *, allow_g3: bool = False) -> dict:
     G1/G2/G3 come from neural-local definitions. All other ids come from the
     shared Add CELL_BY_ID registry. The shared registry is never mutated.
 
-    Bare resolve_neural_cell("G3") is rejected so confirmatory tooling cannot
-    treat G3 as a general cell. Calibration must resolve G3 through
-    resolve_neural_cells(mode="calibration"), which sets allow_g3=True after
-    the mode gate.
+    Bare resolve_neural_cell("G3") is rejected so G3 cannot be treated as a
+    general cell. Callers must resolve G3 through resolve_neural_cells with
+    mode='calibration' or the allowlisted A/G2/G3 reportable contrast.
     """
     if cell_id == "G3" and not allow_g3:
         raise NeuralCollectorError(
-            "G3 is calibration-only; resolve it via resolve_neural_cells "
-            "with mode='calibration'"
+            "G3 is calibration-only unless resolved via resolve_neural_cells "
+            "for calibration or the allowlisted A/G2/G3 reportable contrast"
         )
     if cell_id in NEURAL_LOCAL_CELL_BY_ID:
         return dict(NEURAL_LOCAL_CELL_BY_ID[cell_id])
@@ -259,8 +325,9 @@ def resolve_neural_cells(
 ) -> list[dict]:
     """Resolve ordered cell ids for the neural collector.
 
-    G1 and G3 remain calibration-only. G2 is calibration-only except the frozen
-    A/G2 reportable contrast. G3 is never reportable. Duplicates are rejected.
+    G1 remains calibration-only. G2 is calibration-only except the frozen A/G2
+    reportable contrast. G3 is calibration-only except the frozen A/G2/G3
+    reportable contrast. Smoke never accepts G3. Duplicates are rejected.
     """
     if not cell_ids:
         raise NeuralCollectorError("cells are required")
@@ -273,8 +340,8 @@ def resolve_neural_cells(
     if duplicates:
         raise NeuralCollectorError(f"duplicate cell id(s): {', '.join(duplicates)}")
     local_requested = [cell_id for cell_id in cell_ids if cell_id in CALIBRATION_ONLY_NEURAL_CELLS]
+    allowed_local: frozenset[str] = frozenset()
     if local_requested:
-        allowed_local: frozenset[str] = frozenset()
         if mode == "calibration":
             allowed_local = CALIBRATION_ONLY_NEURAL_CELLS
         elif mode == "reportable" and reportable_contrast is not None:
@@ -284,7 +351,7 @@ def resolve_neural_cells(
             raise NeuralCollectorError(
                 f"neural-local cells {', '.join(disallowed)} are not permitted in mode {mode!r}"
             )
-    allow_g3 = mode == "calibration"
+    allow_g3 = mode == "calibration" or "G3" in allowed_local
     return [resolve_neural_cell(cell_id, allow_g3=allow_g3) for cell_id in cell_ids]
 
 
@@ -358,8 +425,9 @@ def normalize_cell_definition(cell: dict) -> dict:
 def serialize_cell_definitions(cells: list[dict], *, include_adaptive: bool) -> list[dict]:
     """Serialize cell_definitions for environment metadata.
 
-    Reportable and historical calibration keep four-key on-disk shapes.
-    adaptive_early_seal_v1 requires five-key definitions for every cell.
+    Historical A/C and A/G2 reportable keep four-key on-disk shapes.
+    adaptive_early_seal_v1 calibration and the A/G2/G3 reportable contrast
+    require five-key definitions for every cell.
     """
     serialized: list[dict] = []
     for cell in cells:
@@ -500,6 +568,58 @@ def arrival_screen_problems(document: dict, max_lag_ns: int) -> list[str]:
     return []
 
 
+def counted_rotation_position_counts(plan: list[dict]) -> dict[str, dict[int, int]]:
+    """Count position_in_block occurrences per cell for counted trials only."""
+    counts: dict[str, dict[int, int]] = {}
+    for trial in plan:
+        if trial.get("pilot") is True:
+            continue
+        cell_id = str(trial["cell_id"])
+        position = trial.get("position_in_block")
+        if type(position) is not int:
+            raise NeuralCollectorError(
+                f"{trial.get('trial_id')} counted trial is missing position_in_block"
+            )
+        cell_counts = counts.setdefault(cell_id, {})
+        cell_counts[position] = cell_counts.get(position, 0) + 1
+    return counts
+
+
+def require_rotation_position_counts(
+    plan: list[dict], expected: dict[str, dict[int, int]]
+) -> dict[str, dict[int, int]]:
+    actual = counted_rotation_position_counts(plan)
+    if actual != expected:
+        raise NeuralCollectorError(
+            "rotation position counts diverge from the frozen three-arm contract: "
+            f"actual={actual!r}, expected={expected!r}"
+        )
+    return actual
+
+
+def unbatched_size_one_problems(document: dict) -> list[str]:
+    """Require sealed histogram accounting consistent with unbatched size-1 runs."""
+    mean, problems = realized_mean_batch_size(document)
+    if mean is None:
+        return problems or ["mean realized batch size could not be computed"]
+    metrics = document.get("metrics")
+    if not isinstance(metrics, dict):
+        return ["metrics object is missing"]
+    histogram = metrics.get("batch_size_histogram")
+    if not isinstance(histogram, list):
+        return ["batch_size_histogram is missing"]
+    for size, count in enumerate(histogram):
+        if size == 1:
+            continue
+        if type(count) is int and count != 0:
+            problems.append(
+                f"unbatched cell has sealed batches of size {size} (count {count})"
+            )
+    if abs(float(mean) - 1.0) > 1e-12:
+        problems.append(f"unbatched mean realized batch size is {mean}, expected 1.0")
+    return problems
+
+
 def resolve_reportable_contrast(
     *,
     model_id: str,
@@ -555,9 +675,30 @@ def resolve_reportable_contrast(
         contract = dict(REPORTABLE_CONTRAST_AG2)
         contract["resolved_offered_rate"] = AG2_OFFERED_RATE
         return contract
+    if cells == REPORTABLE_CONTRAST_AG2G3["cells"]:
+        baseline = baseline_cell or "G2"
+        alternative = alternative_cell or "G3"
+        if baseline != "G2" or alternative != "G3":
+            raise NeuralCollectorError(
+                "A/G2/G3 reportable contrast requires primary baseline G2 and alternative G3"
+            )
+        if float(target_rps) != AG2G3_OFFERED_RATE:
+            raise NeuralCollectorError(
+                f"A/G2/G3 reportable contrast requires --target-rps {AG2G3_OFFERED_RATE:g}"
+            )
+        if counted_runs is None:
+            counted_runs = THREE_ARM_COUNTED_BLOCKS
+        if counted_runs != THREE_ARM_COUNTED_BLOCKS:
+            raise NeuralCollectorError(
+                f"A/G2/G3 reportable contrast requires exactly "
+                f"{THREE_ARM_COUNTED_BLOCKS} counted blocks"
+            )
+        contract = dict(REPORTABLE_CONTRAST_AG2G3)
+        contract["resolved_offered_rate"] = AG2G3_OFFERED_RATE
+        return contract
     raise NeuralCollectorError(
-        "reportable mode supports only cells A,C or the frozen A,G2 contrast; "
-        f"got {','.join(cell_ids)!r}"
+        "reportable mode supports only cells A,C, the frozen A,G2 contrast, "
+        f"or the frozen A,G2,G3 contrast; got {','.join(cell_ids)!r}"
     )
 
 
@@ -724,6 +865,7 @@ def validate_trial(
     arrival_screen_max_lag_ns: int | None = None,
     require_persistent_batching: bool = False,
     persistent_batching_min_mean: float | None = None,
+    require_unbatched_size_one: bool = False,
     require_strict_generator_delivery: bool | None = None,
 ) -> tuple[dict | None, dict, list[str]]:
     document, status = classify_report(text, expected=expected)
@@ -807,6 +949,8 @@ def validate_trial(
             problems.append(
                 f"mean realized batch size is {mean}, below persistent-batching gate {minimum}"
             )
+    if require_unbatched_size_one:
+        problems.extend(unbatched_size_one_problems(document))
     return document, status, problems
 
 
@@ -894,9 +1038,11 @@ def neural_preflight(
         measurement=measurement,
         counted_runs=counted_runs,
     )
-    include_adaptive_definitions = (
-        calibration_variant == CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1
-    )
+    include_adaptive_definitions = calibration_variant == CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1
+    if reportable_contrast is not None and reportable_contrast.get(
+        "require_five_key_cell_definitions"
+    ):
+        include_adaptive_definitions = True
     cell_definitions = serialize_cell_definitions(
         cells, include_adaptive=include_adaptive_definitions
     )
@@ -994,6 +1140,7 @@ def neural_preflight(
     tools = compiler_and_cmake(runner, cache["CMAKE_CXX_COMPILER"])
     plan = build_plan(cells, profiles, counted_runs)
     pilots = [str(trial["trial_id"]) for trial in plan if trial["pilot"]]
+    rotation_position_counts = None
     if reportable_contrast is not None:
         sign = str(reportable_contrast["contrast_sign_convention"])
         contrast_id = str(reportable_contrast["contrast_id"])
@@ -1003,6 +1150,9 @@ def neural_preflight(
         arrival_screen_version = reportable_contrast.get("arrival_screen_policy_version")
         persistent_cell = reportable_contrast.get("persistent_batching_cell")
         persistent_min = reportable_contrast.get("persistent_batching_min_mean")
+        expected_positions = reportable_contrast.get("expected_position_counts")
+        if isinstance(expected_positions, dict):
+            rotation_position_counts = require_rotation_position_counts(plan, expected_positions)
     else:
         sign = CONTRAST_SIGN_CONVENTION
         contrast_id = None
@@ -1015,6 +1165,19 @@ def neural_preflight(
     contrast_identity: dict = {}
     if contrast_id is not None:
         contrast_identity["contrast_id"] = contrast_id
+    if reportable_contrast is not None:
+        for key in (
+            "secondary_baseline_cell",
+            "secondary_alternative_cell",
+            "secondary_contrast_sign_convention",
+            "secondary_comparison_class",
+            "secondary_multiple_comparisons_adjustment",
+            "unbatched_cell",
+            "legacy_adaptive_identity_prohibited",
+            "require_five_key_cell_definitions",
+        ):
+            if key in reportable_contrast and reportable_contrast[key] is not None:
+                contrast_identity[key] = reportable_contrast[key]
     if arrival_status is not None:
         contrast_identity["arrival_fidelity_status"] = arrival_status
         contrast_identity["phase_boundary_fidelity"] = phase_boundary
@@ -1028,7 +1191,17 @@ def neural_preflight(
         contrast_identity["persistent_batching_cell"] = persistent_cell
         contrast_identity["persistent_batching_min_mean"] = persistent_min
         contrast_identity["persistent_batching_note"] = (
-            "Mean realized batch size from sealed histograms; never the configured max."
+            "Mean realized batch size from sealed histograms; never the configured max. "
+            "G3 mean batch size remains diagnostic under the three-arm contrast."
+        )
+    if rotation_position_counts is not None:
+        contrast_identity["rotation_position_counts"] = {
+            cell_id: {str(position): count for position, count in sorted(positions.items())}
+            for cell_id, positions in sorted(rotation_position_counts.items())
+        }
+        contrast_identity["rotation_balance_note"] = (
+            "Twenty blocks cannot provide perfect three-position balance; "
+            "recorded counts are enforced and are not claimed to be exact balance."
         )
     return {
         "queried": {
