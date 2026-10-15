@@ -8,6 +8,7 @@ import re
 import struct
 import tempfile
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 
 import onnx
@@ -57,6 +58,20 @@ RESNET18_REGENERATED_RELATIVES = frozenset(
         "fixtures/resnet18_f32/b08.expected.f32",
     }
 )
+RESNET18_INPUT_RELATIVES = (
+    "fixtures/resnet18_f32/b01.input.f32",
+    "fixtures/resnet18_f32/b02.input.f32",
+    "fixtures/resnet18_f32/b04.input.f32",
+    "fixtures/resnet18_f32/b08.input.f32",
+)
+RESNET18_EXPECTED_COUNTS = {
+    "fixtures/resnet18_f32/b01.expected.f32": 1 * 1000,
+    "fixtures/resnet18_f32/b02.expected.f32": 2 * 1000,
+    "fixtures/resnet18_f32/b04.expected.f32": 4 * 1000,
+    "fixtures/resnet18_f32/b08.expected.f32": 8 * 1000,
+}
+RESNET18_ATOL = 1e-5
+RESNET18_RTOL = 1e-5
 
 
 def sha256(payload: bytes) -> str:
@@ -123,6 +138,131 @@ def resnet18_manifest_stable_lines(text: str) -> list[str]:
             f"{sorted(set(host_keys))}, expected {sorted(RESNET18_HOST_MANIFEST_KEYS)}"
         )
     return stable
+
+
+def pack_le_f32(values: list[float]) -> bytes:
+    return b"".join(struct.pack("<f", float(value)) for value in values)
+
+
+def unpack_le_f32(payload: bytes) -> list[float]:
+    if not isinstance(payload, (bytes, bytearray)):
+        raise ValueError("float32 payload must be bytes")
+    if len(payload) % 4 != 0:
+        raise ValueError(f"payload length {len(payload)} is not a multiple of 4")
+    count = len(payload) // 4
+    return list(struct.unpack("<" + "f" * count, payload))
+
+
+@dataclass(frozen=True)
+class ResNet18LogitCompare:
+    name: str
+    count: int
+    max_abs: float
+    mean_abs: float
+    max_rel: float
+    exceed: int
+    nonfinite_canonical: int
+    nonfinite_actual: int
+    worst_index: int
+    worst_canonical: float
+    worst_actual: float
+
+    def message(self) -> str:
+        return (
+            f"{self.name}: n={self.count} max_abs={self.max_abs:.8e} "
+            f"mean_abs={self.mean_abs:.8e} max_rel={self.max_rel:.8e} "
+            f"exceed={self.exceed} nonfinite_canonical={self.nonfinite_canonical} "
+            f"nonfinite_actual={self.nonfinite_actual} worst_index={self.worst_index} "
+            f"canonical={self.worst_canonical:.8e} actual={self.worst_actual:.8e} "
+            f"atol={RESNET18_ATOL} rtol={RESNET18_RTOL}"
+        )
+
+
+def compare_resnet18_expected_logits(
+    canonical: bytes, actual: bytes, *, count: int, name: str
+) -> ResNet18LogitCompare:
+    """Compare little-endian float32 logits with frozen atol/rtol=1e-5.
+
+    Canonical files stay the committed goldens. Regenerated NumPy logits may
+    differ by BLAS reduction order. This does not call ONNX Runtime.
+    """
+    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+        raise ValueError("count must be a positive int")
+    expected_bytes = count * 4
+    if not isinstance(canonical, (bytes, bytearray)) or not isinstance(actual, (bytes, bytearray)):
+        raise ValueError(f"{name}: payloads must be little-endian float32 bytes")
+    if len(canonical) != expected_bytes:
+        raise ValueError(
+            f"{name}: canonical length {len(canonical)} != {expected_bytes} for {count} float32 values"
+        )
+    if len(actual) != expected_bytes:
+        raise ValueError(
+            f"{name}: actual length {len(actual)} != {expected_bytes} for {count} float32 values"
+        )
+    left = unpack_le_f32(bytes(canonical))
+    right = unpack_le_f32(bytes(actual))
+    if len(left) != count or len(right) != count:
+        raise ValueError(f"{name}: unpacked counts {len(left)}, {len(right)} != {count}")
+    nonfinite_canonical = 0
+    nonfinite_actual = 0
+    abs_sum = 0.0
+    max_abs = 0.0
+    max_rel = 0.0
+    exceed = 0
+    worst_index = 0
+    worst_canonical = left[0]
+    worst_actual = right[0]
+    for index, (canonical_value, actual_value) in enumerate(zip(left, right, strict=True)):
+        canonical_ok = math.isfinite(canonical_value)
+        actual_ok = math.isfinite(actual_value)
+        if not canonical_ok:
+            nonfinite_canonical += 1
+        if not actual_ok:
+            nonfinite_actual += 1
+        if not canonical_ok or not actual_ok:
+            exceed += 1
+            continue
+        abs_err = abs(actual_value - canonical_value)
+        abs_sum += abs_err
+        if abs_err >= max_abs:
+            max_abs = abs_err
+            worst_index = index
+            worst_canonical = canonical_value
+            worst_actual = actual_value
+        magnitude = abs(canonical_value)
+        if magnitude > 0.0:
+            rel_err = abs_err / magnitude
+        elif abs_err == 0.0:
+            rel_err = 0.0
+        else:
+            rel_err = math.inf
+        if rel_err > max_rel:
+            max_rel = rel_err
+        limit = RESNET18_ATOL + RESNET18_RTOL * magnitude
+        if abs_err > limit:
+            exceed += 1
+    return ResNet18LogitCompare(
+        name=name,
+        count=count,
+        max_abs=max_abs,
+        mean_abs=abs_sum / float(count),
+        max_rel=max_rel,
+        exceed=exceed,
+        nonfinite_canonical=nonfinite_canonical,
+        nonfinite_actual=nonfinite_actual,
+        worst_index=worst_index,
+        worst_canonical=worst_canonical,
+        worst_actual=worst_actual,
+    )
+
+
+def assert_resnet18_expected_logits_close(
+    canonical: bytes, actual: bytes, *, count: int, name: str
+) -> ResNet18LogitCompare:
+    report = compare_resnet18_expected_logits(canonical, actual, count=count, name=name)
+    if report.nonfinite_canonical or report.nonfinite_actual or report.exceed:
+        raise AssertionError(report.message())
+    return report
 
 
 def unpack_f32(payload: bytes) -> list[float]:
@@ -386,6 +526,65 @@ class GeneratedWorkloadTest(unittest.TestCase):
                 self.assertEqual(sha256(payload), sha256(self.repeated[name][0][relative]))
 
 
+class ResNet18ExpectedCompareTest(unittest.TestCase):
+    """Stdlib checks for the frozen ResNet expected-logit comparator. No NumPy."""
+
+    def test_exact_arrays_pass(self) -> None:
+        payload = pack_le_f32([1.0, -2.5, 0.0, 3.1415927])
+        report = assert_resnet18_expected_logits_close(payload, payload, count=4, name="exact")
+        self.assertEqual(report.exceed, 0)
+        self.assertEqual(report.max_abs, 0.0)
+        self.assertEqual(report.max_rel, 0.0)
+
+    def test_small_float32_rounding_passes(self) -> None:
+        canonical = pack_le_f32([1.0, -0.02, 3.0e-5])
+        actual = pack_le_f32([1.0 + 1.0e-7, -0.02 + 1.0e-8, 3.0e-5 + 1.0e-12])
+        report = assert_resnet18_expected_logits_close(
+            canonical, actual, count=3, name="rounding"
+        )
+        self.assertEqual(report.exceed, 0)
+        self.assertGreater(report.max_abs, 0.0)
+        self.assertLess(report.max_abs, RESNET18_ATOL)
+
+    def test_error_above_tolerance_fails(self) -> None:
+        canonical = pack_le_f32([1.0])
+        actual = pack_le_f32([1.0 + 1.0e-3])
+        with self.assertRaises(AssertionError) as raised:
+            assert_resnet18_expected_logits_close(canonical, actual, count=1, name="loose")
+        self.assertIn("exceed=1", str(raised.exception))
+        self.assertIn("loose", str(raised.exception))
+
+    def test_count_and_length_mismatch_fail(self) -> None:
+        payload = pack_le_f32([1.0, 2.0])
+        with self.assertRaises(ValueError):
+            compare_resnet18_expected_logits(payload, payload, count=3, name="count")
+        with self.assertRaises(ValueError):
+            compare_resnet18_expected_logits(payload, pack_le_f32([1.0]), count=2, name="short")
+        with self.assertRaises(ValueError):
+            compare_resnet18_expected_logits(b"\x00\x00\x00", b"\x00\x00\x00", count=1, name="odd")
+        with self.assertRaises(ValueError):
+            compare_resnet18_expected_logits([1.0], [1.0], count=1, name="dtype")  # type: ignore[arg-type]
+
+    def test_nan_and_inf_fail(self) -> None:
+        canonical = pack_le_f32([1.0])
+        with self.assertRaises(AssertionError) as nan_error:
+            assert_resnet18_expected_logits_close(
+                canonical, pack_le_f32([float("nan")]), count=1, name="nan"
+            )
+        self.assertIn("nonfinite_actual=1", str(nan_error.exception))
+        with self.assertRaises(AssertionError) as inf_error:
+            assert_resnet18_expected_logits_close(
+                canonical, pack_le_f32([float("inf")]), count=1, name="inf"
+            )
+        self.assertIn("nonfinite_actual=1", str(inf_error.exception))
+
+    def test_unrelated_binaries_still_require_byte_equality(self) -> None:
+        left = b"onnx-bytes"
+        right = b"onnx-byteS"
+        self.assertNotEqual(left, right)
+        self.assertEqual(left, left)
+
+
 class ResNet18CommittedArtifactTest(unittest.TestCase):
     """Inspect committed ResNet-18 files. Collection does not import NumPy."""
 
@@ -620,19 +819,35 @@ class ResNet18OperatorTest(unittest.TestCase):
     def test_committed_artifacts_match_regeneration_when_numpy_present(self) -> None:
         files = self.resnet.build_artifacts()
         self.assertEqual(set(files), RESNET18_REGENERATED_RELATIVES)
-        for relative, payload in files.items():
+        committed_onnx = (REPO_MODELS / "resnet18_f32.onnx").read_bytes()
+        self.assertEqual(committed_onnx, files["resnet18_f32.onnx"], "resnet18_f32.onnx")
+        committed_manifest = (REPO_MODELS / "fixtures/resnet18_f32/manifest.txt").read_text(
+            encoding="ascii"
+        )
+        self.assertEqual(
+            resnet18_manifest_stable_lines(committed_manifest),
+            resnet18_manifest_stable_lines(files["fixtures/resnet18_f32/manifest.txt"].decode("ascii")),
+            "fixtures/resnet18_f32/manifest.txt",
+        )
+        for relative in RESNET18_INPUT_RELATIVES:
             committed = REPO_MODELS / relative
             self.assertTrue(committed.is_file(), str(committed))
-            if relative == "fixtures/resnet18_f32/manifest.txt":
-                committed_text = committed.read_text(encoding="ascii")
-                regenerated_text = payload.decode("ascii")
-                self.assertEqual(
-                    resnet18_manifest_stable_lines(committed_text),
-                    resnet18_manifest_stable_lines(regenerated_text),
-                    relative,
+            self.assertEqual(committed.read_bytes(), files[relative], relative)
+        reports: list[str] = []
+        failures: list[str] = []
+        for relative, count in RESNET18_EXPECTED_COUNTS.items():
+            committed = REPO_MODELS / relative
+            self.assertTrue(committed.is_file(), str(committed))
+            try:
+                report = assert_resnet18_expected_logits_close(
+                    committed.read_bytes(), files[relative], count=count, name=relative
                 )
+            except AssertionError as error:
+                failures.append(str(error))
                 continue
-            self.assertEqual(committed.read_bytes(), payload, relative)
+            reports.append(report.message())
+        self.assertEqual(len(RESNET18_EXPECTED_COUNTS), 4)
+        self.assertFalse(failures, "expected-logit mismatches:\n" + "\n".join(failures + reports))
         self.assertEqual(self.resnet.LEARNABLE_PARAMETERS, 11_689_512)
 
 
