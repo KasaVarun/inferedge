@@ -32,10 +32,13 @@ inline constexpr std::size_t kMaxSchedulerQueueCapacity = 1024;
 // default is false and preserves fixed-delay waiting. When true, a worker may
 // seal once it owns at least kAdaptiveMinTargetBatch validated requests and
 // the queue is empty, without waiting out the remainder of max_batch_delay.
-// It does not estimate arrival rate. enable_metrics collects worker-local
-// engine-run counts, batch-size histogram bins, and assembly/run/split
-// duration totals. The default is false: workers do not read a clock and do
-// not update metric storage.
+// It does not estimate arrival rate. arrival_aware_batching is a distinct
+// opt-in policy (G4): an EWMA of accepted enqueue interarrival may seal early
+// when the estimate exceeds the remaining batch deadline. The default is
+// false. adaptive_batching and arrival_aware_batching must not both be true.
+// enable_metrics collects worker-local engine-run counts, batch-size histogram
+// bins, and assembly/run/split duration totals. The default is false: workers
+// do not read a clock and do not update metric storage.
 inline constexpr std::size_t kAdaptiveMinTargetBatch = 2;
 
 struct SchedulerConfig {
@@ -47,8 +50,12 @@ struct SchedulerConfig {
     std::chrono::milliseconds max_batch_delay{0};
     // Opt-in. When false, RunBatch keeps fixed-delay fill behavior. When true,
     // start() requires enable_batching, max_batch_size >= kAdaptiveMinTargetBatch,
-    // and max_batch_delay > 0.
+    // and max_batch_delay > 0. Mutually exclusive with arrival_aware_batching.
     bool adaptive_batching{false};
+    // Opt-in arrival-rate-aware early seal (G4). Default false. Requires
+    // enable_batching, max_batch_size >= 2, max_batch_delay > 0. Mutually
+    // exclusive with adaptive_batching. Estimator knobs are not configurable.
+    bool arrival_aware_batching{false};
     bool enable_metrics{false};
     // When true, each published completion carries one steady_clock time point
     // taken immediately before promise::set_value. The default reads no clock
@@ -269,6 +276,16 @@ public:
     static bool IsFailed(const InferenceScheduler& scheduler);
     static bool ClosedForDrain(const InferenceScheduler& scheduler);
     static bool ClosedForCancel(const InferenceScheduler& scheduler);
+    // Test-only arrival-aware EWMA observation and injection. Production leaves
+    // these unused. SetArrivalEwma(nullopt) clears the estimate (uninitialized).
+    // NoteAcceptedArrivalAt applies the same update path as a successful accept
+    // at the given steady_clock time without submitting work.
+    static std::optional<std::int64_t> ArrivalEwmaNanoseconds(const InferenceScheduler& scheduler);
+    static bool ArrivalEwmaHasLastEnqueue(const InferenceScheduler& scheduler);
+    static void SetArrivalEwmaNanoseconds(InferenceScheduler& scheduler,
+                                          std::optional<std::int64_t> ewma_ns);
+    static void NoteAcceptedArrivalAt(InferenceScheduler& scheduler,
+                                      std::chrono::steady_clock::time_point now);
 };
 
 } // namespace inferedge

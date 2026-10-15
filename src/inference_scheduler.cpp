@@ -142,6 +142,10 @@ SchedulerError ValidateConfig(const SchedulerConfig& config) {
         return MakeError(SchedulerErrorKind::kInvalidConfig,
                          "max_batch_delay must be from 0 through 1000 milliseconds");
     }
+    if (config.adaptive_batching && config.arrival_aware_batching) {
+        return MakeError(SchedulerErrorKind::kInvalidConfig,
+                         "adaptive_batching and arrival_aware_batching are mutually exclusive");
+    }
     if (config.adaptive_batching) {
         if (!config.enable_batching) {
             return MakeError(SchedulerErrorKind::kInvalidConfig,
@@ -156,7 +160,61 @@ SchedulerError ValidateConfig(const SchedulerConfig& config) {
                              "adaptive_batching requires max_batch_delay > 0");
         }
     }
+    if (config.arrival_aware_batching) {
+        if (!config.enable_batching) {
+            return MakeError(SchedulerErrorKind::kInvalidConfig,
+                             "arrival_aware_batching requires enable_batching");
+        }
+        if (config.max_batch_size < 2) {
+            return MakeError(SchedulerErrorKind::kInvalidConfig,
+                             "arrival_aware_batching requires max_batch_size >= 2");
+        }
+        if (config.max_batch_delay <= std::chrono::milliseconds::zero()) {
+            return MakeError(SchedulerErrorKind::kInvalidConfig,
+                             "arrival_aware_batching requires max_batch_delay > 0");
+        }
+    }
     return {};
+}
+
+std::chrono::milliseconds ArrivalIdleThreshold(std::chrono::milliseconds max_batch_delay) {
+    const std::chrono::milliseconds scaled = max_batch_delay * 8;
+    const std::chrono::milliseconds floor{50};
+    return scaled > floor ? scaled : floor;
+}
+
+// Scheduler-wide accepted-enqueue EWMA. Caller holds admission_. alpha = 1/8.
+void UpdateArrivalEwma(std::optional<std::chrono::steady_clock::time_point>& last_enqueue_tp,
+                       std::optional<std::int64_t>& ewma_interarrival_ns,
+                       std::chrono::steady_clock::time_point now,
+                       std::chrono::milliseconds idle_threshold) {
+    if (!last_enqueue_tp.has_value()) {
+        last_enqueue_tp = now;
+        return;
+    }
+    const std::chrono::steady_clock::duration delta = now - *last_enqueue_tp;
+    last_enqueue_tp = now;
+    if (delta <= std::chrono::steady_clock::duration::zero()) {
+        return;
+    }
+    if (delta > idle_threshold) {
+        ewma_interarrival_ns = std::nullopt;
+        return;
+    }
+    const auto delta_ns_chrono = std::chrono::duration_cast<std::chrono::nanoseconds>(delta);
+    if (delta_ns_chrono.count() < 0) {
+        return;
+    }
+    if (delta_ns_chrono.count() > std::numeric_limits<std::int64_t>::max()) {
+        return;
+    }
+    const std::int64_t delta_ns = static_cast<std::int64_t>(delta_ns_chrono.count());
+    if (!ewma_interarrival_ns.has_value()) {
+        ewma_interarrival_ns = delta_ns;
+        return;
+    }
+    const std::int64_t ewma = *ewma_interarrival_ns;
+    ewma_interarrival_ns = ewma - (ewma >> 3) + (delta_ns >> 3);
 }
 
 bool CheckedMultiply(std::size_t left, std::size_t right, std::size_t& product) {
@@ -519,6 +577,12 @@ struct InferenceScheduler::Impl {
     std::atomic<std::uint64_t> executing_{0};
     std::atomic<std::uint32_t> live_workers_{0};
 
+    // Arrival-aware (G4) estimator. Written under admission_ after accepted
+    // try_push. Workers snapshot under admission_ only after releasing the
+    // queue mutex.
+    std::optional<std::chrono::steady_clock::time_point> last_enqueue_tp_;
+    std::optional<std::int64_t> ewma_interarrival_ns_;
+
     // Written only after every joinable worker thread joined successfully.
     // metrics() copies it under admission_ only when metrics_merged_ is true.
     WorkerMetrics published_metrics_{};
@@ -854,6 +918,33 @@ BatchStep InferenceScheduler::Impl::RunBatch(std::uint32_t index, InferenceEngin
             // never enter owned and do not satisfy this threshold.
             if (config_.adaptive_batching && owned.size() >= kAdaptiveMinTargetBatch) {
                 break;
+            }
+            // G4: after try_pop released the queue mutex, snapshot EWMA under
+            // admission_ and seal early when the estimate exceeds remaining
+            // deadline. Uninitialized EWMA keeps fixed-delay waiting.
+            if (config_.arrival_aware_batching) {
+                bool ewma_initialized = false;
+                std::int64_t ewma_ns = 0;
+                {
+                    std::lock_guard<std::mutex> admission_lock(admission_);
+                    ewma_initialized = ewma_interarrival_ns_.has_value();
+                    if (ewma_initialized) {
+                        ewma_ns = *ewma_interarrival_ns_;
+                    }
+                }
+                if (ewma_initialized) {
+                    const std::chrono::steady_clock::time_point now =
+                        std::chrono::steady_clock::now();
+                    if (now >= deadline) {
+                        break;
+                    }
+                    const auto remaining_ns =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now)
+                            .count();
+                    if (remaining_ns <= 0 || ewma_ns > remaining_ns) {
+                        break;
+                    }
+                }
             }
             if (!wait_for_more || std::chrono::steady_clock::now() >= deadline) {
                 break;
@@ -1600,9 +1691,17 @@ Admission InferenceScheduler::Impl::Submit(std::vector<NamedTensor> inputs) {
             }
             return rejected;
         }
+        // try_push released queue.mutex_. Update the arrival EWMA under
+        // admission_ only after a successful ownership handoff.
+        if (config_.arrival_aware_batching) {
+            UpdateArrivalEwma(last_enqueue_tp_, ewma_interarrival_ns_,
+                              std::chrono::steady_clock::now(),
+                              ArrivalIdleThreshold(config_.max_batch_delay));
+        }
     } catch (const std::exception&) {
         // The queue argument's destructor publishes when the push throws before
         // the queue takes ownership. Hand that future back. Do not touch entry.
+        // No EWMA update: admission without confirmed queue ownership.
         ++failed_scheduler_;
         Admission accepted;
         accepted.status = AdmissionStatus::kAccepted;
@@ -2025,6 +2124,30 @@ bool SchedulerTestAccess::ClosedForCancel(const InferenceScheduler& scheduler) {
     }
     const std::optional<QueueCloseMode> mode = scheduler.impl_->queue_->close_mode();
     return mode.has_value() && *mode == QueueCloseMode::kCancel;
+}
+
+std::optional<std::int64_t>
+SchedulerTestAccess::ArrivalEwmaNanoseconds(const InferenceScheduler& scheduler) {
+    std::lock_guard<std::mutex> lock(scheduler.impl_->admission_);
+    return scheduler.impl_->ewma_interarrival_ns_;
+}
+
+bool SchedulerTestAccess::ArrivalEwmaHasLastEnqueue(const InferenceScheduler& scheduler) {
+    std::lock_guard<std::mutex> lock(scheduler.impl_->admission_);
+    return scheduler.impl_->last_enqueue_tp_.has_value();
+}
+
+void SchedulerTestAccess::SetArrivalEwmaNanoseconds(InferenceScheduler& scheduler,
+                                                    std::optional<std::int64_t> ewma_ns) {
+    std::lock_guard<std::mutex> lock(scheduler.impl_->admission_);
+    scheduler.impl_->ewma_interarrival_ns_ = ewma_ns;
+}
+
+void SchedulerTestAccess::NoteAcceptedArrivalAt(InferenceScheduler& scheduler,
+                                                std::chrono::steady_clock::time_point now) {
+    std::lock_guard<std::mutex> lock(scheduler.impl_->admission_);
+    UpdateArrivalEwma(scheduler.impl_->last_enqueue_tp_, scheduler.impl_->ewma_interarrival_ns_,
+                      now, ArrivalIdleThreshold(scheduler.impl_->config_.max_batch_delay));
 }
 
 } // namespace inferedge

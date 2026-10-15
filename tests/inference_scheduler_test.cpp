@@ -1,5 +1,6 @@
 #include "inferedge/inference_scheduler.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -2046,6 +2047,7 @@ TEST_F(InferenceSchedulerTest, AggregateInitializationLeavesBatchingDisabled) {
     EXPECT_EQ(config.max_batch_size, 1U);
     EXPECT_EQ(config.max_batch_delay, std::chrono::milliseconds::zero());
     EXPECT_FALSE(config.adaptive_batching);
+    EXPECT_FALSE(config.arrival_aware_batching);
     EXPECT_EQ(inferedge::kAdaptiveMinTargetBatch, 2U);
     EXPECT_FALSE(config.enable_metrics);
 }
@@ -2185,6 +2187,18 @@ std::unique_ptr<InferenceScheduler> MakeAdaptiveBatch(std::uint32_t batch_size,
     config.max_batch_size = batch_size;
     config.max_batch_delay = delay;
     config.adaptive_batching = true;
+    return MakeScheduler(std::move(config));
+}
+
+std::unique_ptr<InferenceScheduler> MakeArrivalAwareBatch(std::uint32_t batch_size,
+                                                          std::chrono::milliseconds delay,
+                                                          std::size_t capacity,
+                                                          std::uint32_t workers = 1) {
+    SchedulerConfig config{INFEREDGE_BATCH_ADD_MODEL_PATH, workers, capacity};
+    config.enable_batching = true;
+    config.max_batch_size = batch_size;
+    config.max_batch_delay = delay;
+    config.arrival_aware_batching = true;
     return MakeScheduler(std::move(config));
 }
 
@@ -2650,6 +2664,409 @@ TEST_F(InferenceSchedulerTest, AdaptiveInvalidRequestDoesNotSatisfyMinTarget) {
 TEST_F(InferenceSchedulerTest, AdaptiveMultiWorkerSmokePreservesTerminalAccounting) {
     BatchRuns runs;
     auto scheduler = MakeAdaptiveBatch(2, std::chrono::milliseconds{30}, 8, 2);
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler,
+                                       [&runs](std::size_t count) { runs.Record(count); });
+    RequireStart(*scheduler);
+    Admission a = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission b = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    Admission c = scheduler->submit(DynamicAddInputs(9.F, 10.F, 11.F, 12.F));
+    Admission d = scheduler->submit(DynamicAddInputs(13.F, 14.F, 15.F, 16.F));
+    release.release();
+    ExpectDynamicSum(Take(std::move(a)), 4.F, 6.F);
+    ExpectDynamicSum(Take(std::move(b)), 12.F, 14.F);
+    ExpectDynamicSum(Take(std::move(c)), 20.F, 22.F);
+    ExpectDynamicSum(Take(std::move(d)), 28.F, 30.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    const std::vector<std::size_t> sizes = runs.Snapshot();
+    std::size_t total = 0;
+    for (const std::size_t size : sizes) {
+        EXPECT_GE(size, 1U);
+        EXPECT_LE(size, 2U);
+        total += size;
+    }
+    EXPECT_EQ(total, 4U);
+    ExpectQuiescent(*scheduler, 4, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, RejectsArrivalAwareBatchingWithoutBatchingEnabled) {
+    SchedulerConfig config =
+        WithBatching(INFEREDGE_BATCH_ADD_MODEL_PATH, false, 4, std::chrono::milliseconds{10});
+    config.arrival_aware_batching = true;
+    ExpectIdleInvalidConfig(*MakeScheduler(std::move(config)));
+}
+
+TEST_F(InferenceSchedulerTest, RejectsArrivalAwareBatchingWithBatchSizeOne) {
+    SchedulerConfig config =
+        WithBatching(INFEREDGE_BATCH_ADD_MODEL_PATH, true, 1, std::chrono::milliseconds{10});
+    config.arrival_aware_batching = true;
+    ExpectIdleInvalidConfig(*MakeScheduler(std::move(config)));
+}
+
+TEST_F(InferenceSchedulerTest, RejectsArrivalAwareBatchingWithZeroDelay) {
+    SchedulerConfig config =
+        WithBatching(INFEREDGE_BATCH_ADD_MODEL_PATH, true, 4, std::chrono::milliseconds{0});
+    config.arrival_aware_batching = true;
+    ExpectIdleInvalidConfig(*MakeScheduler(std::move(config)));
+}
+
+TEST_F(InferenceSchedulerTest, RejectsArrivalAwareTogetherWithAdaptiveBatching) {
+    SchedulerConfig config =
+        WithBatching(INFEREDGE_BATCH_ADD_MODEL_PATH, true, 4, std::chrono::milliseconds{10});
+    config.adaptive_batching = true;
+    config.arrival_aware_batching = true;
+    ExpectIdleInvalidConfig(*MakeScheduler(std::move(config)));
+}
+
+TEST_F(InferenceSchedulerTest, AcceptsValidArrivalAwareBatchingConfiguration) {
+    SchedulerConfig config =
+        WithBatching(INFEREDGE_BATCH_ADD_MODEL_PATH, true, 4, std::chrono::milliseconds{10});
+    config.arrival_aware_batching = true;
+    auto scheduler = MakeScheduler(std::move(config));
+    RequireStart(*scheduler);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+}
+
+TEST_F(InferenceSchedulerTest, ArrivalAwareEwmaFirstSampleLeavesEstimateUninitialized) {
+    auto scheduler = MakeArrivalAwareBatch(4, std::chrono::milliseconds{10}, 4);
+    RequireStart(*scheduler);
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    SchedulerTestAccess::NoteAcceptedArrivalAt(*scheduler, t0);
+    EXPECT_TRUE(SchedulerTestAccess::ArrivalEwmaHasLastEnqueue(*scheduler));
+    EXPECT_FALSE(SchedulerTestAccess::ArrivalEwmaNanoseconds(*scheduler).has_value());
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+}
+
+TEST_F(InferenceSchedulerTest, ArrivalAwareEwmaUsesExactIntegerAlphaOneEighth) {
+    auto scheduler = MakeArrivalAwareBatch(4, std::chrono::milliseconds{10}, 4);
+    RequireStart(*scheduler);
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    SchedulerTestAccess::NoteAcceptedArrivalAt(*scheduler, t0);
+    SchedulerTestAccess::NoteAcceptedArrivalAt(*scheduler, t0 + std::chrono::milliseconds{8});
+    ASSERT_TRUE(SchedulerTestAccess::ArrivalEwmaNanoseconds(*scheduler).has_value());
+    EXPECT_EQ(*SchedulerTestAccess::ArrivalEwmaNanoseconds(*scheduler),
+              std::chrono::nanoseconds{std::chrono::milliseconds{8}}.count());
+    SchedulerTestAccess::NoteAcceptedArrivalAt(*scheduler, t0 + std::chrono::milliseconds{16});
+    // ewma = 8ms - (8ms>>3) + (8ms>>3) = 8ms
+    EXPECT_EQ(*SchedulerTestAccess::ArrivalEwmaNanoseconds(*scheduler),
+              std::chrono::nanoseconds{std::chrono::milliseconds{8}}.count());
+    SchedulerTestAccess::NoteAcceptedArrivalAt(*scheduler, t0 + std::chrono::milliseconds{16} +
+                                                               std::chrono::milliseconds{16});
+    // ewma = 8ms - 1ms + 2ms = 9ms (>>3 of 8ms_ns and 16ms_ns)
+    const std::int64_t eight_ms = std::chrono::nanoseconds{std::chrono::milliseconds{8}}.count();
+    const std::int64_t sixteen_ms = std::chrono::nanoseconds{std::chrono::milliseconds{16}}.count();
+    const std::int64_t expected = eight_ms - (eight_ms >> 3) + (sixteen_ms >> 3);
+    EXPECT_EQ(*SchedulerTestAccess::ArrivalEwmaNanoseconds(*scheduler), expected);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+}
+
+TEST_F(InferenceSchedulerTest, ArrivalAwareIdleResetAtAndAboveThreshold) {
+    // idle_threshold = max(8*5ms, 50ms) = 50ms (floor dominates).
+    auto scheduler = MakeArrivalAwareBatch(4, std::chrono::milliseconds{5}, 4);
+    RequireStart(*scheduler);
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    SchedulerTestAccess::NoteAcceptedArrivalAt(*scheduler, t0);
+    SchedulerTestAccess::NoteAcceptedArrivalAt(*scheduler, t0 + std::chrono::milliseconds{10});
+    ASSERT_TRUE(SchedulerTestAccess::ArrivalEwmaNanoseconds(*scheduler).has_value());
+    // Exactly at threshold: keep sample (not reset).
+    SchedulerTestAccess::NoteAcceptedArrivalAt(*scheduler, t0 + std::chrono::milliseconds{10} +
+                                                               std::chrono::milliseconds{50});
+    ASSERT_TRUE(SchedulerTestAccess::ArrivalEwmaNanoseconds(*scheduler).has_value());
+    const std::int64_t ten_ms = std::chrono::nanoseconds{std::chrono::milliseconds{10}}.count();
+    const std::int64_t fifty_ms = std::chrono::nanoseconds{std::chrono::milliseconds{50}}.count();
+    const std::int64_t after_at = ten_ms - (ten_ms >> 3) + (fifty_ms >> 3);
+    EXPECT_EQ(*SchedulerTestAccess::ArrivalEwmaNanoseconds(*scheduler), after_at);
+    // Strictly above threshold: clear EWMA, keep last anchor.
+    SchedulerTestAccess::NoteAcceptedArrivalAt(*scheduler, t0 + std::chrono::milliseconds{60} +
+                                                               std::chrono::milliseconds{51});
+    EXPECT_FALSE(SchedulerTestAccess::ArrivalEwmaNanoseconds(*scheduler).has_value());
+    EXPECT_TRUE(SchedulerTestAccess::ArrivalEwmaHasLastEnqueue(*scheduler));
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+}
+
+TEST_F(InferenceSchedulerTest, ArrivalAwareRejectedSubmissionDoesNotUpdateEstimator) {
+    auto scheduler = MakeArrivalAwareBatch(4, std::chrono::milliseconds{10}, 1);
+    RequireStart(*scheduler);
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    Admission held = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    EXPECT_TRUE(SchedulerTestAccess::ArrivalEwmaHasLastEnqueue(*scheduler));
+    EXPECT_FALSE(SchedulerTestAccess::ArrivalEwmaNanoseconds(*scheduler).has_value());
+    Admission rejected = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    EXPECT_EQ(rejected.status, AdmissionStatus::kRejectedFull);
+    EXPECT_FALSE(SchedulerTestAccess::ArrivalEwmaNanoseconds(*scheduler).has_value());
+    release.release();
+    ExpectDynamicSum(Take(std::move(held)), 4.F, 6.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+}
+
+TEST_F(InferenceSchedulerTest, ArrivalAwareAcceptedEnqueueUpdatesEstimatorOnce) {
+    auto scheduler = MakeArrivalAwareBatch(4, std::chrono::milliseconds{10}, 4);
+    RequireStart(*scheduler);
+    Admission first = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    EXPECT_TRUE(SchedulerTestAccess::ArrivalEwmaHasLastEnqueue(*scheduler));
+    EXPECT_FALSE(SchedulerTestAccess::ArrivalEwmaNanoseconds(*scheduler).has_value());
+    Admission second = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    EXPECT_TRUE(SchedulerTestAccess::ArrivalEwmaNanoseconds(*scheduler).has_value());
+    ExpectDynamicSum(Take(std::move(first)), 4.F, 6.F);
+    ExpectDynamicSum(Take(std::move(second)), 12.F, 14.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    ExpectQuiescent(*scheduler, 2, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, ArrivalAwareConcurrentProducersPreserveFifoSequences) {
+    auto scheduler = MakeArrivalAwareBatch(4, std::chrono::milliseconds{30}, 64);
+    RequireStart(*scheduler);
+    constexpr int kProducers = 4;
+    constexpr int kPerProducer = 8;
+    std::vector<std::thread> threads;
+    std::vector<std::vector<Admission>> admissions(kProducers);
+    for (int p = 0; p < kProducers; ++p) {
+        threads.emplace_back([&, p] {
+            admissions[p].reserve(kPerProducer);
+            for (int i = 0; i < kPerProducer; ++i) {
+                const float base = static_cast<float>((p * kPerProducer + i) * 4);
+                admissions[p].push_back(scheduler->submit(
+                    DynamicAddInputs(base + 1.F, base + 2.F, base + 3.F, base + 4.F)));
+            }
+        });
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    std::vector<std::uint64_t> sequences;
+    sequences.reserve(static_cast<std::size_t>(kProducers * kPerProducer));
+    for (auto& group : admissions) {
+        for (Admission& admission : group) {
+            ASSERT_EQ(admission.status, AdmissionStatus::kAccepted);
+            SchedulerCompletion completion = Take(std::move(admission));
+            EXPECT_EQ(completion.status, CompletionStatus::kSucceeded);
+            sequences.push_back(completion.sequence);
+        }
+    }
+    std::sort(sequences.begin(), sequences.end());
+    for (std::size_t i = 0; i < sequences.size(); ++i) {
+        EXPECT_EQ(sequences[i], static_cast<std::uint64_t>(i + 1));
+    }
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    ExpectQuiescent(*scheduler, static_cast<std::uint64_t>(kProducers * kPerProducer), 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, ArrivalAwareColdStartWaitsLikeFixedDelay) {
+    BatchRuns runs;
+    auto scheduler = MakeArrivalAwareBatch(4, std::chrono::milliseconds{1000}, 4);
+    auto reached = std::make_shared<std::latch>(1);
+    auto hold = std::make_shared<std::latch>(1);
+    LatchRelease release{hold};
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, reached);
+    SchedulerTestAccess::SetBeforeBatchWait(*scheduler, hold);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler,
+                                       [&runs](std::size_t count) { runs.Record(count); });
+    // Uninitialized EWMA (default): lone request must enter wait_pop_until.
+    RequireStart(*scheduler);
+    Admission admission = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    reached->wait();
+    release.release();
+    ExpectDynamicSum(Take(std::move(admission)), 4.F, 6.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(runs.Snapshot(), (std::vector<std::size_t>{1}));
+    ExpectQuiescent(*scheduler, 1, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, ArrivalAwareSparseEstimateSealsSizeOneWithoutWait) {
+    BatchRuns runs;
+    auto scheduler = MakeArrivalAwareBatch(4, std::chrono::milliseconds{1000}, 4);
+    auto timed_wait = std::make_shared<std::latch>(1);
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, timed_wait);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler,
+                                       [&runs](std::size_t count) { runs.Record(count); });
+    RequireStart(*scheduler);
+    // Larger than any remaining deadline under a 1000ms max delay.
+    SchedulerTestAccess::SetArrivalEwmaNanoseconds(
+        *scheduler, std::chrono::nanoseconds{std::chrono::seconds{10}}.count());
+    Admission admission = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    ExpectDynamicSum(Take(std::move(admission)), 4.F, 6.F);
+    EXPECT_FALSE(timed_wait->try_wait());
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(runs.Snapshot(), (std::vector<std::size_t>{1}));
+    ExpectQuiescent(*scheduler, 1, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, ArrivalAwareDenseEstimateWaitsForPeerOrDeadline) {
+    BatchRuns runs;
+    auto scheduler = MakeArrivalAwareBatch(4, std::chrono::milliseconds{1000}, 4);
+    auto reached = std::make_shared<std::latch>(1);
+    auto hold = std::make_shared<std::latch>(1);
+    LatchRelease release{hold};
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, reached);
+    SchedulerTestAccess::SetBeforeBatchWait(*scheduler, hold);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler,
+                                       [&runs](std::size_t count) { runs.Record(count); });
+    RequireStart(*scheduler);
+    SchedulerTestAccess::SetArrivalEwmaNanoseconds(
+        *scheduler, std::chrono::nanoseconds{std::chrono::microseconds{1}}.count());
+    Admission first = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    reached->wait();
+    Admission second = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    release.release();
+    ExpectDynamicSum(Take(std::move(first)), 4.F, 6.F);
+    ExpectDynamicSum(Take(std::move(second)), 12.F, 14.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(runs.Snapshot(), (std::vector<std::size_t>{2}));
+    ExpectQuiescent(*scheduler, 2, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, ArrivalAwareDrainsReadyQueueBeforeConsultingEstimator) {
+    BatchRuns runs;
+    auto scheduler = MakeArrivalAwareBatch(4, std::chrono::milliseconds{1000}, 8);
+    auto blocked = std::make_shared<std::latch>(1);
+    auto timed_wait = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, timed_wait);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler,
+                                       [&runs](std::size_t count) { runs.Record(count); });
+    RequireStart(*scheduler);
+    // Sparse estimate would seal size-one if consulted before try_pop drain.
+    SchedulerTestAccess::SetArrivalEwmaNanoseconds(
+        *scheduler, std::chrono::nanoseconds{std::chrono::seconds{10}}.count());
+    Admission a = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission b = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    Admission c = scheduler->submit(DynamicAddInputs(9.F, 10.F, 11.F, 12.F));
+    Admission d = scheduler->submit(DynamicAddInputs(13.F, 14.F, 15.F, 16.F));
+    release.release();
+    ExpectDynamicSum(Take(std::move(a)), 4.F, 6.F);
+    ExpectDynamicSum(Take(std::move(b)), 12.F, 14.F);
+    ExpectDynamicSum(Take(std::move(c)), 20.F, 22.F);
+    ExpectDynamicSum(Take(std::move(d)), 28.F, 30.F);
+    EXPECT_FALSE(timed_wait->try_wait());
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(runs.Snapshot(), (std::vector<std::size_t>{4}));
+    ExpectQuiescent(*scheduler, 4, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, ArrivalAwareDeadlineNeverExtendedAfterCapture) {
+    // Deadline is captured at first successful pop. Holding before wait_pop_until
+    // past that absolute deadline must seal without restarting the delay window.
+    BatchRuns runs;
+    auto scheduler = MakeArrivalAwareBatch(4, std::chrono::milliseconds{100}, 4);
+    auto reached = std::make_shared<std::latch>(1);
+    auto hold = std::make_shared<std::latch>(1);
+    LatchRelease release{hold};
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, reached);
+    SchedulerTestAccess::SetBeforeBatchWait(*scheduler, hold);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler,
+                                       [&runs](std::size_t count) { runs.Record(count); });
+    RequireStart(*scheduler);
+    SchedulerTestAccess::SetArrivalEwmaNanoseconds(
+        *scheduler, std::chrono::nanoseconds{std::chrono::microseconds{1}}.count());
+    Admission admission = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    reached->wait();
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    const auto released_at = std::chrono::steady_clock::now();
+    release.release();
+    ExpectDynamicSum(Take(std::move(admission)), 4.F, 6.F);
+    EXPECT_LT(std::chrono::steady_clock::now() - released_at, std::chrono::milliseconds{80});
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(runs.Snapshot(), (std::vector<std::size_t>{1}));
+    ExpectQuiescent(*scheduler, 1, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, ArrivalAwareRespectsMaxBatchSize) {
+    BatchRuns runs;
+    auto scheduler = MakeArrivalAwareBatch(2, std::chrono::milliseconds{30}, 8);
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler,
+                                       [&runs](std::size_t count) { runs.Record(count); });
+    RequireStart(*scheduler);
+    SchedulerTestAccess::SetArrivalEwmaNanoseconds(
+        *scheduler, std::chrono::nanoseconds{std::chrono::seconds{10}}.count());
+    Admission a = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    Admission b = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    Admission c = scheduler->submit(DynamicAddInputs(9.F, 10.F, 11.F, 12.F));
+    release.release();
+    ExpectDynamicSum(Take(std::move(a)), 4.F, 6.F);
+    ExpectDynamicSum(Take(std::move(b)), 12.F, 14.F);
+    ExpectDynamicSum(Take(std::move(c)), 20.F, 22.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(runs.Snapshot(), (std::vector<std::size_t>{2, 1}));
+    ExpectQuiescent(*scheduler, 3, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, ArrivalAwareDrainDuringBatchWaitRunsOwnedRequest) {
+    BatchRuns runs;
+    auto scheduler = MakeArrivalAwareBatch(4, std::chrono::milliseconds{1000}, 2);
+    auto reached = std::make_shared<std::latch>(1);
+    auto hold = std::make_shared<std::latch>(1);
+    LatchRelease release{hold};
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, reached);
+    SchedulerTestAccess::SetBeforeBatchWait(*scheduler, hold);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler,
+                                       [&runs](std::size_t count) { runs.Record(count); });
+    RequireStart(*scheduler);
+    Admission admission = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    reached->wait();
+    const ShutdownResult shutdown =
+        ShutdownWhileBlocked(*scheduler, release, ShutdownPolicy::kDrain);
+    ExpectWinner(shutdown, ShutdownPolicy::kDrain, true);
+    EXPECT_TRUE(SchedulerTestAccess::ClosedForDrain(*scheduler));
+    ExpectDynamicSum(Take(std::move(admission)), 4.F, 6.F);
+    EXPECT_EQ(runs.Snapshot(), (std::vector<std::size_t>{1}));
+    ExpectQuiescent(*scheduler, 1, 0, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, ArrivalAwareCancelDuringBatchWaitKeepsOwnedRequest) {
+    BatchRuns runs;
+    auto scheduler = MakeArrivalAwareBatch(4, std::chrono::milliseconds{1000}, 4);
+    auto reached = std::make_shared<std::latch>(1);
+    auto hold = std::make_shared<std::latch>(1);
+    LatchRelease release{hold};
+    SchedulerTestAccess::SetReachedBatchWait(*scheduler, reached);
+    SchedulerTestAccess::SetBeforeBatchWait(*scheduler, hold);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler,
+                                       [&runs](std::size_t count) { runs.Record(count); });
+    RequireStart(*scheduler);
+    Admission owned = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    reached->wait();
+    Admission queued = scheduler->submit(DynamicAddInputs(5.F, 6.F, 7.F, 8.F));
+    const ShutdownResult shutdown =
+        ShutdownWhileBlocked(*scheduler, release, ShutdownPolicy::kCancelPending);
+    ExpectWinner(shutdown, ShutdownPolicy::kCancelPending, true);
+    ExpectDynamicSum(Take(std::move(owned)), 4.F, 6.F);
+    ExpectCanceled(Take(std::move(queued)), 2);
+    EXPECT_EQ(runs.Snapshot(), (std::vector<std::size_t>{1}));
+    ExpectQuiescent(*scheduler, 1, 0, 0, 0, 1);
+}
+
+TEST_F(InferenceSchedulerTest, ArrivalAwareInvalidRequestDoesNotInflateOwnedBatch) {
+    BatchRuns runs;
+    auto scheduler = MakeArrivalAwareBatch(4, std::chrono::milliseconds{30}, 4);
+    auto blocked = std::make_shared<std::latch>(1);
+    LatchRelease release{blocked};
+    SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
+    SchedulerTestAccess::SetOnBatchRun(*scheduler,
+                                       [&runs](std::size_t count) { runs.Record(count); });
+    RequireStart(*scheduler);
+    SchedulerTestAccess::SetArrivalEwmaNanoseconds(
+        *scheduler, std::chrono::nanoseconds{std::chrono::seconds{10}}.count());
+    Admission invalid = scheduler->submit({NamedTensor{"A", {1, 2}, {1.F, 2.F}}});
+    Admission valid = scheduler->submit(DynamicAddInputs(1.F, 2.F, 3.F, 4.F));
+    release.release();
+    ExpectInferenceFailure(Take(std::move(invalid)), InferenceErrorKind::kMissingInput);
+    ExpectDynamicSum(Take(std::move(valid)), 4.F, 6.F);
+    EXPECT_EQ(scheduler->shutdown(ShutdownPolicy::kDrain).error.kind, SchedulerErrorKind::kNone);
+    EXPECT_EQ(runs.Snapshot(), (std::vector<std::size_t>{1}));
+    ExpectQuiescent(*scheduler, 1, 1, 0, 0);
+}
+
+TEST_F(InferenceSchedulerTest, ArrivalAwareMultiWorkerSmokePreservesTerminalAccounting) {
+    BatchRuns runs;
+    auto scheduler = MakeArrivalAwareBatch(2, std::chrono::milliseconds{30}, 8, 2);
     auto blocked = std::make_shared<std::latch>(1);
     LatchRelease release{blocked};
     SchedulerTestAccess::SetBeforePop(*scheduler, blocked);
