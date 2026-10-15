@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 import struct
 import tempfile
 import unittest
@@ -18,10 +19,110 @@ from models import generate_mlp_small_model as small_gen
 from models import weight_rng as rng
 
 REPO_MODELS = Path(__file__).resolve().parent
+RESNET18_HOST_MANIFEST_KEYS = frozenset({"python", "numpy", "onnx", "platform", "blas"})
+RESNET18_STABLE_MANIFEST_PREFIXES = (
+    "# inferedge float32 fixtures",
+    "# little-endian float32 values, no file header, no padding",
+    "# batch input_file expected_file input_elems output_elems attempt_base",
+    "# model ",
+    "# architecture ",
+    "# not ImageNet-pretrained",
+    "# seed ",
+    "# opset ",
+    "# input ",
+    "# output ",
+    "# learnable_parameters ",
+    "# initializer_count ",
+    "# initializer_order ",
+    "# bn ",
+    "# numpy GAP:",
+    "# numpy Conv:",
+    "# numerical coverage:",
+    "# no weight sidecar",
+)
+RESNET18_MANIFEST_RECORD = re.compile(
+    r"^(\d+) ([A-Za-z0-9._-]+) ([A-Za-z0-9._-]+) (\d+) (\d+) (\d+)$"
+)
+RESNET18_REGENERATED_RELATIVES = frozenset(
+    {
+        "resnet18_f32.onnx",
+        "fixtures/resnet18_f32/manifest.txt",
+        "fixtures/resnet18_f32/b01.input.f32",
+        "fixtures/resnet18_f32/b01.expected.f32",
+        "fixtures/resnet18_f32/b02.input.f32",
+        "fixtures/resnet18_f32/b02.expected.f32",
+        "fixtures/resnet18_f32/b04.input.f32",
+        "fixtures/resnet18_f32/b04.expected.f32",
+        "fixtures/resnet18_f32/b08.input.f32",
+        "fixtures/resnet18_f32/b08.expected.f32",
+    }
+)
 
 
 def sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def resnet18_host_manifest_key(line: str) -> str | None:
+    """Return the provenance key if this comment is host-specific."""
+    if line.startswith("# python "):
+        return "python"
+    if line.startswith("# onnx "):
+        return "onnx"
+    if line.startswith("# platform "):
+        return "platform"
+    if line.startswith("# blas "):
+        return "blas"
+    if line.startswith("# numpy ") and not (
+        line.startswith("# numpy GAP:") or line.startswith("# numpy Conv:")
+    ):
+        return "numpy"
+    return None
+
+
+def resnet18_manifest_stable_lines(text: str) -> list[str]:
+    """Return contract lines after requiring known host provenance comments.
+
+    Host keys python, numpy, onnx, platform, and blas may differ across
+    machines. `# numpy GAP:` and `# numpy Conv:` stay in the stable contract.
+    Every other allowed comment and every fixture record must match.
+    An unknown comment or a malformed line is an error, not a skip.
+    """
+    if not isinstance(text, str):
+        raise ValueError("manifest text must be str")
+    if not text.endswith("\n"):
+        raise ValueError("manifest must end with a newline")
+    lines = text.split("\n")
+    if lines[-1] != "":
+        raise ValueError("manifest must end with an empty line")
+    stable: list[str] = []
+    host_keys: list[str] = []
+    for line in lines[:-1]:
+        host_key = resnet18_host_manifest_key(line)
+        if host_key is not None:
+            value = line.split(" ", 2)[-1] if line.startswith("# ") else ""
+            if not value:
+                raise ValueError(f"empty host provenance value for {host_key}")
+            host_keys.append(host_key)
+            continue
+        if line.startswith("#"):
+            if not line.startswith("# "):
+                raise ValueError(f"malformed manifest comment: {line!r}")
+            if not any(line == prefix or line.startswith(prefix) for prefix in RESNET18_STABLE_MANIFEST_PREFIXES):
+                raise ValueError(f"unknown manifest comment: {line!r}")
+            stable.append(line)
+            continue
+        if RESNET18_MANIFEST_RECORD.fullmatch(line) is None:
+            raise ValueError(f"malformed manifest record: {line!r}")
+        stable.append(line)
+    if len(host_keys) != len(set(host_keys)):
+        raise ValueError(f"duplicate host provenance keys: {host_keys}")
+    if set(host_keys) != RESNET18_HOST_MANIFEST_KEYS:
+        raise ValueError(
+            "host provenance keys are "
+            f"{sorted(set(host_keys))}, expected {sorted(RESNET18_HOST_MANIFEST_KEYS)}"
+        )
+    return stable
 
 
 def unpack_f32(payload: bytes) -> list[float]:
@@ -395,6 +496,40 @@ class ResNet18CommittedArtifactTest(unittest.TestCase):
         sidecar = REPO_MODELS / "fixtures" / "resnet18_f32.weights"
         self.assertFalse(sidecar.exists())
 
+    def test_manifest_stable_lines_ignore_host_provenance_values(self) -> None:
+        committed = (self.fixture_dir / "manifest.txt").read_text(encoding="ascii")
+        stable = resnet18_manifest_stable_lines(committed)
+        self.assertIn("# seed 20261017", stable)
+        self.assertIn("# model resnet18_f32", stable)
+        self.assertIn("# initializer_count 102", stable)
+        self.assertTrue(any(line.startswith("# initializer_order ") for line in stable))
+        self.assertIn("1 b01.input.f32 b01.expected.f32 150528 1000 1000", stable)
+        self.assertIn("8 b08.input.f32 b08.expected.f32 150528 1000 1000", stable)
+        self.assertFalse(any("python" in line for line in stable))
+        drifted = committed.replace(
+            "# python 3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 21.0.0 (clang-2100.1.1.101)]",
+            "# python 3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+            1,
+        )
+        self.assertNotEqual(committed, drifted)
+        self.assertEqual(resnet18_manifest_stable_lines(drifted), stable)
+
+    def test_manifest_rejects_unknown_or_malformed_fields(self) -> None:
+        committed = (self.fixture_dir / "manifest.txt").read_text(encoding="ascii")
+        with self.assertRaises(ValueError):
+            resnet18_manifest_stable_lines(committed + "# extra unknown field\n")
+        with self.assertRaises(ValueError):
+            resnet18_manifest_stable_lines(re.sub(r"^# python .*\n", "", committed, count=1, flags=re.M))
+        seeded = committed.replace("# seed 20261017", "# seed 0", 1)
+        self.assertNotEqual(
+            resnet18_manifest_stable_lines(seeded),
+            resnet18_manifest_stable_lines(committed),
+        )
+        with self.assertRaises(ValueError):
+            resnet18_manifest_stable_lines(committed.replace("# python ", "# ", 1))
+        with self.assertRaises(ValueError):
+            resnet18_manifest_stable_lines("1 b01.input.f32 b01.expected.f32 150528 1000 1000\n")
+
 
 class ResNet18OperatorTest(unittest.TestCase):
     """Focused NumPy operator checks. Skipped when NumPy is absent (CI onnx venv)."""
@@ -484,9 +619,19 @@ class ResNet18OperatorTest(unittest.TestCase):
 
     def test_committed_artifacts_match_regeneration_when_numpy_present(self) -> None:
         files = self.resnet.build_artifacts()
+        self.assertEqual(set(files), RESNET18_REGENERATED_RELATIVES)
         for relative, payload in files.items():
             committed = REPO_MODELS / relative
             self.assertTrue(committed.is_file(), str(committed))
+            if relative == "fixtures/resnet18_f32/manifest.txt":
+                committed_text = committed.read_text(encoding="ascii")
+                regenerated_text = payload.decode("ascii")
+                self.assertEqual(
+                    resnet18_manifest_stable_lines(committed_text),
+                    resnet18_manifest_stable_lines(regenerated_text),
+                    relative,
+                )
+                continue
             self.assertEqual(committed.read_bytes(), payload, relative)
         self.assertEqual(self.resnet.LEARNABLE_PARAMETERS, 11_689_512)
 
