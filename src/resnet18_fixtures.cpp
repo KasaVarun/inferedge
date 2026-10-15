@@ -17,6 +17,14 @@ bool resnet18_fixture_id_valid(std::uint64_t fixture_id) noexcept {
     return fixture_id >= kResNet18FixtureIdMin && fixture_id <= kResNet18FixtureIdMax;
 }
 
+bool resnet18_fixture_id_for_attempt(std::uint64_t attempt_id, std::uint64_t& fixture_id) noexcept {
+    if (attempt_id < 1) {
+        return false;
+    }
+    fixture_id = kResNet18FixtureIdMin + ((attempt_id - 1) % kResNet18FixtureRows);
+    return true;
+}
+
 ResNet18FixtureLoad load_resnet18_fixture_table(const std::filesystem::path& fixture_dir) {
     ResNet18FixtureLoad loaded;
     const NeuralFloatFile images = load_float32_file(fixture_dir / "b08.input.f32",

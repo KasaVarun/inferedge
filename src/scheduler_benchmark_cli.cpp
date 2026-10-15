@@ -129,7 +129,9 @@ std::string scheduler_benchmark_help_message() {
            "Options:\n"
            "  --model <path>                 ONNX model (required)\n"
            "  --model-id <id>                batch_add_f32 (default), mlp_small_f32,\n"
-           "                                 mlp_medium_f32, or gemm_f32\n"
+           "                                 mlp_medium_f32, gemm_f32, or resnet18_f32\n"
+           "                                 resnet18_f32 replays fixtures 1000-1007 by\n"
+           "                                 attempt ordinal; those images are not unique\n"
            "  --workers <n>                  1..64 (required)\n"
            "  --queue-capacity <n>           1..1024 (required)\n"
            "  --workload <name>              open_loop_constant, open_loop_burst, or closed_loop\n"
@@ -290,6 +292,8 @@ parse_scheduler_benchmark_cli(const std::vector<std::string_view>& args) {
                 parsed.config.model_id = SchedulerBenchmarkModelId::kMlpMediumF32;
             } else if (value == "gemm_f32") {
                 parsed.config.model_id = SchedulerBenchmarkModelId::kGemmF32;
+            } else if (value == "resnet18_f32") {
+                parsed.config.model_id = SchedulerBenchmarkModelId::kResnet18F32;
             } else {
                 return error_result("error: unsupported model id '" + std::string{value} + "'\n");
             }

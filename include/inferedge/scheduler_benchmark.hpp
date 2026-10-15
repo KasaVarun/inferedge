@@ -400,7 +400,8 @@ scheduler_benchmark_sha256_file(const std::filesystem::path& path);
 // features row, float32(uint32(attempt_id % 251 + index)) * 0x1p-10. Those
 // values repeat every 251 attempt ids and are not globally unique. Neural
 // expected outputs are not stored here. kResnet18F32 does not generate
-// tensors: it requires an explicit fixture identity, not attempt_id.
+// tensors here: the scheduler inflight path uses fixture replay
+// 1000 + ((attempt_id - 1) % 8). That mapping is not unique images.
 [[nodiscard]] SchedulerBenchmarkTensors scheduler_benchmark_request(SchedulerBenchmarkModelId model,
                                                                     std::uint64_t attempt_id);
 

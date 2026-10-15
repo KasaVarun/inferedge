@@ -1,3 +1,4 @@
+#include "inferedge/resnet18_fixtures.hpp"
 #include "inferedge/scheduler_benchmark_cli.hpp"
 #include "inferedge/scheduler_benchmark_json.hpp"
 
@@ -31,6 +32,15 @@
 
 #ifndef INFEREDGE_INVALID_MODEL_PATH
 #error "CMake must define INFEREDGE_INVALID_MODEL_PATH"
+#endif
+#ifndef INFEREDGE_GEMM_MODEL_PATH
+#error "CMake must define INFEREDGE_GEMM_MODEL_PATH"
+#endif
+#ifndef INFEREDGE_RESNET18_MODEL_PATH
+#error "CMake must define INFEREDGE_RESNET18_MODEL_PATH"
+#endif
+#ifndef INFEREDGE_RESNET18_FIXTURE_DIR
+#error "CMake must define INFEREDGE_RESNET18_FIXTURE_DIR"
 #endif
 
 extern "C" char** environ;
@@ -1253,6 +1263,15 @@ TEST(SchedulerBenchmarkCliTest, ModelIdDefaultsToAddAndRejectsBadSelectors) {
          "--queue-capacity", "1", "--workload", "closed_loop", "--max-offered", "1",
          "--max-outstanding", "1", "--duration-ms", "10", "--completion-timeout-ms", "10"});
     EXPECT_EQ(small.config.model_id, inferedge::SchedulerBenchmarkModelId::kMlpSmallF32);
+    const auto resnet = inferedge::parse_scheduler_benchmark_cli(
+        {"--model", "model.onnx", "--model-id", "resnet18_f32", "--workers", "1",
+         "--queue-capacity", "1", "--workload", "closed_loop", "--max-offered", "1",
+         "--max-outstanding", "1", "--duration-ms", "10", "--completion-timeout-ms", "10"});
+    EXPECT_EQ(resnet.config.model_id, inferedge::SchedulerBenchmarkModelId::kResnet18F32);
+    EXPECT_NE(inferedge::scheduler_benchmark_help_message().find("resnet18_f32"),
+              std::string::npos);
+    EXPECT_NE(inferedge::scheduler_benchmark_help_message().find("fixtures 1000-1007"),
+              std::string::npos);
     const auto missing = inferedge::parse_scheduler_benchmark_cli({"--model-id"});
     EXPECT_EQ(missing.action, SchedulerBenchmarkCliAction::kError);
     EXPECT_NE(missing.message.find("missing value for --model-id"), std::string::npos);
@@ -2090,4 +2109,209 @@ TEST(SchedulerBenchmarkBatchDecisionCliTest, HelpMentionsBatchDecisionFlags) {
     EXPECT_NE(parsed.message.find("--batch-decision-timing"), std::string::npos);
     EXPECT_NE(parsed.message.find("--batch-decision-event-capacity"), std::string::npos);
     EXPECT_NE(parsed.message.find("schema 5"), std::string::npos);
+}
+
+SchedulerBenchmarkConfig ResNetCorrectnessConfig() {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.model_path = INFEREDGE_RESNET18_MODEL_PATH;
+    config.model_id = inferedge::SchedulerBenchmarkModelId::kResnet18F32;
+    config.worker_count = 1;
+    config.queue_capacity = 16;
+    config.max_offered = 8;
+    config.max_outstanding = 8;
+    config.target_requests_per_second = 16.0;
+    config.duration = 5000ms;
+    config.completion_timeout = 15000ms;
+    config.lag_tolerance = 15000ms;
+    config.warmup_requests = 0;
+    config.check_interval = 1;
+    return config;
+}
+
+void ExpectResNetCorrectness(const SchedulerBenchmarkRun& run, const char* cell) {
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << cell << " " << run.message;
+    EXPECT_TRUE(run.report.valid) << cell;
+    EXPECT_EQ(run.report.succeeded, 8U) << cell;
+    EXPECT_EQ(run.report.correctness_mismatches, 0U) << cell;
+    EXPECT_EQ(run.report.correctness_checked, 8U) << cell;
+    EXPECT_EQ(run.report.failed_inference, 0U) << cell;
+    EXPECT_EQ(run.report.failed_scheduler, 0U) << cell;
+    EXPECT_EQ(run.report.failed_worker, 0U) << cell;
+    EXPECT_EQ(run.report.timeouts, 0U) << cell;
+    EXPECT_EQ(run.report.accepted, 8U) << cell;
+    EXPECT_EQ(run.report.submit_attempts, 8U) << cell;
+    ExpectAccounting(run.report);
+}
+
+TEST(SchedulerBenchmarkResNetTest, FixtureReplayIsAttemptOrdinalNotAttemptId) {
+    std::uint64_t fixture = 0;
+    EXPECT_FALSE(inferedge::resnet18_fixture_id_for_attempt(0, fixture));
+    ASSERT_TRUE(inferedge::resnet18_fixture_id_for_attempt(1, fixture));
+    EXPECT_EQ(fixture, 1000U);
+    ASSERT_TRUE(inferedge::resnet18_fixture_id_for_attempt(8, fixture));
+    EXPECT_EQ(fixture, 1007U);
+    ASSERT_TRUE(inferedge::resnet18_fixture_id_for_attempt(9, fixture));
+    EXPECT_EQ(fixture, 1000U);
+    const auto generated = inferedge::scheduler_benchmark_request(
+        inferedge::SchedulerBenchmarkModelId::kResnet18F32, 1);
+    EXPECT_TRUE(generated.inputs.empty());
+}
+
+TEST(SchedulerBenchmarkResNetTest, CheckUsesStoredFixtureAndRejectsSwappedIdentity) {
+    const auto loaded = inferedge::load_resnet18_fixture_table(INFEREDGE_RESNET18_FIXTURE_DIR);
+    ASSERT_EQ(loaded.error.kind, inferedge::NeuralReferenceErrorKind::kNone)
+        << loaded.error.message;
+    const auto early = inferedge::resnet18_request_from_fixture(loaded.table, 1000);
+    const auto late = inferedge::resnet18_request_from_fixture(loaded.table, 1007);
+    ASSERT_EQ(early.error.kind, inferedge::NeuralReferenceErrorKind::kNone);
+    ASSERT_EQ(late.error.kind, inferedge::NeuralReferenceErrorKind::kNone);
+    inferedge::NamedTensor output{"logits", {1, 1000}, late.expected_logits};
+    EXPECT_TRUE(
+        inferedge::scheduler_benchmark_check_output(
+            inferedge::SchedulerBenchmarkModelId::kResnet18F32, output, late.expected_logits)
+            .matched);
+    EXPECT_NE(early.expected_logits, late.expected_logits);
+    std::vector<float> wrong = late.expected_logits;
+    wrong[0] += 1.F;
+    EXPECT_FALSE(inferedge::scheduler_benchmark_check_output(
+                     inferedge::SchedulerBenchmarkModelId::kResnet18F32, output, wrong)
+                     .matched);
+    EXPECT_FALSE(inferedge::scheduler_benchmark_check_output(
+                     inferedge::SchedulerBenchmarkModelId::kResnet18F32, output, {})
+                     .matched);
+    output.name = "product";
+    EXPECT_FALSE(
+        inferedge::scheduler_benchmark_check_output(
+            inferedge::SchedulerBenchmarkModelId::kResnet18F32, output, late.expected_logits)
+            .matched);
+    output.name = "logits";
+    output.shape = {1, 512};
+    output.values.resize(512);
+    EXPECT_FALSE(
+        inferedge::scheduler_benchmark_check_output(
+            inferedge::SchedulerBenchmarkModelId::kResnet18F32, output, late.expected_logits)
+            .matched);
+    output.shape = {1, 1000};
+    output.values = late.expected_logits;
+    output.values[0] = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_FALSE(
+        inferedge::scheduler_benchmark_check_output(
+            inferedge::SchedulerBenchmarkModelId::kResnet18F32, output, late.expected_logits)
+            .matched);
+    output.values[0] = std::numeric_limits<float>::infinity();
+    EXPECT_FALSE(
+        inferedge::scheduler_benchmark_check_output(
+            inferedge::SchedulerBenchmarkModelId::kResnet18F32, output, late.expected_logits)
+            .matched);
+}
+
+TEST(SchedulerBenchmarkResNetTest, WrongModelIdentityIsRejected) {
+    SchedulerBenchmarkConfig gemm_as_resnet = ResNetCorrectnessConfig();
+    gemm_as_resnet.model_path = INFEREDGE_GEMM_MODEL_PATH;
+    const SchedulerBenchmarkRun gemm = inferedge::run_scheduler_benchmark(gemm_as_resnet);
+    EXPECT_EQ(gemm.kind, SchedulerBenchmarkErrorKind::kInvalidConfig);
+    EXPECT_NE(gemm.message.find("SHA-256"), std::string::npos);
+    EXPECT_EQ(gemm.report.succeeded, 0U);
+
+    SchedulerBenchmarkConfig resnet_as_gemm = ResNetCorrectnessConfig();
+    resnet_as_gemm.model_id = inferedge::SchedulerBenchmarkModelId::kGemmF32;
+    const SchedulerBenchmarkRun swapped = inferedge::run_scheduler_benchmark(resnet_as_gemm);
+    EXPECT_EQ(swapped.kind, SchedulerBenchmarkErrorKind::kInvalidConfig);
+    EXPECT_NE(swapped.message.find("SHA-256"), std::string::npos);
+
+    SchedulerBenchmarkConfig missing = ResNetCorrectnessConfig();
+    missing.model_path = INFEREDGE_INVALID_MODEL_PATH;
+    const SchedulerBenchmarkRun absent = inferedge::run_scheduler_benchmark(missing);
+    EXPECT_EQ(absent.kind, SchedulerBenchmarkErrorKind::kInvalidConfig);
+}
+
+TEST(SchedulerBenchmarkResNetTest, MissingFixtureTableFailsClosed) {
+    TempDirectory directory;
+    const std::filesystem::path copied = directory.path() / "resnet18_f32.onnx";
+    std::filesystem::copy_file(INFEREDGE_RESNET18_MODEL_PATH, copied);
+    SchedulerBenchmarkConfig config = ResNetCorrectnessConfig();
+    config.model_path = copied.string();
+    config.max_offered = 1;
+    config.max_outstanding = 1;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    EXPECT_EQ(run.kind, SchedulerBenchmarkErrorKind::kInvalidConfig);
+    EXPECT_NE(run.message.find("float32 file is missing"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkResNetTest, UnbatchedCellAChecksEightRequests) {
+    SchedulerBenchmarkConfig config = ResNetCorrectnessConfig();
+    config.enable_batching = false;
+    ExpectResNetCorrectness(inferedge::run_scheduler_benchmark(config), "A");
+}
+
+TEST(SchedulerBenchmarkResNetTest, G2FixedDelayChecksEightRequests) {
+    SchedulerBenchmarkConfig config = ResNetCorrectnessConfig();
+    config.enable_batching = true;
+    config.max_batch_size = 8;
+    config.max_batch_delay = 5ms;
+    config.adaptive_batching = false;
+    config.arrival_aware_batching = false;
+    ExpectResNetCorrectness(inferedge::run_scheduler_benchmark(config), "G2");
+}
+
+TEST(SchedulerBenchmarkResNetTest, G3AdaptiveChecksEightRequests) {
+    SchedulerBenchmarkConfig config = ResNetCorrectnessConfig();
+    config.enable_batching = true;
+    config.max_batch_size = 8;
+    config.max_batch_delay = 50ms;
+    config.adaptive_batching = true;
+    ExpectResNetCorrectness(inferedge::run_scheduler_benchmark(config), "G3");
+}
+
+TEST(SchedulerBenchmarkResNetTest, G4ArrivalAwareChecksEightRequests) {
+    SchedulerBenchmarkConfig config = ResNetCorrectnessConfig();
+    config.enable_batching = true;
+    config.max_batch_size = 8;
+    config.max_batch_delay = 20ms;
+    config.arrival_aware_batching = true;
+    ExpectResNetCorrectness(inferedge::run_scheduler_benchmark(config), "G4");
+}
+
+TEST(SchedulerBenchmarkResNetTest, DuplicateReplayKeepsDistinctAttemptIds) {
+    SchedulerBenchmarkConfig config = ResNetCorrectnessConfig();
+    config.max_offered = 9;
+    config.max_outstanding = 9;
+    config.enable_batching = false;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_EQ(run.report.succeeded, 9U);
+    EXPECT_EQ(run.report.correctness_mismatches, 0U);
+    EXPECT_EQ(run.report.submit_attempts, 9U);
+}
+
+TEST(SchedulerBenchmarkResNetTest, CliModelIdRunsBoundedCellA) {
+    const ProcessOutput process = RunProcess({INFEREDGE_BENCH_SCHEDULER_EXECUTABLE,
+                                              "--model",
+                                              INFEREDGE_RESNET18_MODEL_PATH,
+                                              "--model-id",
+                                              "resnet18_f32",
+                                              "--workers",
+                                              "1",
+                                              "--queue-capacity",
+                                              "16",
+                                              "--workload",
+                                              "open_loop_constant",
+                                              "--target-rps",
+                                              "16",
+                                              "--max-offered",
+                                              "8",
+                                              "--max-outstanding",
+                                              "8",
+                                              "--duration-ms",
+                                              "5000",
+                                              "--completion-timeout-ms",
+                                              "15000",
+                                              "--lag-tolerance-ms",
+                                              "15000",
+                                              "--format",
+                                              "json"});
+    EXPECT_EQ(process.status, 0) << process.error << process.output;
+    EXPECT_NE(process.output.find("\"succeeded\": 8"), std::string::npos);
+    EXPECT_NE(process.output.find("\"correctness_mismatches\": 0"), std::string::npos);
+    EXPECT_EQ(process.output.find("\"model_id\""), std::string::npos);
 }

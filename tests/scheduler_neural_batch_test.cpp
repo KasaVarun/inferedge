@@ -1,6 +1,7 @@
 #include "inferedge/inference_engine.hpp"
 #include "inferedge/inference_scheduler.hpp"
 #include "inferedge/neural_reference.hpp"
+#include "inferedge/resnet18_fixtures.hpp"
 #include "inferedge/tensor_batch.hpp"
 
 #include <cmath>
@@ -33,6 +34,12 @@
 #endif
 #ifndef INFEREDGE_GEMM_WEIGHTS_PATH
 #error "CMake must define INFEREDGE_GEMM_WEIGHTS_PATH"
+#endif
+#ifndef INFEREDGE_RESNET18_MODEL_PATH
+#error "CMake must define INFEREDGE_RESNET18_MODEL_PATH"
+#endif
+#ifndef INFEREDGE_RESNET18_FIXTURE_DIR
+#error "CMake must define INFEREDGE_RESNET18_FIXTURE_DIR"
 #endif
 
 namespace {
@@ -498,6 +505,42 @@ TEST_F(SchedulerNeuralBatchTest, InvalidRequestDoesNotReplaceItsNeighbors) {
             EXPECT_EQ(failed.inference_error.kind, kinds[kind]);
             EXPECT_TRUE(failed.outputs.empty());
             EXPECT_FALSE(worst.saw_nonfinite);
+        }
+    }
+}
+
+TEST_F(SchedulerNeuralBatchTest, ResNetFixtureRowsKeepRequestIdentity) {
+    const auto table = inferedge::load_resnet18_fixture_table(INFEREDGE_RESNET18_FIXTURE_DIR);
+    ASSERT_EQ(table.error.kind, NeuralReferenceErrorKind::kNone) << table.error.message;
+    constexpr std::size_t kBatches[] = {1, 2, 4, 8};
+    for (const std::size_t batch : kBatches) {
+        std::vector<std::vector<NamedTensor>> requests;
+        std::vector<std::vector<float>> expected;
+        requests.reserve(batch);
+        expected.reserve(batch);
+        for (std::size_t row = 0; row < batch; ++row) {
+            const auto fixture = inferedge::resnet18_request_from_fixture(table.table, 1000 + row);
+            ASSERT_EQ(fixture.error.kind, NeuralReferenceErrorKind::kNone) << fixture.error.message;
+            requests.push_back({fixture.images});
+            expected.push_back(fixture.expected_logits);
+        }
+        ModelCase model{NeuralWorkload::kMlpSmall, INFEREDGE_RESNET18_MODEL_PATH, ""};
+        std::vector<SchedulerCompletion> completions;
+        const std::vector<std::size_t> groups =
+            RunGroup(model, static_cast<std::uint32_t>(batch), requests, completions);
+        ASSERT_EQ(groups, (std::vector<std::size_t>{batch}));
+        ASSERT_EQ(completions.size(), batch);
+        for (std::size_t row = 0; row < batch; ++row) {
+            EXPECT_EQ(completions[row].status, CompletionStatus::kSucceeded);
+            EXPECT_EQ(completions[row].request_id, row + 1);
+            ASSERT_EQ(completions[row].outputs.size(), 1U);
+            const auto checked =
+                inferedge::resnet18_check_logits(completions[row].outputs[0], expected[row]);
+            EXPECT_TRUE(checked.matched)
+                << "batch " << batch << " row " << row << " " << checked.message;
+            if (row + 1 < batch) {
+                EXPECT_NE(expected[row], expected[row + 1]);
+            }
         }
     }
 }

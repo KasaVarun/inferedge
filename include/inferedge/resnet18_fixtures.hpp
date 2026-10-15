@@ -49,6 +49,11 @@ struct ResNet18OutputCheck {
 
 [[nodiscard]] bool resnet18_fixture_id_valid(std::uint64_t fixture_id) noexcept;
 
+// Correctness-testing replay only. attempt_id is 1-based. Images are not unique:
+// fixture_id = 1000 + ((attempt_id - 1) % 8). Attempt 0 is rejected.
+[[nodiscard]] bool resnet18_fixture_id_for_attempt(std::uint64_t attempt_id,
+                                                   std::uint64_t& fixture_id) noexcept;
+
 // Reads b08 packed NCHW images and packed logits. No ORT. No per-request I/O
 // after this call. Missing files and wrong sizes fail.
 [[nodiscard]] ResNet18FixtureLoad

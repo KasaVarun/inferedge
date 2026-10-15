@@ -58,7 +58,9 @@ struct JoinThreads {
 struct PreparedModel {
     SchedulerBenchmarkModelId id{SchedulerBenchmarkModelId::kBatchAddF32};
     bool neural{false};
-    NeuralWorkload workload{NeuralWorkload::kMlpSmall};
+    bool fixture_replay{false};
+    std::optional<NeuralWorkload> workload;
+    ResNet18FixtureTable fixtures;
     std::vector<float> weights;
     std::filesystem::path weights_path;
     std::string model_digest;
@@ -316,22 +318,43 @@ void remember_error(SharedTrial& trial, std::uint64_t attempt_id, std::string ki
 std::string prepare_inflight_expectation(const PreparedModel& model,
                                          SchedulerBenchmarkModelId model_id,
                                          std::uint64_t attempt_id, Inflight& item) {
+    item.expected_outputs.clear();
+    if (model_id == SchedulerBenchmarkModelId::kResnet18F32 || model.fixture_replay) {
+        if (model_id != SchedulerBenchmarkModelId::kResnet18F32 || !model.fixture_replay) {
+            return "resnet18_f32 requires an explicit fixture identity";
+        }
+        std::uint64_t fixture_id = 0;
+        if (!resnet18_fixture_id_for_attempt(attempt_id, fixture_id)) {
+            return "resnet18_f32 requires a positive scheduler attempt identity";
+        }
+        const ResNet18FixtureRequest request =
+            resnet18_request_from_fixture(model.fixtures, fixture_id);
+        if (request.error.kind != NeuralReferenceErrorKind::kNone) {
+            return request.error.message.empty() ? "resnet18_f32 fixture lookup failed"
+                                                 : request.error.message;
+        }
+        if (request.expected_logits.empty()) {
+            return "resnet18_f32 expected logits were not prepared";
+        }
+        item.inputs = {request.images};
+        item.expected_outputs = request.expected_logits;
+        return {};
+    }
     SchedulerBenchmarkTensors tensors = scheduler_benchmark_request(model_id, attempt_id);
     item.inputs = tensors.inputs;
     item.expected_c0 = tensors.expected_c0;
     item.expected_c1 = tensors.expected_c1;
-    item.expected_outputs.clear();
-    if (model_id == SchedulerBenchmarkModelId::kResnet18F32) {
-        return "resnet18_f32 requires an explicit fixture identity";
-    }
     if (!model.neural) {
         return {};
+    }
+    if (!model.workload.has_value()) {
+        return "neural live reference is not configured";
     }
     if (item.inputs.size() != 1 || item.inputs.front().values.empty()) {
         return "neural request input row is empty";
     }
     const NeuralReferenceResult reference =
-        evaluate_neural_reference(model.workload, item.inputs.front().values, 1, model.weights);
+        evaluate_neural_reference(*model.workload, item.inputs.front().values, 1, model.weights);
     if (reference.error.kind != NeuralReferenceErrorKind::kNone) {
         return reference.error.message.empty() ? "neural reference preparation failed"
                                                : reference.error.message;
@@ -1315,7 +1338,7 @@ SchedulerBenchmarkRun fail_run(SchedulerBenchmarkErrorKind kind, std::string mes
     return run;
 }
 
-SchedulerBenchmarkRun warmup(const SchedulerBenchmarkConfig& config) {
+SchedulerBenchmarkRun warmup(const SchedulerBenchmarkConfig& config, const PreparedModel& model) {
     if (config.warmup_requests == 0) {
         return {};
     }
@@ -1329,8 +1352,15 @@ SchedulerBenchmarkRun warmup(const SchedulerBenchmarkConfig& config) {
         return fail_run(SchedulerBenchmarkErrorKind::kRuntime, started.message);
     }
     for (std::uint64_t index = 0; index < config.warmup_requests; ++index) {
-        SchedulerBenchmarkTensors tensors = scheduler_benchmark_request(config.model_id, index + 1);
-        Admission admission = scheduler.submit(std::move(tensors.inputs));
+        Inflight item;
+        item.attempt_id = index + 1;
+        const std::string prepared =
+            prepare_inflight_expectation(model, config.model_id, item.attempt_id, item);
+        if (!prepared.empty()) {
+            (void)scheduler.shutdown(ShutdownPolicy::kDrain);
+            return fail_run(SchedulerBenchmarkErrorKind::kRuntime, prepared);
+        }
+        Admission admission = scheduler.submit(item.inputs);
         if (admission.status != AdmissionStatus::kAccepted || !admission.completion.has_value()) {
             (void)scheduler.shutdown(ShutdownPolicy::kDrain);
             return fail_run(SchedulerBenchmarkErrorKind::kRuntime,
@@ -1428,7 +1458,8 @@ struct ModelPin {
     const char* weights_file;
     const char* weights_sha256;
     bool neural;
-    NeuralWorkload workload;
+    bool fixture_replay;
+    std::optional<NeuralWorkload> workload;
 };
 
 ModelPin pin_for(SchedulerBenchmarkModelId id) {
@@ -1442,6 +1473,7 @@ ModelPin pin_for(SchedulerBenchmarkModelId id) {
                 "mlp_small_f32.weights",
                 kSmallWeightsSha256,
                 true,
+                false,
                 NeuralWorkload::kMlpSmall};
     case SchedulerBenchmarkModelId::kMlpMediumF32:
         return {"features",
@@ -1452,17 +1484,11 @@ ModelPin pin_for(SchedulerBenchmarkModelId id) {
                 "mlp_medium_f32.weights",
                 kMediumWeightsSha256,
                 true,
+                false,
                 NeuralWorkload::kMlpMedium};
     case SchedulerBenchmarkModelId::kGemmF32:
-        return {"features",
-                "product",
-                512,
-                512,
-                kGemmOnnxSha256,
-                "gemm_f32.weights",
-                kGemmWeightsSha256,
-                true,
-                NeuralWorkload::kGemm};
+        return {"features",         "product",          512,  512,   kGemmOnnxSha256,
+                "gemm_f32.weights", kGemmWeightsSha256, true, false, NeuralWorkload::kGemm};
     case SchedulerBenchmarkModelId::kResnet18F32:
         return {kResNet18InputName,
                 kResNet18OutputName,
@@ -1472,11 +1498,12 @@ ModelPin pin_for(SchedulerBenchmarkModelId id) {
                 nullptr,
                 nullptr,
                 true,
-                NeuralWorkload::kMlpSmall};
+                true,
+                std::nullopt};
     case SchedulerBenchmarkModelId::kBatchAddF32:
         break;
     }
-    return {"A", "C", 2, 2, kAddOnnxSha256, nullptr, nullptr, false, NeuralWorkload::kMlpSmall};
+    return {"A", "C", 2, 2, kAddOnnxSha256, nullptr, nullptr, false, false, std::nullopt};
 }
 
 std::uint32_t rotate_right(std::uint32_t value, std::uint32_t bits) noexcept {
@@ -1729,8 +1756,21 @@ PrepareResult prepare_model(const SchedulerBenchmarkConfig& config) {
     auto prepared = std::make_shared<PreparedModel>();
     prepared->id = config.model_id;
     prepared->neural = pin.neural;
+    prepared->fixture_replay = pin.fixture_replay;
     prepared->workload = pin.workload;
     prepared->model_digest = model_digest.hex;
+    if (pin.fixture_replay) {
+        const std::filesystem::path fixture_dir =
+            std::filesystem::path{config.model_path}.parent_path() / "fixtures" / "resnet18_f32";
+        ResNet18FixtureLoad loaded_table = load_resnet18_fixture_table(fixture_dir);
+        if (loaded_table.error.kind != NeuralReferenceErrorKind::kNone) {
+            result.error = loaded_table.error.message.empty()
+                               ? "resnet18_f32 fixture table could not be loaded"
+                               : loaded_table.error.message;
+            return result;
+        }
+        prepared->fixtures = std::move(loaded_table.table);
+    }
     if (pin.neural && pin.weights_file != nullptr) {
         prepared->weights_path =
             std::filesystem::path{config.model_path}.parent_path() / "fixtures" / pin.weights_file;
@@ -1743,7 +1783,11 @@ PrepareResult prepare_model(const SchedulerBenchmarkConfig& config) {
             result.error = "weight sidecar SHA-256 mismatch for the selected model id";
             return result;
         }
-        const NeuralContract contract = neural_contract(pin.workload);
+        if (!pin.workload.has_value()) {
+            result.error = "neural live reference is not configured";
+            return result;
+        }
+        const NeuralContract contract = neural_contract(*pin.workload);
         const NeuralFloatFile weights =
             load_float32_file(prepared->weights_path, contract.parameter_count);
         if (weights.error.kind != NeuralReferenceErrorKind::kNone) {
@@ -1969,7 +2013,11 @@ SchedulerBenchmarkOutputCheck scheduler_benchmark_check_output(SchedulerBenchmar
             return checked;
         }
     }
-    const NeuralMismatch mismatch = neural_worst_mismatch(pin.workload, output.values, reference);
+    if (!pin.workload.has_value()) {
+        checked.message = "neural live reference is not configured";
+        return checked;
+    }
+    const NeuralMismatch mismatch = neural_worst_mismatch(*pin.workload, output.values, reference);
     if (!mismatch.within) {
         checked.message = "output exceeded the neural tolerance";
         return checked;
@@ -2061,7 +2109,7 @@ SchedulerBenchmarkRun run_scheduler_benchmark(const SchedulerBenchmarkConfig& co
                         prepared.error.empty() ? "model identity was not prepared"
                                                : prepared.error);
     }
-    if (const SchedulerBenchmarkRun warmed = warmup(config);
+    if (const SchedulerBenchmarkRun warmed = warmup(config, *prepared.model);
         warmed.kind != SchedulerBenchmarkErrorKind::kNone) {
         return warmed;
     }
