@@ -26,13 +26,20 @@ from benchmarks.collect_neural_scheduler import (
     ARRIVAL_FIDELITY_STATUS_NOT_CERTIFIED,
     ARRIVAL_SCREEN_MAX_LAG_NS,
     ARRIVAL_SCREEN_POLICY_VERSION,
+    CELL_DEFINITION_ADAPTIVE_KEY,
+    CELL_DEFINITION_ARRIVAL_KEY,
     CONTRAST_ID_AG2,
     CONTRAST_ID_AG2G3,
+    CONTRAST_ID_G2G4,
     CONTRAST_SIGN_CONVENTION,
     CONTRAST_SIGN_G2_MINUS_A,
     CONTRAST_SIGN_G3_MINUS_A,
     CONTRAST_SIGN_G3_MINUS_G2,
+    CONTRAST_SIGN_G4_MINUS_G2,
     EXPERIMENT_KIND,
+    G2G4_BOOTSTRAP_SEED,
+    G2G4_DURATION_MS,
+    G2G4_OFFERED_RATE,
     NEURAL_MODELS,
     PHASE_BOUNDARY_FIDELITY_UNAVAILABLE,
     PERSISTENT_BATCHING_MIN_MEAN,
@@ -61,11 +68,14 @@ GEMM = NEURAL_MODELS["gemm_f32"]
 PROFILE = open_loop_profile("neural_open", 90.0)
 AG2_PROFILE = open_loop_profile("neural_open", AG2_OFFERED_RATE)
 AG2G3_PROFILE = open_loop_profile("neural_open", AG2G3_OFFERED_RATE)
+G2G4_PROFILE = open_loop_profile("neural_open", G2G4_OFFERED_RATE)
 
 
 def _cell(cell_id: str) -> dict:
     if cell_id == "G3":
         return resolve_neural_cell("G3", allow_g3=True)
+    if cell_id == "G4":
+        return resolve_neural_cell("G4", allow_g4=True)
     return resolve_neural_cell(cell_id)
 
 
@@ -75,24 +85,39 @@ def _report(
     *,
     lag_max: int = 1000,
     mean_batch: float | None = None,
+    duration_ms: int = 1000,
 ) -> dict:
     cell = _cell(cell_id)
     document = sample_report(model=str(MODEL))
     document["generator"]["warmup_requests"] = 100
+    duration_ns = int(duration_ms) * 1_000_000
+    document["configured_duration_nanoseconds"] = duration_ns
+    document["arrival_window_nanoseconds"] = duration_ns
+    document["scheduled_span_nanoseconds"] = max(0, duration_ns - 10_000_000)
+    document["total_trial_nanoseconds"] = duration_ns + int(document["completion_nanoseconds"])
     document["scheduler"]["enable_batching"] = cell["enable_batching"]
     document["scheduler"]["max_batch_size"] = cell["max_batch_size"]
     document["scheduler"]["max_batch_delay_ms"] = cell["max_batch_delay_ms"]
     document["scheduler"]["adaptive_batching"] = bool(cell.get("adaptive_batching", False))
+    document["scheduler"]["arrival_aware_batching"] = bool(
+        cell.get("arrival_aware_batching", False)
+    )
     if cell_id == "G3":
         document["scheduler"]["adaptive_batching"] = True
+        document["scheduler"]["arrival_aware_batching"] = False
+    if cell_id == "G4":
+        document["scheduler"]["adaptive_batching"] = False
+        document["scheduler"]["arrival_aware_batching"] = True
     # Fixed offsets yield deterministic primary/secondary differences.
     offset = 0.0
     if cell_id in {"C", "G2"}:
         offset = 5.0
     elif cell_id == "G3":
         offset = 2.0
+    elif cell_id == "G4":
+        offset = -3.0
     document["successful_e2e_latency"]["p50_microseconds"] = 10.0 + block + offset
-    document["successful_e2e_latency"]["p95_microseconds"] = 20.0 + block
+    document["successful_e2e_latency"]["p95_microseconds"] = 20.0 + offset
     document["generator_lag"]["maximum_nanoseconds"] = lag_max
     if mean_batch is not None:
         runs = 50
@@ -112,11 +137,11 @@ def _report(
     return document
 
 
-def _measurement() -> dict:
+def _measurement(*, duration_ms: int = 1000) -> dict:
     return {
         "worker_count": 1,
         "queue_capacity": 64,
-        "duration_ms": 1000,
+        "duration_ms": duration_ms,
         "max_offered": 100000,
         "max_outstanding": 64,
         "completion_timeout_ms": 5000,
@@ -195,11 +220,47 @@ def _write_run(
             },
         }
         five_key = True
+        six_key = False
+        duration_ms = 1000
+        bootstrap_seed = BOOTSTRAP_SEED
+    elif contrast == "g2g4":
+        cell_ids = ["G2", "G4"]
+        profile = G2G4_PROFILE
+        sign = CONTRAST_SIGN_G4_MINUS_G2
+        baseline = "G2"
+        alternative = "G4"
+        contrast_fields = {
+            "contrast_id": CONTRAST_ID_G2G4,
+            "arrival_fidelity_status": ARRIVAL_FIDELITY_STATUS_NOT_CERTIFIED,
+            "phase_boundary_fidelity": PHASE_BOUNDARY_FIDELITY_UNAVAILABLE,
+            "arrival_screen_max_lag_ns": ARRIVAL_SCREEN_MAX_LAG_NS,
+            "arrival_screen_policy_version": ARRIVAL_SCREEN_POLICY_VERSION,
+            "arrival_screen_gating": False,
+            "require_six_key_cell_definitions": True,
+            "bootstrap_seed": G2G4_BOOTSTRAP_SEED,
+            "fixed_duration_ms": G2G4_DURATION_MS,
+            "fixed_worker_count": 1,
+        }
+        five_key = False
+        six_key = True
+        duration_ms = G2G4_DURATION_MS
+        bootstrap_seed = G2G4_BOOTSTRAP_SEED
     else:
         raise AssertionError(contrast)
+    if contrast == "ac":
+        five_key = False
+        six_key = False
+        duration_ms = 1000
+        bootstrap_seed = BOOTSTRAP_SEED
+    elif contrast == "ag2":
+        five_key = False
+        six_key = False
+        duration_ms = 1000
+        bootstrap_seed = BOOTSTRAP_SEED
     cells = [_cell(cell_id) for cell_id in cell_ids]
     profiles = [profile]
     cell_map = {cell["id"]: cell for cell in cells}
+    measurement = _measurement(duration_ms=duration_ms)
     plan = bind_commands(
         build_plan(cells, profiles, counted_blocks),
         binary=BINARY,
@@ -207,7 +268,7 @@ def _write_run(
         model_id=model_id,
         cells=cell_map,
         profiles={profile["id"]: profile},
-        measurement=_measurement(),
+        measurement=measurement,
     )
     if mode is None:
         mode = "smoke" if counted_blocks == 0 else "reportable"
@@ -227,7 +288,13 @@ def _write_run(
                 mean_batch = g2_mean_batch
             elif cell_id == "G3" and g3_mean_batch is not None:
                 mean_batch = g3_mean_batch
-        report = _report(cell_id, block, lag_max=lag_max, mean_batch=mean_batch)
+        report = _report(
+            cell_id,
+            block,
+            lag_max=lag_max,
+            mean_batch=mean_batch,
+            duration_ms=duration_ms,
+        )
         trial_id = str(trial["trial_id"])
         (runs / f"{trial_id}.json").write_text(dump_report(report), encoding="utf-8")
         meta = {
@@ -273,16 +340,20 @@ def _write_run(
         "traffic_profile": profile["id"],
         "cells": cell_ids,
         "profiles": [profile["id"]],
-        "cell_definitions": serialize_cell_definitions(cells, include_adaptive=five_key),
+        "cell_definitions": serialize_cell_definitions(
+            cells,
+            include_adaptive=five_key or six_key,
+            include_arrival_aware=six_key,
+        ),
         "profile_definitions": profiles,
-        "measurement": _measurement(),
+        "measurement": measurement,
         "counted_runs_per_cell": counted_blocks,
         "counted_run_target": counted_blocks,
         "trial_order": [str(trial["trial_id"]) for trial in plan],
         "baseline_cell": baseline,
         "alternative_cell": alternative,
         "contrast_source": "predeclared",
-        "bootstrap_seed": BOOTSTRAP_SEED,
+        "bootstrap_seed": bootstrap_seed,
         "bootstrap_replicates": BOOTSTRAP_REPLICATES,
         "confidence_level": CONFIDENCE_LEVEL,
         "zero_admission_rejection_required": mode == "reportable",
@@ -1192,6 +1263,165 @@ class AdaptiveIdentityAnalyzerTest(unittest.TestCase):
     def test_no_g3_cell_in_resolver(self) -> None:
         with self.assertRaises(Exception):
             resolve_neural_cell("G3")
+
+
+class G2G4SparseAnalyzeTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.temporary.name)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_valid_g2g4_uses_g4_minus_g2_seed_and_no_winner(self) -> None:
+        run_set = _write_run(self.root, 20, contrast="g2g4", run_name="g2g4-ok")
+        document = json.loads(analyze(run_set).read_text(encoding="utf-8"))
+        self.assertEqual(document["contrast_id"], CONTRAST_ID_G2G4)
+        self.assertEqual(document["contrast_sign_convention"], CONTRAST_SIGN_G4_MINUS_G2)
+        self.assertEqual(document["effect_definition"], "difference = G4_metric - G2_metric")
+        self.assertEqual(document["baseline_cell"], "G2")
+        self.assertEqual(document["alternative_cell"], "G4")
+        self.assertEqual(document["bootstrap"]["seed"], G2G4_BOOTSTRAP_SEED)
+        self.assertEqual(document["schema_version"], SCHEMA_VERSION)
+        self.assertEqual(document["arrival_fidelity_status"], "not_certified")
+        self.assertFalse(document["winner_declared"])
+        self.assertFalse(document["superiority_claimed"])
+        latency = next(
+            metric for metric in document["metrics"] if metric["metric"] == "p50_e2e_latency"
+        )
+        self.assertAlmostEqual(latency["effect_estimate"], -8.0)
+        self.assertTrue(all(block["difference"] == -8.0 for block in latency["blocks"]))
+        self.assertEqual(latency["paired_block_count"], 20)
+        self.assertTrue(latency["confidence_interval_computed"])
+        differences = [-8.0] * 20
+        check = paired_block_bootstrap_mean(
+            differences,
+            seed=G2G4_BOOTSTRAP_SEED,
+            replicates=BOOTSTRAP_REPLICATES,
+            level=CONFIDENCE_LEVEL,
+        )
+        self.assertEqual(check, latency["confidence_interval"])
+
+    def test_partial_blocks_rejected_and_wrong_seed_rejected(self) -> None:
+        partial = _write_run(self.root, 10, contrast="g2g4", run_name="g2g4-partial")
+        with self.assertRaises(AnalyzerError) as raised:
+            analyze(partial)
+        self.assertIn("20", str(raised.exception))
+        run_set = _write_run(self.root, 20, contrast="g2g4", run_name="g2g4-bad-seed")
+
+        def mutate(doc: dict) -> None:
+            doc["collection_protocol"]["bootstrap_seed"] = BOOTSTRAP_SEED
+            doc["source_defined_policy"]["bootstrap_seed"] = BOOTSTRAP_SEED
+
+        _mutate_environment(run_set, mutate)
+        with self.assertRaises(AnalyzerError) as seed:
+            analyze(run_set)
+        self.assertIn("20261016", str(seed.exception))
+
+    def test_schema5_and_completion_timing_rejected(self) -> None:
+        run_set = _write_run(self.root, 20, contrast="g2g4", run_name="g2g4-schema5")
+        _mutate_report(
+            run_set,
+            "G2-neural_open-01",
+            lambda doc: doc.update(batch_decision={"events": []}),
+        )
+        with self.assertRaises(AnalyzerError) as raised:
+            analyze(run_set)
+        self.assertIn("batch_decision", str(raised.exception))
+        run_set2 = _write_run(self.root, 20, contrast="g2g4", run_name="g2g4-schema4")
+        _mutate_report(
+            run_set2,
+            "G4-neural_open-01",
+            lambda doc: doc.update(pre_publication_latency={"p50_nanoseconds": 1}),
+        )
+        with self.assertRaises(AnalyzerError) as timing:
+            analyze(run_set2)
+        message = str(timing.exception).lower()
+        self.assertTrue(
+            "pre_publication_latency" in message or "completion timing" in message
+        )
+
+    def test_wrong_protocol_kind_cells_and_six_key(self) -> None:
+        run_set = _write_run(self.root, 20, contrast="g2g4", run_name="g2g4-protocol")
+
+        def bad_protocol(doc: dict) -> None:
+            doc["collection_protocol"]["analysis_protocol_version"] = 0
+
+        _mutate_environment(run_set, bad_protocol)
+        with self.assertRaises(AnalyzerError) as protocol:
+            analyze(run_set)
+        self.assertIn("protocol", str(protocol.exception).lower())
+        run_set2 = _write_run(self.root, 20, contrast="g2g4", run_name="g2g4-kind")
+
+        def bad_kind(doc: dict) -> None:
+            doc["experiment_kind"] = "completion_timing_overhead"
+            doc["collection_protocol"]["experiment_kind"] = "completion_timing_overhead"
+
+        _mutate_environment(run_set2, bad_kind)
+        with self.assertRaises(AnalyzerError):
+            analyze(run_set2)
+        run_set3 = _write_run(self.root, 20, contrast="g2g4", run_name="g2g4-fourkey")
+
+        def strip_six(doc: dict) -> None:
+            for cell in doc["collection_protocol"]["cell_definitions"]:
+                cell.pop(CELL_DEFINITION_ARRIVAL_KEY, None)
+                cell.pop(CELL_DEFINITION_ADAPTIVE_KEY, None)
+            doc["collection_protocol"]["require_six_key_cell_definitions"] = False
+            doc["source_defined_policy"]["require_six_key_cell_definitions"] = False
+
+        _mutate_environment(run_set3, strip_six)
+        with self.assertRaises(AnalyzerError) as six_key:
+            analyze(run_set3)
+        self.assertTrue(
+            "six-key" in str(six_key.exception) or "cell definition" in str(six_key.exception)
+        )
+
+    def test_missing_or_duplicate_paired_arm_rejected(self) -> None:
+        run_set = _write_run(self.root, 20, contrast="g2g4", run_name="g2g4-dup")
+        plan_path = run_set / "execution_plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        for trial in plan["trials"]:
+            if trial.get("block_index") == 1 and trial.get("position_in_block") == 1:
+                trial["cell_id"] = "G2"
+        plan_path.write_text(json.dumps(plan) + "\n", encoding="utf-8")
+        env_path = run_set / "environment.json"
+        environment = json.loads(env_path.read_text(encoding="utf-8"))
+        environment["collection_protocol"]["trial_order"] = [
+            str(trial["trial_id"]) for trial in plan["trials"]
+        ]
+        env_path.write_text(json.dumps(environment) + "\n", encoding="utf-8")
+        with self.assertRaises(AnalyzerError) as raised:
+            analyze(run_set)
+        message = str(raised.exception).lower()
+        self.assertTrue("duplicate" in message or "rotation" in message or "arm" in message)
+
+    def test_g4_unrelated_and_historical_seeds_preserved(self) -> None:
+        ag2 = _write_run(self.root, 20, contrast="ag2", run_name="ag2-ok")
+        document = json.loads(analyze(ag2).read_text(encoding="utf-8"))
+        self.assertEqual(document["bootstrap"]["seed"], 20261013)
+        self.assertEqual(document["contrast_id"], CONTRAST_ID_AG2)
+        ac = _write_run(self.root, 10, contrast="ac", run_name="ac-ok")
+        ac_doc = json.loads(analyze(ac).read_text(encoding="utf-8"))
+        self.assertEqual(ac_doc["bootstrap"]["seed"], 20261013)
+        bad = _write_run(self.root, 20, contrast="ag2", run_name="g4-unrelated")
+
+        def mutate(doc: dict) -> None:
+            doc["collection_protocol"]["cells"] = ["A", "G4"]
+            doc["collection_protocol"]["alternative_cell"] = "G4"
+            doc["collection_protocol"].pop("contrast_id", None)
+
+        _mutate_environment(bad, mutate)
+        with self.assertRaises(AnalyzerError) as g4:
+            analyze(bad)
+        self.assertIn("G4", str(g4.exception))
+
+    def test_non_gating_lag_does_not_reject(self) -> None:
+        run_set = _write_run(
+            self.root, 20, contrast="g2g4", run_name="g2g4-lag", lag_max=ARRIVAL_SCREEN_MAX_LAG_NS + 1
+        )
+        document = json.loads(analyze(run_set).read_text(encoding="utf-8"))
+        self.assertEqual(document["contrast_id"], CONTRAST_ID_G2G4)
+        self.assertFalse(document["winner_declared"])
 
 
 if __name__ == "__main__":

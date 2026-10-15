@@ -3,10 +3,10 @@
 
 This module is additive. It does not teach the historical Add collector about
 neural models. Reportable mode allowlists gemm_f32 A versus C (C_minus_A), the
-frozen A versus G2 contrast (G2_minus_A at 1000 RPS), and the three-arm
-A/G2/G3 adaptive contrast (G3_minus_G2 primary at 1000 RPS). Offered rate must
-be frozen before reportable mode. This collector does not run a real campaign by
-itself.
+frozen A versus G2 contrast (G2_minus_A at 1000 RPS), the three-arm A/G2/G3
+adaptive contrast (G3_minus_G2 primary at 1000 RPS), and the frozen G2 versus G4
+sparse contrast (G4_minus_G2 at 100 RPS). Offered rate must be frozen before
+reportable mode. This collector does not run a real campaign by itself.
 """
 
 from __future__ import annotations
@@ -117,9 +117,10 @@ NEURAL_LOCAL_CELLS = (
     },
 )
 NEURAL_LOCAL_CELL_BY_ID = {cell["id"]: cell for cell in NEURAL_LOCAL_CELLS}
-# G1 stays calibration-only. G2 is calibration-only except the frozen A/G2
-# reportable contrast. G3 is calibration-only except the frozen A/G2/G3
-# three-arm reportable contrast. G4 is calibration-only with no reportable contrast.
+# G1 stays calibration-only. G2 is calibration-only except the frozen A/G2 and
+# G2/G4 reportable contrasts. G3 is calibration-only except the frozen A/G2/G3
+# three-arm reportable contrast. G4 is calibration-only except the frozen
+# G2/G4 sparse reportable contrast.
 CALIBRATION_ONLY_NEURAL_CELLS = frozenset(NEURAL_LOCAL_CELL_BY_ID)
 CALIBRATION_VARIANT_NONZERO_BATCH_DELAY_V1 = "nonzero_batch_delay_v1"
 CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1 = "adaptive_early_seal_v1"
@@ -164,9 +165,11 @@ CELL_DEFINITION_ALLOWED_KEYS = CELL_DEFINITION_KEYS + (
 CONTRAST_ID_AC = "gemm_f32_A_vs_C"
 CONTRAST_ID_AG2 = "gemm_f32_A_vs_G2_delay2ms_rps1000"
 CONTRAST_ID_AG2G3 = "gemm_f32_A_G2_G3_adaptive_rps1000"
+CONTRAST_ID_G2G4 = "gemm_f32_G2_vs_G4_sparse_rps100"
 CONTRAST_SIGN_G2_MINUS_A = "G2_minus_A"
 CONTRAST_SIGN_G3_MINUS_G2 = "G3_minus_G2"
 CONTRAST_SIGN_G3_MINUS_A = "G3_minus_A"
+CONTRAST_SIGN_G4_MINUS_G2 = "G4_minus_G2"
 ARRIVAL_FIDELITY_STATUS_NOT_CERTIFIED = "not_certified"
 PHASE_BOUNDARY_FIDELITY_UNAVAILABLE = "unavailable"
 ARRIVAL_SCREEN_POLICY_VERSION = "coarse_max_lag_v1"
@@ -174,6 +177,11 @@ ARRIVAL_SCREEN_MAX_LAG_NS = 5_000_000
 PERSISTENT_BATCHING_MIN_MEAN = 2.0
 AG2_OFFERED_RATE = 1000.0
 AG2G3_OFFERED_RATE = 1000.0
+G2G4_OFFERED_RATE = 100.0
+G2G4_DURATION_MS = 5000
+G2G4_WORKER_COUNT = 1
+G2G4_BOOTSTRAP_SEED = 20261016
+G2G4_COUNTED_BLOCKS = PREFERRED_COUNTED_RUNS
 # Twenty counted blocks under within_profile_cyclic_rotation on (A,G2,G3).
 # Perfect three-position balance is impossible; record and enforce these counts.
 THREE_ARM_COUNTED_BLOCKS = PREFERRED_COUNTED_RUNS
@@ -279,10 +287,54 @@ REPORTABLE_CONTRAST_AG2G3 = {
     },
 }
 
+REPORTABLE_CONTRAST_G2G4 = {
+    "contrast_id": CONTRAST_ID_G2G4,
+    "model_id": REPORTABLE_MODEL_ID,
+    "cells": ("G2", "G4"),
+    "baseline_cell": "G2",
+    "alternative_cell": "G4",
+    "contrast_sign_convention": CONTRAST_SIGN_G4_MINUS_G2,
+    "required_counted_runs": G2G4_COUNTED_BLOCKS,
+    "fixed_offered_rate": G2G4_OFFERED_RATE,
+    "fixed_duration_ms": G2G4_DURATION_MS,
+    "fixed_worker_count": G2G4_WORKER_COUNT,
+    "bootstrap_seed": G2G4_BOOTSTRAP_SEED,
+    "arrival_fidelity_status": ARRIVAL_FIDELITY_STATUS_NOT_CERTIFIED,
+    "phase_boundary_fidelity": PHASE_BOUNDARY_FIDELITY_UNAVAILABLE,
+    "arrival_screen_max_lag_ns": ARRIVAL_SCREEN_MAX_LAG_NS,
+    "arrival_screen_policy_version": ARRIVAL_SCREEN_POLICY_VERSION,
+    "arrival_screen_gating": False,
+    "persistent_batching_cell": None,
+    "persistent_batching_min_mean": None,
+    "allow_neural_local_cells": frozenset({"G2", "G4"}),
+    "require_five_key_cell_definitions": False,
+    "require_six_key_cell_definitions": True,
+    "forbid_instrumentation": True,
+    "expected_cells": {
+        "G2": {
+            "id": "G2",
+            "enable_batching": True,
+            "max_batch_size": 4,
+            "max_batch_delay_ms": 2,
+            "adaptive_batching": False,
+            "arrival_aware_batching": False,
+        },
+        "G4": {
+            "id": "G4",
+            "enable_batching": True,
+            "max_batch_size": 4,
+            "max_batch_delay_ms": 2,
+            "adaptive_batching": False,
+            "arrival_aware_batching": True,
+        },
+    },
+}
+
 REPORTABLE_CONTRASTS_BY_ID = {
     CONTRAST_ID_AC: REPORTABLE_CONTRAST_AC,
     CONTRAST_ID_AG2: REPORTABLE_CONTRAST_AG2,
     CONTRAST_ID_AG2G3: REPORTABLE_CONTRAST_AG2G3,
+    CONTRAST_ID_G2G4: REPORTABLE_CONTRAST_G2G4,
 }
 
 NEURAL_MODELS = {
@@ -343,13 +395,13 @@ def resolve_neural_cell(
 
     Bare resolve_neural_cell("G3") / ("G4") is rejected so those cells cannot be
     treated as general. Callers must resolve them through resolve_neural_cells
-    with mode='calibration' (G4), or calibration / allowlisted A/G2/G3 reportable
-    (G3).
+    with mode='calibration', or through an allowlisted reportable contrast
+    (A/G2/G3 for G3; G2/G4 for G4).
     """
     if cell_id == "G4" and not allow_g4:
         raise NeuralCollectorError(
             "G4 is calibration-only unless resolved via resolve_neural_cells "
-            "for calibration mode"
+            "for calibration or the allowlisted G2/G4 reportable contrast"
         )
     if cell_id == "G3" and not allow_g3:
         raise NeuralCollectorError(
@@ -377,9 +429,10 @@ def resolve_neural_cells(
     """Resolve ordered cell ids for the neural collector.
 
     G1 remains calibration-only. G2 is calibration-only except the frozen A/G2
-    reportable contrast. G3 is calibration-only except the frozen A/G2/G3
-    reportable contrast. G4 is calibration-only with no reportable contrast.
-    Smoke never accepts G3 or G4. Duplicates are rejected.
+    and G2/G4 reportable contrasts. G3 is calibration-only except the frozen
+    A/G2/G3 reportable contrast. G4 is calibration-only except the frozen G2/G4
+    sparse reportable contrast. Smoke never accepts G3 or G4. Duplicates are
+    rejected.
     """
     if not cell_ids:
         raise NeuralCollectorError("cells are required")
@@ -404,7 +457,7 @@ def resolve_neural_cells(
                 f"neural-local cells {', '.join(disallowed)} are not permitted in mode {mode!r}"
             )
     allow_g3 = mode == "calibration" or "G3" in allowed_local
-    allow_g4 = mode == "calibration"
+    allow_g4 = mode == "calibration" or "G4" in allowed_local
     return [
         resolve_neural_cell(cell_id, allow_g3=allow_g3, allow_g4=allow_g4)
         for cell_id in cell_ids
@@ -548,10 +601,11 @@ def serialize_cell_definitions(
 
     Historical A/C and A/G2 reportable keep four-key on-disk shapes.
     adaptive_early_seal_v1 calibration and the A/G2/G3 reportable contrast
-    require five-key definitions for every cell. arrival_aware_batching_v1
-    and arrival_aware_sparse_v1 require six-key definitions for every cell.
-    Format is chosen by the caller from the validated calibration / reportable
-    variant, not inferred from arbitrary cell dictionary keys.
+    require five-key definitions for every cell. arrival_aware_batching_v1,
+    arrival_aware_sparse_v1, and the G2/G4 sparse reportable contrast require
+    six-key definitions for every cell. Format is chosen by the caller from the
+    validated calibration / reportable variant, not inferred from arbitrary
+    cell dictionary keys.
     """
     if include_arrival_aware and not include_adaptive:
         raise NeuralCollectorError(
@@ -998,10 +1052,72 @@ def resolve_reportable_contrast(
         contract = dict(REPORTABLE_CONTRAST_AG2G3)
         contract["resolved_offered_rate"] = AG2G3_OFFERED_RATE
         return contract
+    if cells == REPORTABLE_CONTRAST_G2G4["cells"]:
+        baseline = baseline_cell or "G2"
+        alternative = alternative_cell or "G4"
+        if baseline != "G2" or alternative != "G4":
+            raise NeuralCollectorError(
+                "G2/G4 reportable contrast requires baseline G2 and alternative G4"
+            )
+        if float(target_rps) != G2G4_OFFERED_RATE:
+            raise NeuralCollectorError(
+                f"G2/G4 reportable contrast requires --target-rps {G2G4_OFFERED_RATE:g}"
+            )
+        if counted_runs is None:
+            counted_runs = G2G4_COUNTED_BLOCKS
+        if counted_runs != G2G4_COUNTED_BLOCKS:
+            raise NeuralCollectorError(
+                f"G2/G4 reportable contrast requires exactly "
+                f"{G2G4_COUNTED_BLOCKS} counted blocks"
+            )
+        contract = dict(REPORTABLE_CONTRAST_G2G4)
+        contract["resolved_offered_rate"] = G2G4_OFFERED_RATE
+        return contract
     raise NeuralCollectorError(
         "reportable mode supports only cells A,C, the frozen A,G2 contrast, "
-        f"or the frozen A,G2,G3 contrast; got {','.join(cell_ids)!r}"
+        "the frozen A,G2,G3 contrast, or the frozen G2,G4 sparse contrast; "
+        f"got {','.join(cell_ids)!r}"
     )
+
+
+def enforce_reportable_measurement(contrast: dict, measurement: dict) -> None:
+    """Reject frozen-contrast measurement settings that diverge from the contract."""
+    if contrast.get("fixed_duration_ms") is not None:
+        duration = measurement.get("duration_ms")
+        if type(duration) is not int or isinstance(duration, bool):
+            raise NeuralCollectorError("duration_ms must be an integer")
+        if duration != int(contrast["fixed_duration_ms"]):
+            raise NeuralCollectorError(
+                f"{contrast['contrast_id']} requires duration_ms="
+                f"{int(contrast['fixed_duration_ms'])}, got {duration}"
+            )
+    if contrast.get("fixed_worker_count") is not None:
+        workers = measurement.get("worker_count")
+        if type(workers) is not int or isinstance(workers, bool):
+            raise NeuralCollectorError("worker_count must be an integer")
+        if workers != int(contrast["fixed_worker_count"]):
+            raise NeuralCollectorError(
+                f"{contrast['contrast_id']} requires worker_count="
+                f"{int(contrast['fixed_worker_count'])}, got {workers}"
+            )
+    if contrast.get("forbid_instrumentation") is True:
+        if measurement.get("enable_batch_decision_timing") is True:
+            raise NeuralCollectorError(
+                f"{contrast['contrast_id']} rejects batch-decision timing instrumentation"
+            )
+        if measurement.get("enable_completion_timing") is True:
+            raise NeuralCollectorError(
+                f"{contrast['contrast_id']} rejects completion timing instrumentation"
+            )
+        capacity = measurement.get("batch_decision_event_capacity", 0)
+        if (
+            type(capacity) is int
+            and not isinstance(capacity, bool)
+            and capacity != 0
+        ):
+            raise NeuralCollectorError(
+                f"{contrast['contrast_id']} rejects batch_decision_event_capacity"
+            )
 
 
 def evidence_class_for(mode: str) -> str:
@@ -1511,6 +1627,13 @@ def neural_preflight(
         "require_five_key_cell_definitions"
     ):
         include_adaptive_definitions = True
+    if reportable_contrast is not None and reportable_contrast.get(
+        "require_six_key_cell_definitions"
+    ):
+        include_adaptive_definitions = True
+        include_arrival_aware_definitions = True
+    if reportable_contrast is not None:
+        enforce_reportable_measurement(reportable_contrast, measurement)
     cell_definitions = serialize_cell_definitions(
         cells,
         include_adaptive=include_adaptive_definitions,
@@ -1645,6 +1768,11 @@ def neural_preflight(
             "unbatched_cell",
             "legacy_adaptive_identity_prohibited",
             "require_five_key_cell_definitions",
+            "require_six_key_cell_definitions",
+            "arrival_screen_gating",
+            "bootstrap_seed",
+            "fixed_duration_ms",
+            "fixed_worker_count",
         ):
             if key in reportable_contrast and reportable_contrast[key] is not None:
                 contrast_identity[key] = reportable_contrast[key]
@@ -1653,10 +1781,20 @@ def neural_preflight(
         contrast_identity["phase_boundary_fidelity"] = phase_boundary
         contrast_identity["arrival_screen_max_lag_ns"] = arrival_screen
         contrast_identity["arrival_screen_policy_version"] = arrival_screen_version
-        contrast_identity["arrival_screen_note"] = (
-            "Coarse generator-lag screen only; not precise arrival-fidelity certification. "
-            "Inclusive bound on generator_lag.maximum_nanoseconds."
-        )
+        if reportable_contrast is not None and reportable_contrast.get(
+            "arrival_screen_gating"
+        ) is False:
+            contrast_identity["arrival_screen_note"] = (
+                "Non-gating coarse_max_lag_v1 diagnostic only; missed screens are "
+                "recorded and do not reject an otherwise hard-valid trial. "
+                "Not precise arrival-fidelity certification. Inclusive bound on "
+                "generator_lag.maximum_nanoseconds."
+            )
+        else:
+            contrast_identity["arrival_screen_note"] = (
+                "Coarse generator-lag screen only; not precise arrival-fidelity certification. "
+                "Inclusive bound on generator_lag.maximum_nanoseconds."
+            )
     if persistent_cell is not None:
         contrast_identity["persistent_batching_cell"] = persistent_cell
         contrast_identity["persistent_batching_min_mean"] = persistent_min
@@ -1785,7 +1923,12 @@ def neural_preflight(
             "alternative_cell": contrast["alternative_cell"],
             "contrast_source": contrast["contrast_source"],
             "statistical_method": STATISTICAL_METHOD,
-            "bootstrap_seed": BOOTSTRAP_SEED,
+            "bootstrap_seed": (
+                int(reportable_contrast["bootstrap_seed"])
+                if reportable_contrast is not None
+                and reportable_contrast.get("bootstrap_seed") is not None
+                else BOOTSTRAP_SEED
+            ),
             "bootstrap_replicates": BOOTSTRAP_REPLICATES,
             "confidence_level": CONFIDENCE_LEVEL,
             "inter_trial_delay_seconds": delay_seconds,
@@ -1923,9 +2066,11 @@ def execute_plan(
             problems.append("stderr is not empty")
         else:
             protocol = checked["collection_protocol"]
+            arrival_screen_gating = protocol.get("arrival_screen_gating", True) is not False
             apply_arrival_screen = (
                 mode == "reportable"
                 and protocol.get("arrival_screen_max_lag_ns") is not None
+                and arrival_screen_gating
                 and not bool(trial["pilot"])
             )
             apply_persistent = (
@@ -1951,6 +2096,23 @@ def execute_plan(
                 cell=cell,
             )
             problems.extend(trial_problems)
+            if (
+                document is not None
+                and mode == "reportable"
+                and protocol.get("arrival_screen_gating") is False
+                and protocol.get("arrival_screen_max_lag_ns") is not None
+                and not bool(trial["pilot"])
+            ):
+                lag_ok = coarse_max_lag_v1(
+                    document, int(protocol["arrival_screen_max_lag_ns"])
+                )
+                status = dict(status)
+                status["coarse_max_lag_v1"] = lag_ok
+                if lag_ok is True:
+                    status["coarse_max_lag_status"] = "passed"
+                elif lag_ok is False:
+                    status["coarse_max_lag_status"] = "missed"
+                status["arrival_fidelity_status"] = ARRIVAL_FIDELITY_STATUS_NOT_CERTIFIED
             if (
                 document is not None
                 and not problems
@@ -2071,6 +2233,7 @@ def execute_plan(
             "multi_request_batch_fraction",
             "multi_size_batch_fraction",
             "coarse_max_lag_v1",
+            "coarse_max_lag_status",
             "batch_open_wait",
             "timing_data_valid",
             "arrival_fidelity_status",
@@ -2102,7 +2265,7 @@ def execute_plan(
 
 def validate_reportable_args(args: argparse.Namespace) -> dict:
     cell_ids = [item.strip() for item in args.cells.split(",") if item.strip()]
-    return resolve_reportable_contrast(
+    contract = resolve_reportable_contrast(
         model_id=args.model_id,
         cell_ids=cell_ids,
         baseline_cell=args.baseline_cell,
@@ -2111,6 +2274,26 @@ def validate_reportable_args(args: argparse.Namespace) -> dict:
         counted_runs=args.counted_runs,
         offered_rate_frozen=bool(args.offered_rate_frozen),
     )
+    measurement = dict(DEFAULT_MEASUREMENT)
+    for name in (
+        "duration_ms",
+        "max_offered",
+        "max_outstanding",
+        "completion_timeout_ms",
+        "warmup_requests",
+        "lag_tolerance_ms",
+        "check_interval",
+    ):
+        value = getattr(args, name, None)
+        if value is not None:
+            measurement[name] = value
+    if bool(getattr(args, "batch_decision_timing", False)):
+        measurement["enable_batch_decision_timing"] = True
+        capacity = getattr(args, "batch_decision_event_capacity", None)
+        if capacity is not None:
+            measurement["batch_decision_event_capacity"] = capacity
+    enforce_reportable_measurement(contract, measurement)
+    return contract
 
 
 def collect(
@@ -2175,6 +2358,8 @@ def collect(
             )
         measurement["enable_batch_decision_timing"] = True
         measurement["batch_decision_event_capacity"] = int(capacity_arg)
+    if reportable_contrast is not None:
+        enforce_reportable_measurement(reportable_contrast, measurement)
     offered_rate_frozen = bool(args.offered_rate_frozen)
     if mode == "reportable" and not offered_rate_frozen:
         raise NeuralCollectorError("reportable mode requires a frozen offered rate")
@@ -2281,8 +2466,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Collect neural scheduler evidence under benchmarks/scheduler_runs. "
-            "Reportable mode allowlists gemm_f32 A versus C, or the frozen A versus G2 "
-            "contrast at 1000 RPS, and requires a frozen offered rate. "
+            "Reportable mode allowlists gemm_f32 A versus C, the frozen A versus G2 "
+            "contrast at 1000 RPS, the frozen A/G2/G3 adaptive contrast, or the frozen "
+            "G2 versus G4 sparse contrast at 100 RPS, and requires a frozen offered rate. "
             "This does not analyze or publish a speed claim."
         )
     )

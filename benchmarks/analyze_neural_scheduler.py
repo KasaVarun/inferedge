@@ -2,9 +2,10 @@
 """Analyze one neural_scheduler_batching run set.
 
 Confirmatory contrasts are allowlisted: gemm_f32 C minus A, the frozen
-A versus G2 study (G2 minus A), and the three-arm A/G2/G3 adaptive study
-(G3 minus G2 primary). This module never declares a winner. It refuses Add
-or overhead experiment identities.
+A versus G2 study (G2 minus A), the three-arm A/G2/G3 adaptive study
+(G3 minus G2 primary), and the frozen G2 versus G4 sparse study
+(G4 minus G2). This module never declares a winner. It refuses Add or
+overhead experiment identities.
 """
 
 from __future__ import annotations
@@ -31,14 +32,21 @@ from benchmarks.collect_neural_scheduler import (
     ARRIVAL_SCREEN_MAX_LAG_NS,
     ARRIVAL_SCREEN_POLICY_VERSION,
     CELL_DEFINITION_ADAPTIVE_KEY,
+    CELL_DEFINITION_ARRIVAL_KEY,
     CONTRAST_ID_AC,
     CONTRAST_ID_AG2,
     CONTRAST_ID_AG2G3,
+    CONTRAST_ID_G2G4,
     CONTRAST_SIGN_CONVENTION,
     CONTRAST_SIGN_G2_MINUS_A,
     CONTRAST_SIGN_G3_MINUS_A,
     CONTRAST_SIGN_G3_MINUS_G2,
+    CONTRAST_SIGN_G4_MINUS_G2,
     EXPERIMENT_KIND,
+    G2G4_BOOTSTRAP_SEED,
+    G2G4_DURATION_MS,
+    G2G4_OFFERED_RATE,
+    G2G4_WORKER_COUNT,
     PHASE_BOUNDARY_FIDELITY_UNAVAILABLE,
     PERSISTENT_BATCHING_MIN_MEAN,
     REFERENCE_CHECKING_POLICY,
@@ -47,9 +55,11 @@ from benchmarks.collect_neural_scheduler import (
     REPORTABLE_CELLS,
     REPORTABLE_CONTRAST_AG2,
     REPORTABLE_CONTRAST_AG2G3,
+    REPORTABLE_CONTRAST_G2G4,
     REPORTABLE_MODEL_ID,
     THREE_ARM_POSITION_COUNTS_20,
     adaptive_batching_for_cell,
+    arrival_aware_batching_for_cell,
     counted_rotation_position_counts,
     model_contract,
     normalize_cell_definition,
@@ -223,6 +233,8 @@ def _effect_definition(sign: str) -> str:
         return "difference = G3_metric - G2_metric"
     if sign == CONTRAST_SIGN_G3_MINUS_A:
         return "difference = G3_metric - A_metric"
+    if sign == CONTRAST_SIGN_G4_MINUS_G2:
+        return "difference = G4_metric - G2_metric"
     raise AnalyzerError(f"unsupported contrast sign convention {sign!r}")
 
 
@@ -237,6 +249,28 @@ def _require_five_key_definitions(definitions: object, expected_cells: tuple[str
         if CELL_DEFINITION_ADAPTIVE_KEY not in raw:
             raise AnalyzerError(
                 f"three-arm contrast requires five-key cell definition for {cell_id!r}"
+            )
+        by_id[cell_id] = raw
+    for cell_id in expected_cells:
+        if cell_id not in by_id:
+            raise AnalyzerError(f"cell definition for {cell_id} is missing")
+
+
+def _require_six_key_definitions(definitions: object, expected_cells: tuple[str, ...]) -> None:
+    if not isinstance(definitions, list):
+        raise AnalyzerError("cell_definitions are missing")
+    by_id: dict[str, dict] = {}
+    for raw in definitions:
+        if not isinstance(raw, dict):
+            raise AnalyzerError("cell definition is not an object")
+        cell_id = str(raw.get("id", ""))
+        if CELL_DEFINITION_ADAPTIVE_KEY not in raw:
+            raise AnalyzerError(
+                f"G2/G4 contrast requires six-key cell definition for {cell_id!r}"
+            )
+        if CELL_DEFINITION_ARRIVAL_KEY not in raw:
+            raise AnalyzerError(
+                f"G2/G4 contrast requires six-key cell definition for {cell_id!r}"
             )
         by_id[cell_id] = raw
     for cell_id in expected_cells:
@@ -454,10 +488,88 @@ def _resolve_confirmatory_contrast(protocol: dict) -> dict:
             "cell_map": cell_map,
             "expected_cells": expected,
         }
+    if cells == REPORTABLE_CONTRAST_G2G4["cells"]:
+        if contrast_id != CONTRAST_ID_G2G4:
+            raise AnalyzerError(
+                "G2/G4 confirmatory evidence requires contrast_id "
+                f"{CONTRAST_ID_G2G4!r}"
+            )
+        if sign != CONTRAST_SIGN_G4_MINUS_G2:
+            raise AnalyzerError("contrast sign convention is not G4_minus_G2")
+        if protocol.get("baseline_cell") != "G2":
+            raise AnalyzerError("baseline cell must be G2")
+        if protocol.get("alternative_cell") != "G4":
+            raise AnalyzerError("alternative cell must be G4")
+        if protocol.get("arrival_fidelity_status") != ARRIVAL_FIDELITY_STATUS_NOT_CERTIFIED:
+            raise AnalyzerError("arrival_fidelity_status must be not_certified")
+        if protocol.get("phase_boundary_fidelity") != PHASE_BOUNDARY_FIDELITY_UNAVAILABLE:
+            raise AnalyzerError("phase_boundary_fidelity must be unavailable")
+        if protocol.get("arrival_screen_max_lag_ns") != ARRIVAL_SCREEN_MAX_LAG_NS:
+            raise AnalyzerError("arrival_screen_max_lag_ns must be 5000000")
+        if protocol.get("arrival_screen_policy_version") != ARRIVAL_SCREEN_POLICY_VERSION:
+            raise AnalyzerError("arrival_screen_policy_version mismatch")
+        if protocol.get("arrival_screen_gating") is not False:
+            raise AnalyzerError("G2/G4 arrival screen must be non-gating")
+        if protocol.get("persistent_batching_cell") is not None:
+            raise AnalyzerError("G2/G4 contrast must not require persistent batching")
+        if protocol.get("require_six_key_cell_definitions") is not True:
+            raise AnalyzerError("G2/G4 contrast requires six-key cell definitions")
+        if protocol.get("bootstrap_seed") != G2G4_BOOTSTRAP_SEED:
+            raise AnalyzerError("G2/G4 bootstrap seed is not 20261016")
+        offered = protocol.get("offered_rate")
+        if not isinstance(offered, (int, float)) or float(offered) != G2G4_OFFERED_RATE:
+            raise AnalyzerError(f"G2/G4 offered rate must be {G2G4_OFFERED_RATE:g}")
+        measurement = protocol.get("measurement")
+        if not isinstance(measurement, dict):
+            raise AnalyzerError("measurement is missing")
+        if measurement.get("duration_ms") != G2G4_DURATION_MS:
+            raise AnalyzerError(f"G2/G4 duration_ms must be {G2G4_DURATION_MS}")
+        if measurement.get("worker_count") != G2G4_WORKER_COUNT:
+            raise AnalyzerError(f"G2/G4 worker_count must be {G2G4_WORKER_COUNT}")
+        if measurement.get("enable_batch_decision_timing") is True:
+            raise AnalyzerError("G2/G4 rejects batch-decision timing")
+        if measurement.get("enable_completion_timing") is True:
+            raise AnalyzerError("G2/G4 rejects completion timing")
+        _require_six_key_definitions(
+            protocol.get("cell_definitions"), REPORTABLE_CONTRAST_G2G4["cells"]
+        )
+        expected = REPORTABLE_CONTRAST_G2G4["expected_cells"]
+        cell_map = _cell_map_from_definitions(
+            protocol.get("cell_definitions"), REPORTABLE_CONTRAST_G2G4["cells"]
+        )
+        for cell_id, want in expected.items():
+            _require_cell_matches(cell_map[cell_id], want, cell_id)
+        return {
+            "contrast_id": CONTRAST_ID_G2G4,
+            "cells": REPORTABLE_CONTRAST_G2G4["cells"],
+            "baseline_cell": "G2",
+            "alternative_cell": "G4",
+            "contrast_sign_convention": CONTRAST_SIGN_G4_MINUS_G2,
+            "effect_definition": _effect_definition(CONTRAST_SIGN_G4_MINUS_G2),
+            "required_counted_runs": PREFERRED_COUNTED_RUNS,
+            "fixed_offered_rate": G2G4_OFFERED_RATE,
+            "bootstrap_seed": G2G4_BOOTSTRAP_SEED,
+            "arrival_screen_max_lag_ns": None,
+            "arrival_screen_diagnostic_max_lag_ns": ARRIVAL_SCREEN_MAX_LAG_NS,
+            "persistent_batching_cell": None,
+            "persistent_batching_min_mean": None,
+            "unbatched_cell": None,
+            "secondary_contrast_sign_convention": None,
+            "secondary_baseline_cell": None,
+            "secondary_alternative_cell": None,
+            "require_five_key_cell_definitions": False,
+            "require_six_key_cell_definitions": True,
+            "legacy_adaptive_identity_prohibited": False,
+            "expected_position_counts": None,
+            "cell_map": cell_map,
+            "expected_cells": expected,
+        }
     if "G1" in cells:
         raise AnalyzerError("G1 is calibration-only and is never confirmatory")
     if "G3" in cells:
         raise AnalyzerError("G3 is confirmatory only under the frozen A/G2/G3 contrast")
+    if "G4" in cells:
+        raise AnalyzerError("G4 is confirmatory only under the frozen G2/G4 contrast")
     raise AnalyzerError(f"unknown confirmatory cell set {cells!r}")
 
 
@@ -473,12 +585,16 @@ def _check_environment(environment: dict) -> tuple[dict, dict | None]:
         raise AnalyzerError("analysis protocol is not 2")
     if protocol.get("reference_checking_policy") != REFERENCE_CHECKING_POLICY:
         raise AnalyzerError("reference checking policy is not precomputed_reference_compare")
-    if protocol.get("bootstrap_seed") != BOOTSTRAP_SEED:
-        raise AnalyzerError("bootstrap seed is not 20261013")
     if protocol.get("bootstrap_replicates") != BOOTSTRAP_REPLICATES:
         raise AnalyzerError("bootstrap replicates are not 10000")
     if protocol.get("confidence_level") != CONFIDENCE_LEVEL:
         raise AnalyzerError("confidence level is not 0.95")
+    protocol_bootstrap_seed = protocol.get("bootstrap_seed")
+    if protocol.get("contrast_id") == CONTRAST_ID_G2G4:
+        if protocol_bootstrap_seed != G2G4_BOOTSTRAP_SEED:
+            raise AnalyzerError("bootstrap seed is not 20261016")
+    elif protocol_bootstrap_seed != BOOTSTRAP_SEED:
+        raise AnalyzerError("bootstrap seed is not 20261013")
     verified = environment.get("verified_configuration")
     if not isinstance(verified, dict):
         raise AnalyzerError("verified_configuration is missing")
@@ -546,7 +662,11 @@ def _check_environment(environment: dict) -> tuple[dict, dict | None]:
         if isinstance(source_policy, dict):
             if source_policy.get("contrast_sign_convention") != contrast["contrast_sign_convention"]:
                 raise AnalyzerError("source_defined_policy contrast sign mismatch")
-            if contrast["contrast_id"] in {CONTRAST_ID_AG2, CONTRAST_ID_AG2G3}:
+            if contrast["contrast_id"] in {
+                CONTRAST_ID_AG2,
+                CONTRAST_ID_AG2G3,
+                CONTRAST_ID_G2G4,
+            }:
                 if source_policy.get("contrast_id") != contrast["contrast_id"]:
                     raise AnalyzerError("source_defined_policy contrast_id mismatch")
                 if source_policy.get("arrival_screen_max_lag_ns") != ARRIVAL_SCREEN_MAX_LAG_NS:
@@ -554,7 +674,16 @@ def _check_environment(environment: dict) -> tuple[dict, dict | None]:
             if contrast["contrast_id"] == CONTRAST_ID_AG2G3:
                 if source_policy.get("secondary_contrast_sign_convention") != CONTRAST_SIGN_G3_MINUS_A:
                     raise AnalyzerError("source_defined_policy secondary contrast mismatch")
-    elif protocol.get("contrast_id") in {CONTRAST_ID_AG2, CONTRAST_ID_AG2G3}:
+            if contrast["contrast_id"] == CONTRAST_ID_G2G4:
+                if source_policy.get("arrival_screen_gating") is not False:
+                    raise AnalyzerError("source_defined_policy arrival screen gating mismatch")
+                if source_policy.get("require_six_key_cell_definitions") is not True:
+                    raise AnalyzerError("source_defined_policy six-key requirement mismatch")
+    elif protocol.get("contrast_id") in {
+        CONTRAST_ID_AG2,
+        CONTRAST_ID_AG2G3,
+        CONTRAST_ID_G2G4,
+    }:
         raise AnalyzerError(
             f"{protocol.get('contrast_id')} contrast_id is confirmatory-only"
         )
@@ -855,6 +984,7 @@ def analyze(
                 CONTRAST_SIGN_G2_MINUS_A,
                 CONTRAST_SIGN_G3_MINUS_G2,
                 CONTRAST_SIGN_G3_MINUS_A,
+                CONTRAST_SIGN_G4_MINUS_G2,
             }
             else "difference = alternative_metric - baseline_metric"
         )
@@ -948,8 +1078,14 @@ def analyze(
             continue
         if identity["adaptive_identity_status"] == "legacy_authorized":
             expected_adaptive = False
+            expected_arrival = False
         else:
             expected_adaptive = cell_adaptive
+            try:
+                expected_arrival = arrival_aware_batching_for_cell(cell)
+            except CollectorError as exc:
+                problems.append(f"{trial_id} {exc}")
+                continue
         expected = {
             "model_path": str(model),
             "workload": profile["workload"],
@@ -959,7 +1095,7 @@ def analyze(
             "max_batch_size": cell["max_batch_size"],
             "max_batch_delay_ms": cell["max_batch_delay_ms"],
             "adaptive_batching": expected_adaptive,
-            "arrival_aware_batching": bool(identity.get("arrival_aware_batching", False)),
+            "arrival_aware_batching": expected_arrival,
             "require_adaptive_batching_field": identity["require_adaptive_batching_field"],
             "require_arrival_aware_batching_field": identity[
                 "require_arrival_aware_batching_field"
@@ -995,6 +1131,17 @@ def analyze(
             continue
         if document.get("schema_version") != SCHEMA_VERSION:
             problems.append(f"{trial_id} schema_version is not 3")
+        if contrast_id == CONTRAST_ID_G2G4:
+            if "batch_decision" in document:
+                problems.append(f"{trial_id} schema-5 batch_decision fields are rejected")
+            if "pre_publication_latency" in document or (
+                "pre_publication_to_observation_delay" in document
+            ):
+                problems.append(f"{trial_id} schema-4 completion timing fields are rejected")
+            scheduler_flags = document.get("scheduler")
+            if isinstance(scheduler_flags, dict):
+                if scheduler_flags.get("enable_completion_timing") is True:
+                    problems.append(f"{trial_id} completion timing is enabled")
         if rejection_total(document) != 0 and protocol.get("zero_admission_rejection_required"):
             problems.append(f"{trial_id} has scheduler admission rejections")
         scheduler = document.get("scheduler")
@@ -1007,6 +1154,8 @@ def analyze(
             }
             if CELL_DEFINITION_ADAPTIVE_KEY in scheduler:
                 reported[CELL_DEFINITION_ADAPTIVE_KEY] = scheduler[CELL_DEFINITION_ADAPTIVE_KEY]
+            if CELL_DEFINITION_ARRIVAL_KEY in scheduler:
+                reported[CELL_DEFINITION_ARRIVAL_KEY] = scheduler[CELL_DEFINITION_ARRIVAL_KEY]
             try:
                 if normalize_cell_definition(reported) != cell:
                     problems.append(
@@ -1026,6 +1175,11 @@ def analyze(
                 if first.get(key) != other.get(key):
                     raise AnalyzerError(f"fairness mismatch on {key}")
     evidence_class = protocol["evidence_class"]
+    bootstrap_seed = BOOTSTRAP_SEED
+    if contrast is not None and contrast.get("bootstrap_seed") is not None:
+        bootstrap_seed = int(contrast["bootstrap_seed"])
+    elif protocol.get("contrast_id") == CONTRAST_ID_G2G4:
+        bootstrap_seed = G2G4_BOOTSTRAP_SEED
     pairs = []
     triples = []
     three_arm = contrast_id == CONTRAST_ID_AG2G3
@@ -1089,7 +1243,7 @@ def analyze(
             alternative_values,
             units=units,
             allow_interval=allow_interval,
-            seed=BOOTSTRAP_SEED,
+            seed=bootstrap_seed,
             replicates=BOOTSTRAP_REPLICATES,
             level=CONFIDENCE_LEVEL,
         )
@@ -1132,7 +1286,7 @@ def analyze(
             right_values,
             units=units,
             allow_interval=allow_interval,
-            seed=BOOTSTRAP_SEED,
+            seed=bootstrap_seed,
             replicates=BOOTSTRAP_REPLICATES,
             level=CONFIDENCE_LEVEL,
         )
@@ -1162,7 +1316,7 @@ def analyze(
         differences = [block["difference"] for block in latency["blocks"]]
         check = paired_block_bootstrap_mean(
             differences,
-            seed=BOOTSTRAP_SEED,
+            seed=bootstrap_seed,
             replicates=BOOTSTRAP_REPLICATES,
             level=CONFIDENCE_LEVEL,
         )
@@ -1219,6 +1373,17 @@ def analyze(
                 "Twenty blocks cannot provide perfect three-position rotation balance.",
             ]
         )
+    if contrast_id == CONTRAST_ID_G2G4:
+        limitations.extend(
+            [
+                "arrival_fidelity_status remains not_certified for the G2/G4 sparse study.",
+                "phase_boundary_fidelity remains unavailable.",
+                "The 5 ms coarse_max_lag_v1 screen is diagnostic and non-gating.",
+                "A missed lag screen does not reject an otherwise hard-valid trial.",
+                "Schema 3 only; completion timing and batch-decision timing stay off.",
+                "No automatic G4 superiority claim is made.",
+            ]
+        )
     experimental_unit = "three_arm_paired_block" if three_arm else "paired_block"
     aggregate = {
         "experiment_kind": EXPERIMENT_KIND,
@@ -1253,7 +1418,7 @@ def analyze(
         "arrival_screen_policy_version": protocol.get("arrival_screen_policy_version"),
         "bootstrap": {
             "method": "paired_block_bootstrap_mean",
-            "seed": BOOTSTRAP_SEED,
+            "seed": bootstrap_seed,
             "replicates": BOOTSTRAP_REPLICATES,
             "level": CONFIDENCE_LEVEL,
             "minimum_blocks": MINIMUM_INTERVAL_BLOCKS,

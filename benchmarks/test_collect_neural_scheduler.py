@@ -36,10 +36,16 @@ from benchmarks.collect_neural_scheduler import (
     CELL_DEFINITION_KEYS,
     CONTRAST_ID_AG2,
     CONTRAST_ID_AG2G3,
+    CONTRAST_ID_G2G4,
     CONTRAST_SIGN_G2_MINUS_A,
     CONTRAST_SIGN_G3_MINUS_A,
     CONTRAST_SIGN_G3_MINUS_G2,
+    CONTRAST_SIGN_G4_MINUS_G2,
     EXPERIMENT_KIND,
+    G2G4_BOOTSTRAP_SEED,
+    G2G4_DURATION_MS,
+    G2G4_OFFERED_RATE,
+    G2G4_WORKER_COUNT,
     NEURAL_LOCAL_CELLS,
     NEURAL_LOCAL_CELL_BY_ID,
     NEURAL_MODELS,
@@ -47,6 +53,7 @@ from benchmarks.collect_neural_scheduler import (
     REPORTABLE_CONTRAST_AC,
     REPORTABLE_CONTRAST_AG2,
     REPORTABLE_CONTRAST_AG2G3,
+    REPORTABLE_CONTRAST_G2G4,
     REPORTABLE_MODEL_ID,
     STRICT_CALIBRATION_VARIANTS,
     THREE_ARM_POSITION_COUNTS_20,
@@ -60,6 +67,7 @@ from benchmarks.collect_neural_scheduler import (
     coarse_max_lag_v1,
     collect,
     counted_runs_for,
+    enforce_reportable_measurement,
     evidence_class_for,
     model_contract,
     multi_request_batch_fraction,
@@ -83,6 +91,7 @@ from benchmarks.collect_scheduler import (
     BINARY_NAME,
     CELLS,
     CELL_BY_ID,
+    DEFAULT_MEASUREMENT,
     SCHEMA_VERSION,
     scheduler_command,
 )
@@ -3159,6 +3168,322 @@ class InstrumentedSparseCalibrationTest(unittest.TestCase):
         )
         self.assertNotIn("--batch-decision-timing", command)
         self.assertEqual(SCHEMA_VERSION, 3)
+
+
+class G2G4SparseReportableCollectorTest(unittest.TestCase):
+    def test_exact_g2g4_contrast_resolution(self) -> None:
+        contract = resolve_reportable_contrast(
+            model_id=REPORTABLE_MODEL_ID,
+            cell_ids=["G2", "G4"],
+            baseline_cell="G2",
+            alternative_cell="G4",
+            target_rps=G2G4_OFFERED_RATE,
+            counted_runs=20,
+            offered_rate_frozen=True,
+        )
+        self.assertEqual(contract["contrast_id"], CONTRAST_ID_G2G4)
+        self.assertEqual(contract["contrast_sign_convention"], CONTRAST_SIGN_G4_MINUS_G2)
+        self.assertEqual(contract["baseline_cell"], "G2")
+        self.assertEqual(contract["alternative_cell"], "G4")
+        self.assertEqual(contract["fixed_offered_rate"], 100.0)
+        self.assertEqual(contract["fixed_duration_ms"], G2G4_DURATION_MS)
+        self.assertEqual(contract["fixed_worker_count"], G2G4_WORKER_COUNT)
+        self.assertEqual(contract["bootstrap_seed"], G2G4_BOOTSTRAP_SEED)
+        self.assertIs(contract["arrival_screen_gating"], False)
+        self.assertTrue(contract["require_six_key_cell_definitions"])
+        self.assertEqual(set(contract["allow_neural_local_cells"]), {"G2", "G4"})
+        cells = resolve_neural_cells(
+            ["G2", "G4"], "reportable", reportable_contrast=REPORTABLE_CONTRAST_G2G4
+        )
+        self.assertEqual([cell["id"] for cell in cells], ["G2", "G4"])
+        self.assertFalse(adaptive_batching_for_cell(cells[0]))
+        self.assertFalse(arrival_aware_batching_for_cell(cells[0]))
+        self.assertFalse(adaptive_batching_for_cell(cells[1]))
+        self.assertTrue(arrival_aware_batching_for_cell(cells[1]))
+
+    def test_wrong_rate_duration_workers_blocks_and_frozen_flag(self) -> None:
+        with self.assertRaises(NeuralCollectorError) as rate:
+            resolve_reportable_contrast(
+                model_id=REPORTABLE_MODEL_ID,
+                cell_ids=["G2", "G4"],
+                baseline_cell="G2",
+                alternative_cell="G4",
+                target_rps=50.0,
+                counted_runs=20,
+                offered_rate_frozen=True,
+            )
+        self.assertIn("100", str(rate.exception))
+        with self.assertRaises(NeuralCollectorError) as frozen:
+            resolve_reportable_contrast(
+                model_id=REPORTABLE_MODEL_ID,
+                cell_ids=["G2", "G4"],
+                baseline_cell="G2",
+                alternative_cell="G4",
+                target_rps=G2G4_OFFERED_RATE,
+                counted_runs=20,
+                offered_rate_frozen=False,
+            )
+        self.assertIn("frozen", str(frozen.exception))
+        with self.assertRaises(NeuralCollectorError) as blocks:
+            resolve_reportable_contrast(
+                model_id=REPORTABLE_MODEL_ID,
+                cell_ids=["G2", "G4"],
+                baseline_cell="G2",
+                alternative_cell="G4",
+                target_rps=G2G4_OFFERED_RATE,
+                counted_runs=10,
+                offered_rate_frozen=True,
+            )
+        self.assertIn("20", str(blocks.exception))
+        measurement = dict(DEFAULT_MEASUREMENT)
+        measurement["duration_ms"] = 1000
+        with self.assertRaises(NeuralCollectorError) as duration:
+            enforce_reportable_measurement(REPORTABLE_CONTRAST_G2G4, measurement)
+        self.assertIn("duration_ms", str(duration.exception))
+        measurement["duration_ms"] = G2G4_DURATION_MS
+        measurement["worker_count"] = 2
+        with self.assertRaises(NeuralCollectorError) as workers:
+            enforce_reportable_measurement(REPORTABLE_CONTRAST_G2G4, measurement)
+        self.assertIn("worker_count", str(workers.exception))
+        args = build_parser().parse_args(
+            [
+                "--binary",
+                "/tmp/x",
+                "--repo-root",
+                ".",
+                "--expected-commit",
+                COMMIT,
+                "--mode",
+                "reportable",
+                "--model-id",
+                REPORTABLE_MODEL_ID,
+                "--cells",
+                "G2,G4",
+                "--target-rps",
+                "100",
+                "--counted-runs",
+                "20",
+                "--offered-rate-frozen",
+            ]
+        )
+        with self.assertRaises(NeuralCollectorError) as missing_duration:
+            validate_reportable_args(args)
+        self.assertIn("duration_ms", str(missing_duration.exception))
+
+    def test_wrong_cell_order_baseline_alternative_and_unrelated_g4(self) -> None:
+        with self.assertRaises(NeuralCollectorError):
+            resolve_reportable_contrast(
+                model_id=REPORTABLE_MODEL_ID,
+                cell_ids=["G4", "G2"],
+                baseline_cell="G4",
+                alternative_cell="G2",
+                target_rps=G2G4_OFFERED_RATE,
+                counted_runs=20,
+                offered_rate_frozen=True,
+            )
+        with self.assertRaises(NeuralCollectorError) as baseline:
+            resolve_reportable_contrast(
+                model_id=REPORTABLE_MODEL_ID,
+                cell_ids=["G2", "G4"],
+                baseline_cell="G4",
+                alternative_cell="G2",
+                target_rps=G2G4_OFFERED_RATE,
+                counted_runs=20,
+                offered_rate_frozen=True,
+            )
+        self.assertIn("baseline G2", str(baseline.exception))
+        with self.assertRaises(NeuralCollectorError):
+            resolve_reportable_contrast(
+                model_id=REPORTABLE_MODEL_ID,
+                cell_ids=["A", "G4"],
+                baseline_cell="A",
+                alternative_cell="G4",
+                target_rps=G2G4_OFFERED_RATE,
+                counted_runs=20,
+                offered_rate_frozen=True,
+            )
+        with self.assertRaises(NeuralCollectorError):
+            resolve_neural_cells(
+                ["G2", "G4"], "reportable", reportable_contrast=REPORTABLE_CONTRAST_AG2
+            )
+        for contrast in (
+            REPORTABLE_CONTRAST_AC,
+            REPORTABLE_CONTRAST_AG2,
+            REPORTABLE_CONTRAST_AG2G3,
+        ):
+            self.assertNotIn("G4", contrast["allow_neural_local_cells"])
+
+    def test_timing_instrumentation_rejected(self) -> None:
+        measurement = dict(DEFAULT_MEASUREMENT)
+        measurement["duration_ms"] = G2G4_DURATION_MS
+        measurement["enable_batch_decision_timing"] = True
+        measurement["batch_decision_event_capacity"] = 1024
+        with self.assertRaises(NeuralCollectorError) as raised:
+            enforce_reportable_measurement(REPORTABLE_CONTRAST_G2G4, measurement)
+        self.assertIn("batch-decision", str(raised.exception))
+        measurement = dict(DEFAULT_MEASUREMENT)
+        measurement["duration_ms"] = G2G4_DURATION_MS
+        measurement["enable_completion_timing"] = True
+        with self.assertRaises(NeuralCollectorError) as completion:
+            enforce_reportable_measurement(REPORTABLE_CONTRAST_G2G4, measurement)
+        self.assertIn("completion", str(completion.exception))
+
+    def test_six_key_and_historical_key_shapes(self) -> None:
+        cells = resolve_neural_cells(
+            ["G2", "G4"], "reportable", reportable_contrast=REPORTABLE_CONTRAST_G2G4
+        )
+        six = serialize_cell_definitions(
+            cells, include_adaptive=True, include_arrival_aware=True
+        )
+        self.assertEqual(len(six), 2)
+        for entry in six:
+            self.assertEqual(len(entry), 6)
+            self.assertIn(CELL_DEFINITION_ADAPTIVE_KEY, entry)
+            self.assertIn(CELL_DEFINITION_ARRIVAL_KEY, entry)
+        self.assertIs(six[0][CELL_DEFINITION_ADAPTIVE_KEY], False)
+        self.assertIs(six[0][CELL_DEFINITION_ARRIVAL_KEY], False)
+        self.assertIs(six[1][CELL_DEFINITION_ADAPTIVE_KEY], False)
+        self.assertIs(six[1][CELL_DEFINITION_ARRIVAL_KEY], True)
+        self.assertEqual(
+            REPORTABLE_CONTRAST_AC["expected_cells"]["A"].keys(), set(CELL_DEFINITION_KEYS)
+        )
+        self.assertEqual(
+            REPORTABLE_CONTRAST_AG2["expected_cells"]["G2"].keys(), set(CELL_DEFINITION_KEYS)
+        )
+        self.assertEqual(
+            set(REPORTABLE_CONTRAST_AG2G3["expected_cells"]["G3"].keys()),
+            set(CELL_DEFINITION_KEYS) | {CELL_DEFINITION_ADAPTIVE_KEY},
+        )
+        self.assertEqual(
+            set(REPORTABLE_CONTRAST_G2G4["expected_cells"]["G4"].keys()),
+            set(CELL_DEFINITION_KEYS)
+            | {CELL_DEFINITION_ADAPTIVE_KEY, CELL_DEFINITION_ARRIVAL_KEY},
+        )
+
+    def test_protocol2_pilots_rotation_and_forty_two_trials(self) -> None:
+        cells = resolve_neural_cells(
+            ["G2", "G4"], "reportable", reportable_contrast=REPORTABLE_CONTRAST_G2G4
+        )
+        profiles = [open_loop_profile("neural_open", G2G4_OFFERED_RATE)]
+        plan = build_plan(cells, profiles, 20)
+        self.assertEqual(len(plan), 42)
+        pilots = [trial for trial in plan if trial["pilot"]]
+        counted = [trial for trial in plan if not trial["pilot"]]
+        self.assertEqual([trial["cell_id"] for trial in pilots], ["G2", "G4"])
+        self.assertEqual(len(counted), 40)
+        for block_index in range(1, 21):
+            rows = [trial for trial in counted if trial["block_index"] == block_index]
+            cell_ids = [trial["cell_id"] for trial in rows]
+            if block_index % 2 == 1:
+                self.assertEqual(cell_ids, ["G2", "G4"])
+            else:
+                self.assertEqual(cell_ids, ["G4", "G2"])
+            self.assertEqual(len(set(cell_ids)), 2)
+
+    def test_non_gating_lag_screen_and_strict_primary_gate(self) -> None:
+        self.assertIs(REPORTABLE_CONTRAST_G2G4["arrival_screen_gating"], False)
+        document = sample_report()
+        document["generator_lag"]["maximum_nanoseconds"] = ARRIVAL_SCREEN_MAX_LAG_NS + 1
+        self.assertIs(coarse_max_lag_v1(document), False)
+        self.assertTrue(arrival_screen_problems(document, ARRIVAL_SCREEN_MAX_LAG_NS))
+        document["generator"]["warmup_requests"] = 100
+        document["scheduler"]["enable_batching"] = True
+        document["scheduler"]["max_batch_size"] = 4
+        document["scheduler"]["max_batch_delay_ms"] = 2
+        document["scheduler"]["adaptive_batching"] = False
+        document["scheduler"]["arrival_aware_batching"] = True
+        expected = {
+            "model_path": document["model"],
+            "workload": "open_loop_constant",
+            "worker_count": 1,
+            "queue_capacity": 64,
+            "enable_batching": True,
+            "max_batch_size": 4,
+            "max_batch_delay_ms": 2,
+            "adaptive_batching": False,
+            "arrival_aware_batching": True,
+            "require_adaptive_batching_field": True,
+            "require_arrival_aware_batching_field": True,
+            "warmup_requests": 100,
+            "check_interval": 1,
+            "duration_ms": 1000,
+            "lag_tolerance_ms": 1000,
+            "comparison_class": "primary",
+            "analysis_protocol_version": 2,
+            "target_rps": G2G4_OFFERED_RATE,
+        }
+        _doc, status, problems = validate_trial(
+            dump_report(document),
+            expected=expected,
+            mode="reportable",
+            require_zero_rejections=True,
+            arrival_screen_max_lag_ns=None,
+            require_strict_generator_delivery=True,
+        )
+        self.assertEqual(problems, [])
+        self.assertEqual(status["delivery_class"], "STRICT_PRIMARY")
+
+    def test_validate_reportable_args_g2g4_path(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--binary",
+                "/tmp/x",
+                "--repo-root",
+                ".",
+                "--expected-commit",
+                COMMIT,
+                "--mode",
+                "reportable",
+                "--model-id",
+                REPORTABLE_MODEL_ID,
+                "--cells",
+                "G2,G4",
+                "--target-rps",
+                "100",
+                "--counted-runs",
+                "20",
+                "--duration-ms",
+                "5000",
+                "--offered-rate-frozen",
+            ]
+        )
+        contract = validate_reportable_args(args)
+        self.assertEqual(contract["contrast_id"], CONTRAST_ID_G2G4)
+
+    def test_historical_contrasts_unchanged(self) -> None:
+        ac = resolve_reportable_contrast(
+            model_id=REPORTABLE_MODEL_ID,
+            cell_ids=["A", "C"],
+            baseline_cell=None,
+            alternative_cell=None,
+            target_rps=90.0,
+            counted_runs=10,
+            offered_rate_frozen=True,
+        )
+        self.assertEqual(ac["contrast_id"], "gemm_f32_A_vs_C")
+        ag2 = resolve_reportable_contrast(
+            model_id=REPORTABLE_MODEL_ID,
+            cell_ids=["A", "G2"],
+            baseline_cell="A",
+            alternative_cell="G2",
+            target_rps=AG2_OFFERED_RATE,
+            counted_runs=20,
+            offered_rate_frozen=True,
+        )
+        self.assertEqual(ag2["contrast_id"], CONTRAST_ID_AG2)
+        self.assertEqual(ag2["contrast_sign_convention"], CONTRAST_SIGN_G2_MINUS_A)
+        ag2g3 = resolve_reportable_contrast(
+            model_id=REPORTABLE_MODEL_ID,
+            cell_ids=["A", "G2", "G3"],
+            baseline_cell="G2",
+            alternative_cell="G3",
+            target_rps=AG2G3_OFFERED_RATE,
+            counted_runs=20,
+            offered_rate_frozen=True,
+        )
+        self.assertEqual(ag2g3["contrast_id"], CONTRAST_ID_AG2G3)
+        self.assertEqual(ag2g3["contrast_sign_convention"], CONTRAST_SIGN_G3_MINUS_G2)
+        self.assertNotEqual(G2G4_BOOTSTRAP_SEED, 20261013)
 
 
 if __name__ == "__main__":
