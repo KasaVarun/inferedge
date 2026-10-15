@@ -1388,5 +1388,237 @@ class AdaptiveIdentityValidationTest(unittest.TestCase):
         self.assertTrue(status["collector_valid"])
 
 
+def schema5_batch_decision(
+    *,
+    capacity: int = 1024,
+    events: list[dict] | None = None,
+    sealed: int | None = None,
+    recorded: int | None = None,
+    dropped: int = 0,
+    overflow: bool = False,
+    timing_valid: bool = True,
+) -> dict:
+    event_list = [] if events is None else list(events)
+    if recorded is None:
+        recorded = len(event_list)
+    if sealed is None:
+        sealed = recorded + dropped
+    return {
+        "enabled": True,
+        "clock": "steady_clock",
+        "timestamp_unit": "nanoseconds",
+        "timestamp_epoch": "steady_clock_time_since_epoch",
+        "buffer_capacity_per_worker": capacity,
+        "sealed_batches_total": sealed,
+        "events_recorded": recorded,
+        "events_dropped": dropped,
+        "trace_overflow": overflow,
+        "timing_data_valid": timing_valid,
+        "events": event_list,
+    }
+
+
+def schema5_event(
+    batch_id: int = 1,
+    worker_index: int = 0,
+    open_ns: int = 10,
+    seal_ns: int = 20,
+    batch_size: int = 1,
+    seal_reason: str = "deadline_expired",
+) -> dict:
+    return {
+        "batch_id": batch_id,
+        "worker_index": worker_index,
+        "batch_open_ns": open_ns,
+        "batch_seal_ns": seal_ns,
+        "batch_size": batch_size,
+        "seal_reason": seal_reason,
+    }
+
+
+def schema5_report(**overrides) -> dict:
+    document = sample_report()
+    document["schema_version"] = 5
+    document["scheduler"] = dict(document["scheduler"])
+    document["scheduler"]["enable_batch_decision_timing"] = True
+    document["scheduler"]["batch_decision_event_capacity"] = 1024
+    document["batch_decision"] = schema5_batch_decision(
+        events=[schema5_event()],
+    )
+    # One sealed size-one batch aligns with default engine_run_count when tests
+    # shrink the cohort; leave accounting for callers that need full cohorts.
+    document.update(overrides)
+    return document
+
+
+def schema5_expected(**overrides) -> dict:
+    return expected_launch(
+        enable_batch_decision_timing=True,
+        batch_decision_event_capacity=1024,
+        **overrides,
+    )
+
+
+class Schema5ValidationTest(unittest.TestCase):
+    def test_schema3_rejects_instrumentation_fields(self) -> None:
+        document = sample_report()
+        document["scheduler"] = dict(document["scheduler"])
+        document["scheduler"]["enable_batch_decision_timing"] = False
+        document["scheduler"]["batch_decision_event_capacity"] = 0
+        problems = problems_for(document)
+        self.assertTrue(any("unexpected" in item for item in problems))
+
+    def test_schema4_rejects_batch_decision_object(self) -> None:
+        document = schema4_report()
+        document["batch_decision"] = schema5_batch_decision()
+        document["scheduler"]["enable_batch_decision_timing"] = True
+        document["scheduler"]["batch_decision_event_capacity"] = 1024
+        _report, status = classify_report(
+            dump_report(document),
+            expected=expected_launch(analysis_protocol_version=3),
+        )
+        self.assertFalse(status["collector_valid"])
+        self.assertTrue(any("unexpected" in item for item in status["problems"]))
+
+    def test_schema5_accepts_valid_trace(self) -> None:
+        document = schema5_report()
+        document["scheduler"]["enable_batching"] = True
+        document["scheduler"]["max_batch_size"] = 4
+        document["metrics"]["engine_run_count"] = 1
+        document["metrics"]["requests_entered_engine_runs"] = 1
+        document["metrics"]["batch_size_histogram"] = [0, 1] + [0] * 31
+        document["succeeded"] = 1
+        document["accepted"] = 1
+        document["submit_attempts"] = 1
+        document["scheduled_opportunities"] = 1
+        document["correctness_checked"] = 1
+        document["generator_lag"]["count"] = 1
+        document["successful_e2e_latency"]["sample_count"] = 1
+        document["successful_e2e_latency"]["precise_tail"] = False
+        document["burst_phases"] = [
+            {
+                "index": 0,
+                "requests_per_second": 50.0,
+                "duration_nanoseconds": 1_000_000_000,
+                "scheduled_opportunities": 1,
+            }
+        ]
+        _report, status = classify_report(
+            dump_report(document),
+            expected=schema5_expected(enable_batching=True, max_batch_size=4),
+        )
+        self.assertEqual(status["problems"], [], status["problems"])
+        self.assertTrue(status["collector_valid"])
+
+    def test_schema5_zero_event_trace(self) -> None:
+        document = schema5_report()
+        document["batch_decision"] = schema5_batch_decision(events=[])
+        _report, status = classify_report(
+            dump_report(document),
+            expected=schema5_expected(),
+        )
+        self.assertEqual(status["problems"], [], status["problems"])
+
+    def test_schema5_rejects_bool_as_int_and_unknown_reason(self) -> None:
+        document = schema5_report()
+        document["batch_decision"]["events_recorded"] = True
+        problems = problems_for(
+            document,
+            enable_batch_decision_timing=True,
+            batch_decision_event_capacity=1024,
+            enable_batching=True,
+            max_batch_size=4,
+        )
+        self.assertTrue(any("events_recorded" in item for item in problems))
+        document = schema5_report()
+        document["batch_decision"]["events"][0]["seal_reason"] = "mystery"
+        problems = problems_for(
+            document,
+            enable_batch_decision_timing=True,
+            batch_decision_event_capacity=1024,
+            enable_batching=True,
+            max_batch_size=4,
+        )
+        self.assertTrue(any("unknown" in item for item in problems))
+
+    def test_schema5_rejects_negative_order_duplicate_and_overflow_claimed_valid(self) -> None:
+        document = schema5_report()
+        document["batch_decision"]["events"][0]["batch_open_ns"] = 50
+        document["batch_decision"]["events"][0]["batch_seal_ns"] = 40
+        problems = problems_for(
+            document,
+            enable_batch_decision_timing=True,
+            batch_decision_event_capacity=1024,
+            enable_batching=True,
+            max_batch_size=4,
+        )
+        self.assertTrue(any("precedes" in item for item in problems))
+        document = schema5_report()
+        document["batch_decision"] = schema5_batch_decision(
+            events=[schema5_event(1), schema5_event(1, open_ns=30, seal_ns=40)]
+        )
+        problems = problems_for(
+            document,
+            enable_batch_decision_timing=True,
+            batch_decision_event_capacity=1024,
+            enable_batching=True,
+            max_batch_size=4,
+        )
+        self.assertTrue(any("unique" in item for item in problems))
+        document = schema5_report()
+        document["batch_decision"] = schema5_batch_decision(
+            events=[schema5_event()],
+            overflow=True,
+            timing_valid=True,
+        )
+        problems = problems_for(
+            document,
+            enable_batch_decision_timing=True,
+            batch_decision_event_capacity=1024,
+            enable_batching=True,
+            max_batch_size=4,
+        )
+        self.assertTrue(any("overflow" in item for item in problems))
+
+    def test_schema5_with_completion_timing(self) -> None:
+        document = schema4_report()
+        document["schema_version"] = 5
+        document["scheduler"]["enable_batch_decision_timing"] = True
+        document["scheduler"]["batch_decision_event_capacity"] = 1024
+        document["batch_decision"] = schema5_batch_decision(events=[])
+        _report, status = classify_report(
+            dump_report(document),
+            expected=expected_launch(
+                analysis_protocol_version=3,
+                enable_batch_decision_timing=True,
+                batch_decision_event_capacity=1024,
+            ),
+        )
+        self.assertEqual(status["problems"], [], status["problems"])
+        self.assertTrue(status["collector_valid"])
+        missing = dict(document)
+        del missing["pre_publication_latency"]
+        _report, rejected = classify_report(
+            dump_report(missing),
+            expected=expected_launch(
+                analysis_protocol_version=3,
+                enable_batch_decision_timing=True,
+                batch_decision_event_capacity=1024,
+            ),
+        )
+        self.assertFalse(rejected["collector_valid"])
+
+    def test_schema5_capacity_mismatch(self) -> None:
+        document = schema5_report()
+        document["batch_decision"]["buffer_capacity_per_worker"] = 8
+        document["scheduler"]["batch_decision_event_capacity"] = 8
+        problems = problems_for(
+            document,
+            enable_batch_decision_timing=True,
+            batch_decision_event_capacity=1024,
+        )
+        self.assertTrue(any("capacity" in item for item in problems))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -64,6 +64,7 @@ TOOL_VERSION = "0.1.0"
 BINARY_NAME = "inferedge-bench-scheduler"
 SCHEMA_VERSION = 3
 PRECISION_SCHEMA_VERSION = 4
+BATCH_DECISION_SCHEMA_VERSION = 5
 MODEL_RELATIVE = "models/batch_add_f32.onnx"
 MODEL_SHA256 = "f33bbe0ad5420419dd2dbb5322f4172e213b854f1124c660b1d732e8f8ce3b23"
 OUTPUT_ROOT_RELATIVE = "benchmarks/scheduler_runs"
@@ -263,6 +264,38 @@ SCHEMA4_EXTRA_KEYS = (
     "steady_clock_period_note",
     "phase_boundary_fidelity",
     "timing_outcome_counts",
+)
+SCHEMA5_EXTRA_KEYS = ("batch_decision",)
+BATCH_DECISION_KEYS = (
+    "enabled",
+    "clock",
+    "timestamp_unit",
+    "timestamp_epoch",
+    "buffer_capacity_per_worker",
+    "sealed_batches_total",
+    "events_recorded",
+    "events_dropped",
+    "trace_overflow",
+    "timing_data_valid",
+    "events",
+)
+BATCH_DECISION_EVENT_KEYS = (
+    "batch_id",
+    "worker_index",
+    "batch_open_ns",
+    "batch_seal_ns",
+    "batch_size",
+    "seal_reason",
+)
+BATCH_SEAL_REASONS = frozenset(
+    {
+        "capacity_reached",
+        "deadline_expired",
+        "g3_minimum_target",
+        "g4_arrival_aware",
+        "queue_closed",
+        "shutdown_or_other",
+    }
 )
 TIMING_SUMMARY_KEYS = (
     "definition",
@@ -893,6 +926,34 @@ def analysis_protocol_of(expected: dict) -> int:
     return int(value)
 
 
+def completion_timing_required(expected: dict) -> bool:
+    """True when schema-4 completion-timing sections are required."""
+    return analysis_protocol_of(expected) == 3 or expected.get("completion_timing") is True
+
+
+def expected_schema_version(expected: dict) -> int:
+    """Select schema 3, 4, or 5 from the effective expected launch contract.
+
+    Batch-decision timing selects schema 5 even when completion timing is also
+    required. Protocol 3 alone still selects schema 4. Legacy protocol 1/2 keep
+    schema 3 when instrumentation is off.
+    """
+    if expected.get("enable_batch_decision_timing") is True:
+        return BATCH_DECISION_SCHEMA_VERSION
+    if completion_timing_required(expected):
+        return PRECISION_SCHEMA_VERSION
+    return SCHEMA_VERSION
+
+
+def top_level_keys_for_expected(expected: dict) -> tuple[str, ...]:
+    keys = list(TOP_LEVEL_KEYS)
+    if completion_timing_required(expected):
+        keys.extend(SCHEMA4_EXTRA_KEYS)
+    if expected_schema_version(expected) == BATCH_DECISION_SCHEMA_VERSION:
+        keys.extend(SCHEMA5_EXTRA_KEYS)
+    return tuple(keys)
+
+
 def strict_arrival_window_problems(
     configured: int,
     span: int,
@@ -1205,17 +1266,18 @@ def _arrival_fidelity(document: dict, expected: dict) -> tuple[str, list[str]]:
 
 
 def _check_document(document: dict, expected: dict, problems: list[str]) -> None:
-    protocol = analysis_protocol_of(expected)
-    keys = TOP_LEVEL_KEYS + SCHEMA4_EXTRA_KEYS if protocol == 3 else TOP_LEVEL_KEYS
+    keys = top_level_keys_for_expected(expected)
     require_exact_keys(document, keys, "report", problems)
     if problems:
         return
     schema = json_integer(document["schema_version"], "schema_version", problems)
-    expected_schema = PRECISION_SCHEMA_VERSION if protocol == 3 else SCHEMA_VERSION
+    expected_schema = expected_schema_version(expected)
     if schema is not None and schema != expected_schema:
         problems.append(f"schema_version is {schema}, expected {expected_schema}")
-    if protocol == 3:
+    if completion_timing_required(expected):
         _check_precision(document, problems)
+    if expected_schema == BATCH_DECISION_SCHEMA_VERSION:
+        _check_batch_decision(document, expected, problems)
     if document["tool"] != TOOL_NAME:
         problems.append(f"tool is {document['tool']!r}, expected {TOOL_NAME!r}")
     if document["tool_version"] != TOOL_VERSION:
@@ -1307,8 +1369,10 @@ def _scheduler_keys_for_expected(expected: dict, scheduler: dict) -> tuple[str, 
         base = SCHEDULER_KEYS_WITH_ADAPTIVE
     else:
         base = SCHEDULER_KEYS
-    if analysis_protocol_of(expected) == 3:
-        return base + ("enable_completion_timing",)
+    if completion_timing_required(expected):
+        base = base + ("enable_completion_timing",)
+    if expected.get("enable_batch_decision_timing") is True:
+        base = base + ("enable_batch_decision_timing", "batch_decision_event_capacity")
     return base
 
 
@@ -1328,14 +1392,36 @@ def _check_scheduler(document: dict, expected: dict, problems: list[str]) -> Non
     require_exact_keys(scheduler, scheduler_keys, "scheduler", problems)
     if any(key not in scheduler for key in scheduler_keys):
         return
-    if analysis_protocol_of(expected) == 3:
+    if completion_timing_required(expected):
         timing = _bool(
             scheduler.get("enable_completion_timing"),
             "scheduler.enable_completion_timing",
             problems,
         )
         if timing is not True:
-            problems.append("protocol 3 requires completion timing")
+            problems.append("completion timing requires scheduler.enable_completion_timing")
+    if expected.get("enable_batch_decision_timing") is True:
+        decision = _bool(
+            scheduler.get("enable_batch_decision_timing"),
+            "scheduler.enable_batch_decision_timing",
+            problems,
+        )
+        if decision is not True:
+            problems.append("schema 5 requires scheduler.enable_batch_decision_timing")
+        capacity = _nonnegative_int(
+            scheduler.get("batch_decision_event_capacity"),
+            "scheduler.batch_decision_event_capacity",
+            problems,
+        )
+        expected_capacity = expected.get("batch_decision_event_capacity")
+        if (
+            capacity is not None
+            and type(expected_capacity) is int
+            and capacity != expected_capacity
+        ):
+            problems.append(
+                "scheduler.batch_decision_event_capacity does not match the launch capacity"
+            )
     for label, expected_value in (
         ("worker_count", expected["worker_count"]),
         ("queue_capacity", expected["queue_capacity"]),
@@ -1424,7 +1510,7 @@ def _check_lag(document: dict, expected: dict, problems: list[str]) -> None:
     lag = _object(document["generator_lag"], "generator_lag", problems)
     if lag is None:
         return
-    lag_keys = LAG4_KEYS if analysis_protocol_of(expected) == 3 else LAG_KEYS
+    lag_keys = LAG4_KEYS if completion_timing_required(expected) else LAG_KEYS
     require_exact_keys(lag, lag_keys, "generator_lag", problems)
     if any(key not in lag for key in lag_keys):
         return
@@ -1436,7 +1522,7 @@ def _check_lag(document: dict, expected: dict, problems: list[str]) -> None:
         return
     if minimum is not None and maximum is not None and minimum > maximum:
         problems.append("generator lag minimum exceeds maximum")
-    if analysis_protocol_of(expected) == 3:
+    if completion_timing_required(expected):
         p50 = json_integer(lag["p50_nanoseconds"], "generator_lag.p50_nanoseconds", problems)
         p95 = json_integer(lag["p95_nanoseconds"], "generator_lag.p95_nanoseconds", problems)
         p99 = json_integer(lag["p99_nanoseconds"], "generator_lag.p99_nanoseconds", problems)
@@ -1450,6 +1536,116 @@ def _check_lag(document: dict, expected: dict, problems: list[str]) -> None:
             problems.append("signed lag percentiles are not ordered")
         if count is not None and count < 100 and lag.get("precise_tail") is True:
             problems.append("generator lag precise_tail is true below 100 samples")
+
+
+def _check_batch_decision(document: dict, expected: dict, problems: list[str]) -> None:
+    """Structural schema-5 batch_decision validation. Policy accounting is neural-local."""
+    snap = _object(document.get("batch_decision"), "batch_decision", problems)
+    if snap is None:
+        return
+    require_exact_keys(snap, BATCH_DECISION_KEYS, "batch_decision", problems)
+    if any(key not in snap for key in BATCH_DECISION_KEYS):
+        return
+    enabled = _bool(snap["enabled"], "batch_decision.enabled", problems)
+    if enabled is not True:
+        problems.append("batch_decision.enabled must be true for schema 5")
+    if snap.get("clock") != "steady_clock":
+        problems.append("batch_decision.clock must be steady_clock")
+    if snap.get("timestamp_unit") != "nanoseconds":
+        problems.append("batch_decision.timestamp_unit must be nanoseconds")
+    if snap.get("timestamp_epoch") != "steady_clock_time_since_epoch":
+        problems.append(
+            "batch_decision.timestamp_epoch must be steady_clock_time_since_epoch"
+        )
+    capacity = _nonnegative_int(
+        snap["buffer_capacity_per_worker"],
+        "batch_decision.buffer_capacity_per_worker",
+        problems,
+    )
+    expected_capacity = expected.get("batch_decision_event_capacity")
+    if (
+        capacity is not None
+        and type(expected_capacity) is int
+        and capacity != expected_capacity
+    ):
+        problems.append(
+            "batch_decision.buffer_capacity_per_worker does not match the launch capacity"
+        )
+    sealed = _nonnegative_int(
+        snap["sealed_batches_total"], "batch_decision.sealed_batches_total", problems
+    )
+    recorded = _nonnegative_int(
+        snap["events_recorded"], "batch_decision.events_recorded", problems
+    )
+    dropped = _nonnegative_int(
+        snap["events_dropped"], "batch_decision.events_dropped", problems
+    )
+    overflow = _bool(snap["trace_overflow"], "batch_decision.trace_overflow", problems)
+    timing_valid = _bool(
+        snap["timing_data_valid"], "batch_decision.timing_data_valid", problems
+    )
+    events = snap.get("events")
+    if not isinstance(events, list):
+        problems.append("batch_decision.events is not a list")
+        return
+    if recorded is not None and recorded != len(events):
+        problems.append("batch_decision.events length must equal events_recorded")
+    if (
+        recorded is not None
+        and dropped is not None
+        and sealed is not None
+        and recorded + dropped != sealed
+    ):
+        problems.append(
+            "batch_decision recorded+dropped must equal sealed_batches_total"
+        )
+    if overflow is True and timing_valid is True:
+        problems.append("batch_decision.timing_data_valid must be false when overflow")
+    if dropped is not None and dropped > 0 and timing_valid is True:
+        problems.append("batch_decision.timing_data_valid must be false when events dropped")
+    worker_count = expected.get("worker_count")
+    max_batch = expected.get("max_batch_size")
+    seen_ids: set[int] = set()
+    for index, event in enumerate(events):
+        label = f"batch_decision.events[{index}]"
+        item = _object(event, label, problems)
+        if item is None:
+            continue
+        require_exact_keys(item, BATCH_DECISION_EVENT_KEYS, label, problems)
+        if any(key not in item for key in BATCH_DECISION_EVENT_KEYS):
+            continue
+        batch_id = _nonnegative_int(item["batch_id"], f"{label}.batch_id", problems)
+        worker_index = _nonnegative_int(
+            item["worker_index"], f"{label}.worker_index", problems
+        )
+        open_ns = json_integer(item["batch_open_ns"], f"{label}.batch_open_ns", problems)
+        seal_ns = json_integer(item["batch_seal_ns"], f"{label}.batch_seal_ns", problems)
+        batch_size = _nonnegative_int(item["batch_size"], f"{label}.batch_size", problems)
+        reason = item.get("seal_reason")
+        if type(reason) is not str:
+            problems.append(f"{label}.seal_reason is not a string")
+        elif reason not in BATCH_SEAL_REASONS:
+            problems.append(f"{label}.seal_reason is unknown: {reason!r}")
+        if batch_size is not None and batch_size < 1:
+            problems.append(f"{label}.batch_size must be at least 1")
+        if (
+            batch_size is not None
+            and type(max_batch) is int
+            and batch_size > max_batch
+        ):
+            problems.append(f"{label}.batch_size exceeds configured maximum")
+        if open_ns is not None and seal_ns is not None and seal_ns < open_ns:
+            problems.append(f"{label} seal timestamp precedes open")
+        if (
+            worker_index is not None
+            and type(worker_count) is int
+            and worker_index >= worker_count
+        ):
+            problems.append(f"{label}.worker_index is out of range")
+        if batch_id is not None:
+            if batch_id in seen_ids:
+                problems.append(f"{label}.batch_id is not unique")
+            seen_ids.add(batch_id)
 
 
 def _check_latency(document: dict, problems: list[str]) -> None:

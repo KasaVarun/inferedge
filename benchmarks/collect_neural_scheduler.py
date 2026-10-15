@@ -49,6 +49,7 @@ from benchmarks.collect_baseline import (
 from benchmarks.collect_concurrent import hardware_metadata, release_optimization_problems
 from benchmarks.collect_scheduler import (
     ALLOWED_UNTRACKED,
+    BATCH_DECISION_SCHEMA_VERSION,
     BINARY_NAME,
     BLOCK_PROTOCOL,
     BOOTSTRAP_REPLICATES,
@@ -63,6 +64,7 @@ from benchmarks.collect_scheduler import (
     STATISTICAL_METHOD,
     TOOL_VERSION,
     classify_report,
+    expected_schema_version,
     execution_plan,
     locate_build_dir,
     require_commit_sha,
@@ -123,6 +125,9 @@ CALIBRATION_VARIANT_NONZERO_BATCH_DELAY_V1 = "nonzero_batch_delay_v1"
 CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1 = "adaptive_early_seal_v1"
 CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1 = "arrival_aware_batching_v1"
 CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_V1 = "arrival_aware_sparse_v1"
+CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_INSTRUMENTED_V1 = (
+    "arrival_aware_sparse_instrumented_v1"
+)
 ADAPTIVE_EARLY_SEAL_CELLS = ("A", "G2", "G3")
 ARRIVAL_AWARE_BATCHING_CELLS = ("A", "G2", "G3", "G4")
 ADAPTIVE_EARLY_SEAL_RATE = 1000.0
@@ -133,13 +138,21 @@ ARRIVAL_AWARE_BATCHING_DURATION_MS = 1000
 ARRIVAL_AWARE_SPARSE_RATES = frozenset({50.0, 100.0})
 ARRIVAL_AWARE_SPARSE_DURATION_MS = 5000
 ARRIVAL_AWARE_SPARSE_COUNTED_RUNS = 1
+ARRIVAL_AWARE_SPARSE_INSTRUMENTED_RATE = 100.0
+ARRIVAL_AWARE_SPARSE_INSTRUMENTED_DURATION_MS = 5000
+ARRIVAL_AWARE_SPARSE_INSTRUMENTED_COUNTED_RUNS = 1
+ARRIVAL_AWARE_SPARSE_INSTRUMENTED_CAPACITY = 1024
 STRICT_CALIBRATION_VARIANTS = frozenset(
     {
         CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1,
         CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1,
         CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_V1,
+        CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_INSTRUMENTED_V1,
     }
 )
+SEAL_REASONS_FORBIDDEN_G2 = frozenset({"g3_minimum_target", "g4_arrival_aware"})
+SEAL_REASONS_FORBIDDEN_G3 = frozenset({"g4_arrival_aware"})
+SEAL_REASONS_FORBIDDEN_G4 = frozenset({"g3_minimum_target"})
 CELL_DEFINITION_KEYS = ("id", "enable_batching", "max_batch_size", "max_batch_delay_ms")
 CELL_DEFINITION_ADAPTIVE_KEY = "adaptive_batching"
 CELL_DEFINITION_ARRIVAL_KEY = "arrival_aware_batching"
@@ -593,10 +606,13 @@ def resolve_calibration_variant(
 
     G4 cell set A,G2,G3,G4 dispatches exactly:
     - arrival_aware_batching_v1: gemm_f32, 1000 RPS, duration_ms=1000, workers=1,
-      counted_runs=1 (E7 plumbing contract)
+      counted_runs=1, instrumentation OFF (E7 plumbing contract)
     - arrival_aware_sparse_v1: gemm_f32, target_rps in {50,100}, duration_ms=5000,
-      workers=1, counted_runs=1 (one rate per run set)
-    Any other G4 rate/duration combination is rejected. G3 adaptive_early_seal_v1
+      workers=1, counted_runs=1, instrumentation OFF
+    - arrival_aware_sparse_instrumented_v1: gemm_f32, 100 RPS, duration_ms=5000,
+      workers=1, counted_runs=1, schema 5, capacity 1024, instrumentation ON
+    Instrumentation ON is rejected for E7 and for 50 RPS sparse. Capacity without
+    timing and timing without capacity are rejected. G3 adaptive_early_seal_v1
     remains gemm_f32 A,G2,G3 at 1000 RPS / 1000 ms. Other neural-local delay
     calibrations keep nonzero_batch_delay_v1.
     """
@@ -620,11 +636,30 @@ def resolve_calibration_variant(
             raise NeuralCollectorError("duration_ms must be an integer")
         if type(counted_runs) is not int:
             raise NeuralCollectorError("counted_runs must be an integer")
+        timing_on = measurement.get("enable_batch_decision_timing") is True
+        capacity = measurement.get("batch_decision_event_capacity", 0)
+        if capacity is None:
+            capacity = 0
+        if type(capacity) is not int or isinstance(capacity, bool):
+            raise NeuralCollectorError("batch_decision_event_capacity must be an integer")
+        if timing_on and capacity == 0:
+            raise NeuralCollectorError(
+                "enable_batch_decision_timing requires batch_decision_event_capacity"
+            )
+        if not timing_on and capacity != 0:
+            raise NeuralCollectorError(
+                "batch_decision_event_capacity requires enable_batch_decision_timing"
+            )
         if (
             rate == ARRIVAL_AWARE_BATCHING_RATE
             and duration == ARRIVAL_AWARE_BATCHING_DURATION_MS
             and counted_runs == ARRIVAL_AWARE_BATCHING_COUNTED_RUNS
         ):
+            if timing_on:
+                raise NeuralCollectorError(
+                    f"{CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1} does not support "
+                    "batch-decision timing instrumentation"
+                )
             for cell in cells:
                 normalize_cell_definition(cell)
             return CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1
@@ -633,6 +668,22 @@ def resolve_calibration_variant(
             and duration == ARRIVAL_AWARE_SPARSE_DURATION_MS
             and counted_runs == ARRIVAL_AWARE_SPARSE_COUNTED_RUNS
         ):
+            if timing_on:
+                if rate != ARRIVAL_AWARE_SPARSE_INSTRUMENTED_RATE:
+                    raise NeuralCollectorError(
+                        f"{CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_INSTRUMENTED_V1} "
+                        f"requires target_rps={ARRIVAL_AWARE_SPARSE_INSTRUMENTED_RATE:g}; "
+                        f"got {rate:g}"
+                    )
+                if capacity != ARRIVAL_AWARE_SPARSE_INSTRUMENTED_CAPACITY:
+                    raise NeuralCollectorError(
+                        f"{CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_INSTRUMENTED_V1} "
+                        f"requires batch_decision_event_capacity="
+                        f"{ARRIVAL_AWARE_SPARSE_INSTRUMENTED_CAPACITY}"
+                    )
+                for cell in cells:
+                    normalize_cell_definition(cell)
+                return CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_INSTRUMENTED_V1
             for cell in cells:
                 normalize_cell_definition(cell)
             return CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_V1
@@ -640,13 +691,23 @@ def resolve_calibration_variant(
             "G4 arrival-aware calibration requires either "
             f"{CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1} "
             f"(target_rps={ARRIVAL_AWARE_BATCHING_RATE:g}, "
-            f"duration_ms={ARRIVAL_AWARE_BATCHING_DURATION_MS}) or "
+            f"duration_ms={ARRIVAL_AWARE_BATCHING_DURATION_MS}), "
             f"{CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_V1} "
             f"(target_rps in {{{', '.join(f'{item:g}' for item in sorted(ARRIVAL_AWARE_SPARSE_RATES))}}}, "
-            f"duration_ms={ARRIVAL_AWARE_SPARSE_DURATION_MS}); "
-            f"got target_rps={rate:g}, duration_ms={duration}, counted_runs={counted_runs}"
+            f"duration_ms={ARRIVAL_AWARE_SPARSE_DURATION_MS}), or "
+            f"{CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_INSTRUMENTED_V1} "
+            f"(target_rps={ARRIVAL_AWARE_SPARSE_INSTRUMENTED_RATE:g}, "
+            f"duration_ms={ARRIVAL_AWARE_SPARSE_INSTRUMENTED_DURATION_MS}, "
+            f"capacity={ARRIVAL_AWARE_SPARSE_INSTRUMENTED_CAPACITY}); "
+            f"got target_rps={rate:g}, duration_ms={duration}, counted_runs={counted_runs}, "
+            f"instrumentation={'on' if timing_on else 'off'}"
         )
     if "G3" in cell_ids or cell_ids == ADAPTIVE_EARLY_SEAL_CELLS:
+        if measurement.get("enable_batch_decision_timing") is True:
+            raise NeuralCollectorError(
+                "batch-decision timing is only supported for "
+                f"{CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_INSTRUMENTED_V1}"
+            )
         if cell_ids != ADAPTIVE_EARLY_SEAL_CELLS:
             raise NeuralCollectorError(
                 "adaptive_early_seal_v1 requires cells A,G2,G3 in that order; "
@@ -673,6 +734,19 @@ def resolve_calibration_variant(
         for cell in cells:
             normalize_cell_definition(cell)
         return CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1
+    if measurement.get("enable_batch_decision_timing") is True:
+        raise NeuralCollectorError(
+            "batch-decision timing is only supported for "
+            f"{CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_INSTRUMENTED_V1}"
+        )
+    if (
+        type(measurement.get("batch_decision_event_capacity", 0)) is int
+        and not isinstance(measurement.get("batch_decision_event_capacity", 0), bool)
+        and int(measurement.get("batch_decision_event_capacity", 0)) != 0
+    ):
+        raise NeuralCollectorError(
+            "batch_decision_event_capacity requires enable_batch_decision_timing"
+        )
     uses_nonzero_delay = any(str(cell["id"]) in CALIBRATION_ONLY_NEURAL_CELLS for cell in cells)
     if uses_nonzero_delay:
         return CALIBRATION_VARIANT_NONZERO_BATCH_DELAY_V1
@@ -993,6 +1067,15 @@ def neural_scheduler_command(
         command.append("--adaptive-batching")
     if arrival:
         command.append("--arrival-aware-batching")
+    if measurement.get("enable_batch_decision_timing") is True:
+        capacity = measurement.get("batch_decision_event_capacity")
+        if type(capacity) is not int or isinstance(capacity, bool) or capacity < 1:
+            raise NeuralCollectorError(
+                "batch_decision_event_capacity must be a positive integer when "
+                "enable_batch_decision_timing is true"
+            )
+        command.append("--batch-decision-timing")
+        command.extend(["--batch-decision-event-capacity", str(capacity)])
     return command
 
 
@@ -1092,6 +1175,112 @@ def rejection_total(document: dict) -> int:
     return total
 
 
+def nearest_rank_percentile(sorted_values: list[int], percentile: float) -> int | None:
+    """Nearest-rank percentile with 1-based rank = ceil(p/100 * n)."""
+    count = len(sorted_values)
+    if count == 0:
+        return None
+    if not math.isfinite(percentile) or percentile <= 0 or percentile > 100:
+        raise NeuralCollectorError("percentile must be in (0, 100]")
+    rank = int(math.ceil(percentile / 100.0 * count))
+    rank = max(1, min(count, rank))
+    return sorted_values[rank - 1]
+
+
+def batch_open_wait_diagnostics(events: list[dict]) -> dict:
+    """Diagnostic open-wait summary. Not confirmatory inference."""
+    if not events:
+        return {
+            "status": "zero_event",
+            "count": 0,
+            "unit": "nanoseconds",
+            "seal_reason_frequencies": {},
+        }
+    waits: list[int] = []
+    frequencies: dict[str, int] = {}
+    for event in events:
+        open_ns = event["batch_open_ns"]
+        seal_ns = event["batch_seal_ns"]
+        waits.append(int(seal_ns) - int(open_ns))
+        reason = str(event["seal_reason"])
+        frequencies[reason] = frequencies.get(reason, 0) + 1
+    ordered = sorted(waits)
+    return {
+        "status": "complete",
+        "count": len(ordered),
+        "unit": "nanoseconds",
+        "minimum_nanoseconds": ordered[0],
+        "median_nanoseconds": nearest_rank_percentile(ordered, 50),
+        "p95_nanoseconds": nearest_rank_percentile(ordered, 95),
+        "maximum_nanoseconds": ordered[-1],
+        "mean_nanoseconds": float(sum(ordered)) / float(len(ordered)),
+        "seal_reason_frequencies": frequencies,
+    }
+
+
+def instrumented_trace_problems(document: dict, cell: dict, expected: dict) -> list[str]:
+    """Neural-local strict schema-5 accounting and policy seal-reason gates."""
+    problems: list[str] = []
+    snap = document.get("batch_decision")
+    if not isinstance(snap, dict):
+        return ["batch_decision object is missing"]
+    if snap.get("events_dropped") != 0:
+        problems.append("instrumented calibration forbids dropped batch-decision events")
+    if snap.get("trace_overflow") is not False:
+        problems.append("instrumented calibration forbids batch-decision trace overflow")
+    if snap.get("timing_data_valid") is not True:
+        problems.append("instrumented calibration requires timing_data_valid=true")
+    if snap.get("buffer_capacity_per_worker") != ARRIVAL_AWARE_SPARSE_INSTRUMENTED_CAPACITY:
+        problems.append(
+            "instrumented calibration requires buffer_capacity_per_worker="
+            f"{ARRIVAL_AWARE_SPARSE_INSTRUMENTED_CAPACITY}"
+        )
+    events = snap.get("events")
+    if not isinstance(events, list):
+        problems.append("batch_decision.events is not a list")
+        return problems
+    cell_id = str(cell.get("id"))
+    enable_batching = bool(cell.get("enable_batching"))
+    sealed = snap.get("sealed_batches_total")
+    if not enable_batching:
+        if sealed != 0 or events or snap.get("events_recorded") != 0:
+            problems.append("unbatched cell A must emit a zero-event batch-decision trace")
+        return problems
+    metrics = document.get("metrics")
+    if not isinstance(metrics, dict):
+        problems.append("metrics object is missing")
+        return problems
+    engine_runs = metrics.get("engine_run_count")
+    if type(engine_runs) is not int or engine_runs < 0:
+        problems.append("engine_run_count is missing")
+    elif sealed != engine_runs:
+        problems.append(
+            "sealed_batches_total must equal metrics.engine_run_count for batching cells"
+        )
+    mean, mean_problems = realized_mean_batch_size(document)
+    if mean_problems and mean is None:
+        problems.extend(mean_problems)
+    forbidden: frozenset[str]
+    if cell_id == "G2":
+        forbidden = SEAL_REASONS_FORBIDDEN_G2
+    elif cell_id == "G3":
+        forbidden = SEAL_REASONS_FORBIDDEN_G3
+    elif cell_id == "G4":
+        forbidden = SEAL_REASONS_FORBIDDEN_G4
+    else:
+        forbidden = frozenset()
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            continue
+        reason = event.get("seal_reason")
+        if type(reason) is str and reason in forbidden:
+            problems.append(
+                f"batch_decision.events[{index}].seal_reason {reason!r} is forbidden for cell {cell_id}"
+            )
+    del expected
+    return problems
+
+
 def validate_trial(
     text: str,
     *,
@@ -1103,6 +1292,7 @@ def validate_trial(
     persistent_batching_min_mean: float | None = None,
     require_unbatched_size_one: bool = False,
     require_strict_generator_delivery: bool | None = None,
+    cell: dict | None = None,
 ) -> tuple[dict | None, dict, list[str]]:
     document, status = classify_report(text, expected=expected)
     problems: list[str] = []
@@ -1112,10 +1302,17 @@ def validate_trial(
             problems.append("collector rejected the trial")
     if document is None:
         return None, status, problems
-    if document.get("schema_version") != SCHEMA_VERSION:
+    want_schema = expected_schema_version(expected)
+    if document.get("schema_version") != want_schema:
         problems.append(
-            f"schema_version is {document.get('schema_version')!r}, expected {SCHEMA_VERSION}"
+            f"schema_version is {document.get('schema_version')!r}, expected {want_schema}"
         )
+    if (
+        want_schema == BATCH_DECISION_SCHEMA_VERSION
+        and cell is not None
+        and expected.get("enable_batch_decision_timing") is True
+    ):
+        problems.extend(instrumented_trace_problems(document, cell, expected))
     if document.get("valid") is not True:
         problems.append("runner valid flag is not true")
     if document.get("correctness_mismatches") != 0:
@@ -1304,6 +1501,7 @@ def neural_preflight(
     include_arrival_aware_definitions = calibration_variant in {
         CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1,
         CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_V1,
+        CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_INSTRUMENTED_V1,
     }
     include_adaptive_definitions = (
         calibration_variant == CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1
@@ -1527,7 +1725,12 @@ def neural_preflight(
             "backend": BACKEND,
             "graph_optimizations": GRAPH_OPTIMIZATIONS,
             "onnxruntime_version_pin": ONNXRUNTIME_VERSION,
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": (
+                BATCH_DECISION_SCHEMA_VERSION
+                if calibration_variant
+                == CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_INSTRUMENTED_V1
+                else SCHEMA_VERSION
+            ),
             "analysis_protocol_version": ANALYSIS_PROTOCOL_VERSION,
             "publication_policy": PUBLICATION_POLICY,
             "experiment_kind": EXPERIMENT_KIND,
@@ -1621,7 +1824,7 @@ def _overlay_identity(manifest: dict, plan: list[dict], checked: dict) -> dict:
 
 def _expected_launch(checked: dict, cell: dict, profile: dict) -> dict:
     measurement = checked["collection_protocol"]["measurement"]
-    return {
+    expected = {
         "model_path": str(checked["paths"]["model"]),
         "workload": profile["workload"],
         "worker_count": measurement["worker_count"],
@@ -1641,6 +1844,12 @@ def _expected_launch(checked: dict, cell: dict, profile: dict) -> dict:
         "analysis_protocol_version": ANALYSIS_PROTOCOL_VERSION,
         "target_rps": profile.get("target_rps"),
     }
+    if measurement.get("enable_batch_decision_timing") is True:
+        expected["enable_batch_decision_timing"] = True
+        expected["batch_decision_event_capacity"] = int(
+            measurement["batch_decision_event_capacity"]
+        )
+    return expected
 
 
 def execute_plan(
@@ -1739,8 +1948,23 @@ def execute_plan(
                     float(protocol["persistent_batching_min_mean"]) if apply_persistent else None
                 ),
                 require_strict_generator_delivery=require_strict,
+                cell=cell,
             )
             problems.extend(trial_problems)
+            if (
+                document is not None
+                and not problems
+                and expected.get("enable_batch_decision_timing") is True
+            ):
+                snap = document.get("batch_decision")
+                events = snap.get("events") if isinstance(snap, dict) else None
+                if isinstance(events, list):
+                    status = dict(status)
+                    status["batch_open_wait"] = batch_open_wait_diagnostics(events)
+                    if isinstance(snap, dict):
+                        status["timing_data_valid"] = snap.get("timing_data_valid") is True
+                status = dict(status)
+                status["arrival_fidelity_status"] = ARRIVAL_FIDELITY_STATUS_NOT_CERTIFIED
             if document is not None and hard_policy_calibration:
                 recorded = recorded_cells.get(str(trial["cell_id"]))
                 if recorded is None:
@@ -1847,6 +2071,9 @@ def execute_plan(
             "multi_request_batch_fraction",
             "multi_size_batch_fraction",
             "coarse_max_lag_v1",
+            "batch_open_wait",
+            "timing_data_valid",
+            "arrival_fidelity_status",
         ):
             if diagnostic_key in status:
                 meta[diagnostic_key] = status[diagnostic_key]
@@ -1931,6 +2158,23 @@ def collect(
         value = getattr(args, name, None)
         if value is not None:
             measurement[name] = value
+    timing_requested = bool(getattr(args, "batch_decision_timing", False))
+    capacity_arg = getattr(args, "batch_decision_event_capacity", None)
+    if timing_requested and capacity_arg is None:
+        raise NeuralCollectorError(
+            "--batch-decision-timing requires --batch-decision-event-capacity"
+        )
+    if capacity_arg is not None and not timing_requested:
+        raise NeuralCollectorError(
+            "--batch-decision-event-capacity requires --batch-decision-timing"
+        )
+    if timing_requested:
+        if type(capacity_arg) is not int or isinstance(capacity_arg, bool) or capacity_arg < 1:
+            raise NeuralCollectorError(
+                "--batch-decision-event-capacity must be a positive integer"
+            )
+        measurement["enable_batch_decision_timing"] = True
+        measurement["batch_decision_event_capacity"] = int(capacity_arg)
     offered_rate_frozen = bool(args.offered_rate_frozen)
     if mode == "reportable" and not offered_rate_frozen:
         raise NeuralCollectorError("reportable mode requires a frozen offered rate")
@@ -2063,6 +2307,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-requests", type=int)
     parser.add_argument("--lag-tolerance-ms", type=int)
     parser.add_argument("--check-interval", type=int)
+    parser.add_argument(
+        "--batch-decision-timing",
+        action="store_true",
+        help=(
+            "Opt in to schema-5 sealed-batch instrumentation for the neural "
+            "arrival_aware_sparse_instrumented_v1 calibration only."
+        ),
+    )
+    parser.add_argument(
+        "--batch-decision-event-capacity",
+        type=int,
+        default=None,
+        help=(
+            "Per-worker batch-decision event capacity. Required with "
+            "--batch-decision-timing; rejected alone."
+        ),
+    )
     parser.add_argument("--preflight-only", action="store_true")
     return parser
 
