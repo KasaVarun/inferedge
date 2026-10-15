@@ -1,0 +1,27 @@
+# inferedge float32 fixtures
+# little-endian float32 values, no file header, no padding
+# batch input_file expected_file input_elems output_elems attempt_base
+# model resnet18_f32
+# architecture ResNet-v1 BasicBlock [2,2,2,2] synthetic SplitMix64 weights
+# not ImageNet-pretrained
+# seed 20261017
+# opset 13 ir 10 producer inferedge
+# input images float32 [batch,3,224,224]
+# output logits float32 [batch,1000]
+# learnable_parameters 11689512
+# initializer_count 102
+# initializer_order conv1.weight,bn1.scale,bn1.B,bn1.mean,bn1.var,layer1.0.conv1.weight,layer1.0.bn1.scale,layer1.0.bn1.B,layer1.0.bn1.mean,layer1.0.bn1.var,layer1.0.conv2.weight,layer1.0.bn2.scale,layer1.0.bn2.B,layer1.0.bn2.mean,layer1.0.bn2.var,layer1.1.conv1.weight,layer1.1.bn1.scale,layer1.1.bn1.B,layer1.1.bn1.mean,layer1.1.bn1.var,layer1.1.conv2.weight,layer1.1.bn2.scale,layer1.1.bn2.B,layer1.1.bn2.mean,layer1.1.bn2.var,layer2.0.conv1.weight,layer2.0.bn1.scale,layer2.0.bn1.B,layer2.0.bn1.mean,layer2.0.bn1.var,layer2.0.conv2.weight,layer2.0.bn2.scale,layer2.0.bn2.B,layer2.0.bn2.mean,layer2.0.bn2.var,layer2.0.downsample.conv.weight,layer2.0.downsample.bn.scale,layer2.0.downsample.bn.B,layer2.0.downsample.bn.mean,layer2.0.downsample.bn.var,layer2.1.conv1.weight,layer2.1.bn1.scale,layer2.1.bn1.B,layer2.1.bn1.mean,layer2.1.bn1.var,layer2.1.conv2.weight,layer2.1.bn2.scale,layer2.1.bn2.B,layer2.1.bn2.mean,layer2.1.bn2.var,layer3.0.conv1.weight,layer3.0.bn1.scale,layer3.0.bn1.B,layer3.0.bn1.mean,layer3.0.bn1.var,layer3.0.conv2.weight,layer3.0.bn2.scale,layer3.0.bn2.B,layer3.0.bn2.mean,layer3.0.bn2.var,layer3.0.downsample.conv.weight,layer3.0.downsample.bn.scale,layer3.0.downsample.bn.B,layer3.0.downsample.bn.mean,layer3.0.downsample.bn.var,layer3.1.conv1.weight,layer3.1.bn1.scale,layer3.1.bn1.B,layer3.1.bn1.mean,layer3.1.bn1.var,layer3.1.conv2.weight,layer3.1.bn2.scale,layer3.1.bn2.B,layer3.1.bn2.mean,layer3.1.bn2.var,layer4.0.conv1.weight,layer4.0.bn1.scale,layer4.0.bn1.B,layer4.0.bn1.mean,layer4.0.bn1.var,layer4.0.conv2.weight,layer4.0.bn2.scale,layer4.0.bn2.B,layer4.0.bn2.mean,layer4.0.bn2.var,layer4.0.downsample.conv.weight,layer4.0.downsample.bn.scale,layer4.0.downsample.bn.B,layer4.0.downsample.bn.mean,layer4.0.downsample.bn.var,layer4.1.conv1.weight,layer4.1.bn1.scale,layer4.1.bn1.B,layer4.1.bn1.mean,layer4.1.bn1.var,layer4.1.conv2.weight,layer4.1.bn2.scale,layer4.1.bn2.B,layer4.1.bn2.mean,layer4.1.bn2.var,fc.weight,fc.bias
+# python 3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 21.0.0 (clang-2100.1.1.101)]
+# numpy 2.5.4
+# onnx 1.22.0
+# platform macOS-27.0.1-arm64-arm-64bit-Mach-O arm64
+# blas numpy=2.5.4; blas={'name': 'accelerate', 'found': True, 'version': 'unknown', 'detection method': 'system', 'include directory': 'unknown', 'lib directory': 'unknown', 'openblas configuration': 'unknown', 'pc file directory': 'unknown'}; build_keys=['Build Dependencies', 'Compilers', 'Machine Information', 'Python Information', 'SIMD Extensions']
+# bn gamma=1 beta=0 mean=0 var=1 epsilon=1e-5 (not arithmetic identity)
+# numpy GAP: float32 sum over H,W then * float32(1/(H*W))
+# numpy Conv: im2col + float32 matmul; BLAS order not bit-stable across hosts
+# numerical coverage: attempt_ids 1000..1007 only; fixture replay
+# no weight sidecar
+1 b01.input.f32 b01.expected.f32 150528 1000 1000
+2 b02.input.f32 b02.expected.f32 150528 1000 1000
+4 b04.input.f32 b04.expected.f32 150528 1000 1000
+8 b08.input.f32 b08.expected.f32 150528 1000 1000

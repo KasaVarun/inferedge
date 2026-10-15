@@ -285,5 +285,211 @@ class GeneratedWorkloadTest(unittest.TestCase):
                 self.assertEqual(sha256(payload), sha256(self.repeated[name][0][relative]))
 
 
+class ResNet18CommittedArtifactTest(unittest.TestCase):
+    """Inspect committed ResNet-18 files. Collection does not import NumPy."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.onnx_path = REPO_MODELS / "resnet18_f32.onnx"
+        cls.fixture_dir = REPO_MODELS / "fixtures" / "resnet18_f32"
+        if not cls.onnx_path.is_file():
+            raise unittest.SkipTest("resnet18_f32.onnx has not been generated")
+        cls.model = onnx.load(str(cls.onnx_path))
+
+    def test_onnx_contract(self) -> None:
+        onnx.checker.check_model(self.model)
+        self.assertEqual(self.model.ir_version, 10)
+        self.assertEqual([(item.domain, item.version) for item in self.model.opset_import], [("", 13)])
+        self.assertEqual(self.model.producer_name, "inferedge")
+        self.assertEqual(self.model.graph.input[0].name, "images")
+        self.assertEqual(self.model.graph.output[0].name, "logits")
+        input_dims = self.model.graph.input[0].type.tensor_type.shape.dim
+        output_dims = self.model.graph.output[0].type.tensor_type.shape.dim
+        self.assertEqual(self.model.graph.input[0].type.tensor_type.elem_type, TensorProto.FLOAT)
+        self.assertEqual(self.model.graph.output[0].type.tensor_type.elem_type, TensorProto.FLOAT)
+        self.assertEqual(input_dims[0].dim_param, "batch")
+        self.assertFalse(input_dims[0].HasField("dim_value"))
+        self.assertEqual([dim.dim_value for dim in input_dims[1:]], [3, 224, 224])
+        self.assertEqual(output_dims[0].dim_param, "batch")
+        self.assertFalse(output_dims[0].HasField("dim_value"))
+        self.assertEqual(output_dims[1].dim_value, 1000)
+        operators = [node.op_type for node in self.model.graph.node]
+        self.assertEqual(operators[0], "Conv")
+        self.assertEqual(operators[1], "BatchNormalization")
+        self.assertEqual(operators[2], "Relu")
+        self.assertEqual(operators[3], "MaxPool")
+        self.assertEqual(operators[-3], "GlobalAveragePool")
+        self.assertEqual(operators[-2], "Flatten")
+        self.assertEqual(operators[-1], "Gemm")
+        self.assertEqual(operators.count("Conv"), 20)
+        self.assertEqual(operators.count("BatchNormalization"), 20)
+        self.assertEqual(operators.count("Add"), 8)
+        self.assertEqual(operators.count("Relu"), 17)
+        self.assertEqual(operators.count("MaxPool"), 1)
+        self.assertEqual(operators.count("GlobalAveragePool"), 1)
+        self.assertEqual(operators.count("Flatten"), 1)
+        self.assertEqual(operators.count("Gemm"), 1)
+        stem = {item.name: item for item in self.model.graph.node[0].attribute}
+        self.assertEqual(list(stem["kernel_shape"].ints), [7, 7])
+        self.assertEqual(list(stem["strides"].ints), [2, 2])
+        self.assertEqual(list(stem["pads"].ints), [3, 3, 3, 3])
+        pool = {item.name: item for item in self.model.graph.node[3].attribute}
+        self.assertEqual(list(pool["kernel_shape"].ints), [3, 3])
+        self.assertEqual(list(pool["strides"].ints), [2, 2])
+        self.assertEqual(list(pool["pads"].ints), [1, 1, 1, 1])
+        gemm = {item.name: item for item in self.model.graph.node[-1].attribute}
+        self.assertEqual(gemm["transA"].i, 0)
+        self.assertEqual(gemm["transB"].i, 0)
+        flatten = {item.name: item for item in self.model.graph.node[-2].attribute}
+        self.assertEqual(flatten["axis"].i, 1)
+        names = [tensor.name for tensor in self.model.graph.initializer]
+        self.assertIn("conv1.weight", names)
+        self.assertIn("fc.weight", names)
+        self.assertIn("fc.bias", names)
+        self.assertIn("layer1.0.conv1.weight", names)
+        self.assertIn("layer2.0.downsample.conv.weight", names)
+        self.assertIn("layer3.0.downsample.conv.weight", names)
+        self.assertIn("layer4.0.downsample.conv.weight", names)
+        self.assertNotIn("layer1.0.downsample.conv.weight", names)
+        learnable = 0
+        for tensor in self.model.graph.initializer:
+            self.assertEqual(tensor.data_type, TensorProto.FLOAT)
+            self.assertEqual(tensor.data_location, TensorProto.DEFAULT)
+            self.assertEqual(len(tensor.external_data), 0)
+            count = 1
+            for dim in tensor.dims:
+                count *= int(dim)
+            if tensor.name.endswith(".mean") or tensor.name.endswith(".var"):
+                continue
+            learnable += count
+        self.assertEqual(learnable, 11_689_512)
+        fc_weight = next(tensor for tensor in self.model.graph.initializer if tensor.name == "fc.weight")
+        self.assertEqual(list(fc_weight.dims), [512, 1000])
+
+    def test_fixture_files_and_sizes(self) -> None:
+        manifest = (self.fixture_dir / "manifest.txt").read_text(encoding="ascii")
+        self.assertIn("seed 20261017", manifest)
+        self.assertIn("not ImageNet-pretrained", manifest)
+        self.assertIn("no weight sidecar", manifest)
+        self.assertIn("attempt_ids 1000..1007 only", manifest)
+        for batch_size in (1, 2, 4, 8):
+            tag = f"b{batch_size:02d}"
+            input_path = self.fixture_dir / f"{tag}.input.f32"
+            expected_path = self.fixture_dir / f"{tag}.expected.f32"
+            self.assertTrue(input_path.is_file(), str(input_path))
+            self.assertTrue(expected_path.is_file(), str(expected_path))
+            self.assertEqual(input_path.stat().st_size, batch_size * 3 * 224 * 224 * 4)
+            self.assertEqual(expected_path.stat().st_size, batch_size * 1000 * 4)
+            inputs = unpack_f32(input_path.read_bytes())
+            outputs = unpack_f32(expected_path.read_bytes())
+            self.assertTrue(all(math.isfinite(value) for value in inputs))
+            self.assertTrue(all(math.isfinite(value) for value in outputs))
+            self.assertIn(
+                f"{batch_size} {tag}.input.f32 {tag}.expected.f32 150528 1000 1000",
+                manifest,
+            )
+        single = unpack_f32((self.fixture_dir / "b01.input.f32").read_bytes())
+        paired = unpack_f32((self.fixture_dir / "b02.input.f32").read_bytes())
+        self.assertEqual(paired[:150528], single)
+        self.assertNotEqual(paired[:150528], paired[150528:])
+        sidecar = REPO_MODELS / "fixtures" / "resnet18_f32.weights"
+        self.assertFalse(sidecar.exists())
+
+
+class ResNet18OperatorTest(unittest.TestCase):
+    """Focused NumPy operator checks. Skipped when NumPy is absent (CI onnx venv)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        try:
+            import numpy as np
+        except ImportError as error:
+            raise unittest.SkipTest("numpy is not installed") from error
+        from models import generate_resnet18_model as resnet_gen
+
+        cls.np = np
+        cls.resnet = resnet_gen
+
+    def test_conv_padding_stride_oihw_nchw(self) -> None:
+        np = self.np
+        images = np.array(
+            [[[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0], [13.0, 14.0, 15.0, 16.0]]]],
+            dtype=np.float32,
+        )
+        kernel = np.array([[[[1.0, 0.0], [0.0, 0.0]]]], dtype=np.float32)
+        strided = self.resnet.conv2d_nchw(images, kernel, stride=2, pad=0)
+        self.assertEqual(strided.shape, (1, 1, 2, 2))
+        np.testing.assert_array_equal(strided[0, 0], np.array([[1.0, 3.0], [9.0, 11.0]], dtype=np.float32))
+        padded = self.resnet.conv2d_nchw(images, kernel, stride=1, pad=1)
+        self.assertEqual(padded.shape, (1, 1, 5, 5))
+        self.assertEqual(float(padded[0, 0, 0, 0]), 0.0)
+        self.assertEqual(float(padded[0, 0, 1, 1]), 1.0)
+        crossed = np.zeros((1, 2, 1, 1), dtype=np.float32)
+        crossed[0, 1, 0, 0] = 1.0
+        oihw = np.zeros((1, 2, 1, 1), dtype=np.float32)
+        oihw[0, 1, 0, 0] = 3.0
+        product = self.resnet.conv2d_nchw(crossed, oihw, stride=1, pad=0)
+        self.assertEqual(float(product[0, 0, 0, 0]), 3.0)
+
+    def test_batch_norm_epsilon_is_not_identity(self) -> None:
+        np = self.np
+        images = np.array([[[[2.0]]]], dtype=np.float32)
+        ones = np.array([1.0], dtype=np.float32)
+        zeros = np.array([0.0], dtype=np.float32)
+        actual = self.resnet.batch_norm_nchw(images, ones, zeros, zeros, ones)
+        expected = np.float32(2.0) * self.resnet.bn_inv_std(1.0, 1e-5)
+        self.assertTrue(math.isfinite(float(actual[0, 0, 0, 0])))
+        self.assertNotEqual(float(actual[0, 0, 0, 0]), 2.0)
+        self.assertEqual(float(actual[0, 0, 0, 0]), float(expected))
+
+    def test_identity_and_projection_residual_add(self) -> None:
+        np = self.np
+        left = np.array([[[[1.0, -2.0]]]], dtype=np.float32)
+        right = np.array([[[[3.0, 4.0]]]], dtype=np.float32)
+        added = left + right
+        np.testing.assert_array_equal(added, np.array([[[[4.0, 2.0]]]], dtype=np.float32))
+        activated = self.resnet.relu_nchw(added)
+        np.testing.assert_array_equal(activated, np.array([[[[4.0, 2.0]]]], dtype=np.float32))
+        source = np.ones((1, 2, 4, 4), dtype=np.float32)
+        proj = np.zeros((3, 2, 1, 1), dtype=np.float32)
+        proj[0, 0, 0, 0] = 1.0
+        projected = self.resnet.conv2d_nchw(source, proj, stride=2, pad=0)
+        self.assertEqual(projected.shape, (1, 3, 2, 2))
+        self.assertEqual(float(projected[0, 0, 0, 0]), 1.0)
+        self.assertEqual(float(projected[0, 1, 0, 0]), 0.0)
+
+    def test_maxpool_and_global_average_pool(self) -> None:
+        np = self.np
+        images = np.array([[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]]], dtype=np.float32)
+        pooled = self.resnet.maxpool2d_nchw(images, kernel=2, stride=1, pad=0)
+        np.testing.assert_array_equal(pooled[0, 0], np.array([[5.0, 6.0], [8.0, 9.0]], dtype=np.float32))
+        gap = self.resnet.global_average_pool_nchw(images)
+        expected = np.float32(45.0) * np.float32(1.0 / 9.0)
+        self.assertEqual(float(gap[0, 0, 0, 0]), float(expected))
+
+    def test_classifier_ordering_and_finite_inputs(self) -> None:
+        np = self.np
+        features = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+        weight = np.array([[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]], dtype=np.float32)
+        bias = np.array([1.0, 2.0], dtype=np.float32)
+        logits = self.resnet.gemm_logits(features, weight, bias)
+        np.testing.assert_array_equal(logits, np.array([[11.0, 22.0], [31.0, 42.0]], dtype=np.float32))
+        image = self.resnet.image_from_attempt(1000)
+        self.assertEqual(image.shape, (1, 3, 224, 224))
+        self.assertTrue(bool(np.all(np.isfinite(image))))
+        first = float(image.reshape(-1)[0])
+        self.assertEqual(first, float(np.float32((1000 % 251) & 0xFFFFFF) * np.float32(2.0**-24)))
+        self.assertEqual(self.resnet.LEARNABLE_PARAMETERS, 11_689_512)
+        self.assertEqual(self.resnet.SEED, 20261017)
+
+    def test_committed_artifacts_match_regeneration_when_numpy_present(self) -> None:
+        files = self.resnet.build_artifacts()
+        for relative, payload in files.items():
+            committed = REPO_MODELS / relative
+            self.assertTrue(committed.is_file(), str(committed))
+            self.assertEqual(committed.read_bytes(), payload, relative)
+        self.assertEqual(self.resnet.LEARNABLE_PARAMETERS, 11_689_512)
+
+
 if __name__ == "__main__":
     unittest.main()
