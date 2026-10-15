@@ -148,6 +148,7 @@ std::string scheduler_benchmark_help_message() {
            "  --max-batch-size <n>           1..32 (default 1)\n"
            "  --max-batch-delay-ms <n>       0..1000 (default 0)\n"
            "  --adaptive-batching            early-seal at 2 when queue is empty (opt-in)\n"
+           "  --arrival-aware-batching       arrival-rate-aware early seal (opt-in; not adaptive)\n"
            "  --disable-metrics              leave scheduler metrics off\n"
            "  --completion-timing            schema 4 pre-publication stamps (default off)\n"
            "  --format <text|json>           default text\n"
@@ -208,6 +209,7 @@ parse_scheduler_benchmark_cli(const std::vector<std::string_view>& args) {
     bool saw_batch = false;
     bool saw_delay = false;
     bool saw_adaptive = false;
+    bool saw_arrival_aware = false;
     bool saw_format = false;
     bool saw_metrics = false;
     bool saw_timing = false;
@@ -234,6 +236,14 @@ parse_scheduler_benchmark_cli(const std::vector<std::string_view>& args) {
                 return error_result(duplicated);
             }
             parsed.config.adaptive_batching = true;
+            continue;
+        }
+        if (argument == "--arrival-aware-batching") {
+            if (const std::string duplicated = assign_once(saw_arrival_aware, argument);
+                !duplicated.empty()) {
+                return error_result(duplicated);
+            }
+            parsed.config.arrival_aware_batching = true;
             continue;
         }
         if (argument == "--completion-timing") {
@@ -455,6 +465,10 @@ parse_scheduler_benchmark_cli(const std::vector<std::string_view>& args) {
     if (parsed.config.max_outstanding > parsed.config.max_offered) {
         return error_result("error: --max-outstanding cannot exceed --max-offered\n");
     }
+    if (parsed.config.adaptive_batching && parsed.config.arrival_aware_batching) {
+        return error_result(
+            "error: --adaptive-batching and --arrival-aware-batching are mutually exclusive\n");
+    }
     if (parsed.config.adaptive_batching) {
         if (!parsed.config.enable_batching) {
             return error_result("error: --adaptive-batching requires --enable-batching\n");
@@ -464,6 +478,18 @@ parse_scheduler_benchmark_cli(const std::vector<std::string_view>& args) {
         }
         if (parsed.config.max_batch_delay <= std::chrono::milliseconds::zero()) {
             return error_result("error: --adaptive-batching requires --max-batch-delay-ms > 0\n");
+        }
+    }
+    if (parsed.config.arrival_aware_batching) {
+        if (!parsed.config.enable_batching) {
+            return error_result("error: --arrival-aware-batching requires --enable-batching\n");
+        }
+        if (parsed.config.max_batch_size < 2) {
+            return error_result("error: --arrival-aware-batching requires --max-batch-size >= 2\n");
+        }
+        if (parsed.config.max_batch_delay <= std::chrono::milliseconds::zero()) {
+            return error_result(
+                "error: --arrival-aware-batching requires --max-batch-delay-ms > 0\n");
         }
     }
     return parsed;

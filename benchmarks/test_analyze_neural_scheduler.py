@@ -10,6 +10,7 @@ import unittest
 
 from benchmarks.analyze_neural_scheduler import (
     LEGACY_PRE_ADAPTIVE_IDENTITY_PAIRS,
+    LEGACY_PRE_ARRIVAL_AWARE_IDENTITY_PAIRS,
     AnalyzerError,
     analyze,
 )
@@ -1004,6 +1005,7 @@ class AddAnalyzerSafetyTest(unittest.TestCase):
 
 
 LEGACY_COMMIT, LEGACY_BINARY = next(iter(LEGACY_PRE_ADAPTIVE_IDENTITY_PAIRS))
+LEGACY_B_COMMIT, LEGACY_B_BINARY = next(iter(LEGACY_PRE_ARRIVAL_AWARE_IDENTITY_PAIRS))
 
 
 def _trial_report_paths(run_set: pathlib.Path) -> list[pathlib.Path]:
@@ -1018,6 +1020,21 @@ def _strip_adaptive_field(run_set: pathlib.Path) -> None:
     for path in _trial_report_paths(run_set):
         document = json.loads(path.read_text(encoding="utf-8"))
         document["scheduler"].pop("adaptive_batching", None)
+        path.write_text(dump_report(document), encoding="utf-8")
+
+
+def _strip_generation_a_policy_fields(run_set: pathlib.Path) -> None:
+    for path in _trial_report_paths(run_set):
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["scheduler"].pop("adaptive_batching", None)
+        document["scheduler"].pop("arrival_aware_batching", None)
+        path.write_text(dump_report(document), encoding="utf-8")
+
+
+def _strip_arrival_aware_field(run_set: pathlib.Path) -> None:
+    for path in _trial_report_paths(run_set):
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["scheduler"].pop("arrival_aware_batching", None)
         path.write_text(dump_report(document), encoding="utf-8")
 
 
@@ -1059,12 +1076,23 @@ class AdaptiveIdentityAnalyzerTest(unittest.TestCase):
         finally:
             temporary.cleanup()
 
+    def test_missing_arrival_aware_rejected_without_legacy_flag(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        try:
+            run_set = _write_run(pathlib.Path(temporary.name), 20, contrast="ag2")
+            _strip_arrival_aware_field(run_set)
+            with self.assertRaises(AnalyzerError) as raised:
+                analyze(run_set)
+            self.assertIn("arrival_aware_batching", str(raised.exception))
+        finally:
+            temporary.cleanup()
+
     def test_legacy_approved_identity_accepted(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         try:
             run_set = _write_run(pathlib.Path(temporary.name), 20, contrast="ag2")
             _set_legacy_identity(run_set, LEGACY_COMMIT, LEGACY_BINARY)
-            _strip_adaptive_field(run_set)
+            _strip_generation_a_policy_fields(run_set)
             aggregate = analyze(run_set, legacy_pre_adaptive_identity=True)
             document = json.loads(aggregate.read_text(encoding="utf-8"))
             self.assertEqual(document["adaptive_identity_status"], "legacy_authorized")
@@ -1081,7 +1109,7 @@ class AdaptiveIdentityAnalyzerTest(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         try:
             run_set = _write_run(pathlib.Path(temporary.name), 20, contrast="ag2")
-            _strip_adaptive_field(run_set)
+            _strip_generation_a_policy_fields(run_set)
             with self.assertRaises(AnalyzerError) as raised:
                 analyze(run_set, legacy_pre_adaptive_identity=True)
             self.assertIn("not allowlisted", str(raised.exception))
@@ -1093,7 +1121,7 @@ class AdaptiveIdentityAnalyzerTest(unittest.TestCase):
         try:
             run_set = _write_run(pathlib.Path(temporary.name), 20, contrast="ag2")
             _set_legacy_identity(run_set, LEGACY_COMMIT, "ff" * 32)
-            _strip_adaptive_field(run_set)
+            _strip_generation_a_policy_fields(run_set)
             with self.assertRaises(AnalyzerError) as raised:
                 analyze(run_set, legacy_pre_adaptive_identity=True)
             self.assertIn("not allowlisted", str(raised.exception))
@@ -1114,6 +1142,52 @@ class AdaptiveIdentityAnalyzerTest(unittest.TestCase):
             self.assertIn("mixed adaptive_batching", str(raised.exception))
         finally:
             temporary.cleanup()
+
+    def test_generation_b_approved_identity_accepted(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        try:
+            run_set = _write_run(pathlib.Path(temporary.name), 20, contrast="ag2g3")
+            _set_legacy_identity(run_set, LEGACY_B_COMMIT, LEGACY_B_BINARY)
+            _strip_arrival_aware_field(run_set)
+            aggregate = analyze(run_set, legacy_pre_arrival_aware_identity=True)
+            document = json.loads(aggregate.read_text(encoding="utf-8"))
+            self.assertEqual(
+                document["adaptive_identity_status"], "legacy_pre_arrival_aware_authorized"
+            )
+            self.assertTrue(
+                any("pre-G4 runner contract" in item for item in document["limitations"])
+            )
+        finally:
+            temporary.cleanup()
+
+    def test_generation_b_unapproved_identity_rejected(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        try:
+            run_set = _write_run(pathlib.Path(temporary.name), 20, contrast="ag2g3")
+            _strip_arrival_aware_field(run_set)
+            with self.assertRaises(AnalyzerError) as raised:
+                analyze(run_set, legacy_pre_arrival_aware_identity=True)
+            self.assertIn("not allowlisted", str(raised.exception))
+        finally:
+            temporary.cleanup()
+
+    def test_generation_a_and_b_flags_mutually_exclusive(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        try:
+            run_set = _write_run(pathlib.Path(temporary.name), 20, contrast="ag2")
+            with self.assertRaises(AnalyzerError) as raised:
+                analyze(
+                    run_set,
+                    legacy_pre_adaptive_identity=True,
+                    legacy_pre_arrival_aware_identity=True,
+                )
+            self.assertIn("mutually exclusive", str(raised.exception))
+        finally:
+            temporary.cleanup()
+
+    def test_no_g4_cell_in_resolver(self) -> None:
+        with self.assertRaises(Exception):
+            resolve_neural_cell("G4")
 
     def test_no_g3_cell_in_resolver(self) -> None:
         with self.assertRaises(Exception):

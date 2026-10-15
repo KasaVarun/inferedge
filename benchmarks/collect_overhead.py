@@ -223,10 +223,12 @@ def expected_for(model: pathlib.Path, arm: str) -> dict:
         "enable_batching": launch["enable_batching"],
         "max_batch_size": launch["max_batch_size"],
         "max_batch_delay_ms": launch["max_batch_delay_ms"],
-        # New overhead evidence requires explicit adaptive identity.
-        # Cell A remains non-adaptive; the runner must report false.
+        # New overhead evidence requires Generation C policy identity.
+        # Cell A remains non-adaptive and non-arrival-aware; both must be false.
         "adaptive_batching": False,
+        "arrival_aware_batching": False,
         "require_adaptive_batching_field": True,
+        "require_arrival_aware_batching_field": True,
         "warmup_requests": measurement["warmup_requests"],
         "check_interval": measurement["check_interval"],
         "duration_ms": measurement["duration_ms"],

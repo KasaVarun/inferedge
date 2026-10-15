@@ -172,6 +172,8 @@ SchedulerBenchmarkJsonResult write_scheduler_benchmark_json(const SchedulerBench
     writer.i64(report.max_batch_delay.count());
     writer.raw(",\n    \"adaptive_batching\": ");
     writer.boolean(report.adaptive_batching);
+    writer.raw(",\n    \"arrival_aware_batching\": ");
+    writer.boolean(report.arrival_aware_batching);
     writer.raw(",\n    \"enable_metrics\": ");
     writer.boolean(report.enable_metrics);
     if (report.completion_timing_enabled) {

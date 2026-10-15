@@ -72,7 +72,7 @@ class AnalyzerError(CollectorError):
 
 
 # Exact (git_commit, benchmark_binary_sha256) pairs authorized for legacy
-# pre-adaptive report revalidation. Cross-product matching is forbidden.
+# Generation A (pre-adaptive) report revalidation. Cross-product matching is forbidden.
 LEGACY_PRE_ADAPTIVE_IDENTITY_PAIRS = frozenset(
     {
         (
@@ -82,8 +82,23 @@ LEGACY_PRE_ADAPTIVE_IDENTITY_PAIRS = frozenset(
     }
 )
 
+# Exact pairs for Generation B (adaptive present, arrival-aware absent).
+LEGACY_PRE_ARRIVAL_AWARE_IDENTITY_PAIRS = frozenset(
+    {
+        (
+            "0b2b65d819c8d8b3e39fef9043af962bfed865ac",
+            "956e5a7ee470c55686addb9ca84c5f438ea33845819a7a7284f40b24db4a94ba",
+        ),
+    }
+)
+
 LEGACY_ADAPTIVE_IDENTITY_LIMITATIONS = (
     "adaptive_batching inferred false under pre-adaptive report contract",
+    "Identity is supported by recorded collection metadata, not cryptographic attestation.",
+)
+
+LEGACY_PRE_ARRIVAL_AWARE_IDENTITY_LIMITATIONS = (
+    "arrival_aware_batching absent under pre-G4 runner contract",
     "Identity is supported by recorded collection metadata, not cryptographic attestation.",
 )
 
@@ -627,65 +642,146 @@ def _load_trials(run_set: pathlib.Path, plan: list[dict]) -> dict[str, dict]:
     return found
 
 
+def _resolve_policy_identity(
+    *,
+    queried: dict,
+    loaded_reports: dict[str, dict],
+    legacy_pre_adaptive_identity: bool,
+    legacy_pre_arrival_aware_identity: bool,
+) -> dict:
+    """Return Generation A/B/C policy-identity settings for neural analysis."""
+    if legacy_pre_adaptive_identity and legacy_pre_arrival_aware_identity:
+        raise AnalyzerError(
+            "legacy Generation A and Generation B authorization are mutually exclusive"
+        )
+
+    adaptive_presence: list[bool] = []
+    arrival_presence: list[bool] = []
+    adaptive_true: list[str] = []
+    arrival_true: list[str] = []
+    for trial_id, document in loaded_reports.items():
+        scheduler = document.get("scheduler")
+        if not isinstance(scheduler, dict):
+            raise AnalyzerError(f"{trial_id} scheduler object is missing")
+        has_adaptive = "adaptive_batching" in scheduler
+        has_arrival = "arrival_aware_batching" in scheduler
+        adaptive_presence.append(has_adaptive)
+        arrival_presence.append(has_arrival)
+        if has_adaptive and scheduler.get("adaptive_batching") is True:
+            adaptive_true.append(trial_id)
+        if has_arrival and scheduler.get("arrival_aware_batching") is True:
+            arrival_true.append(trial_id)
+    if adaptive_presence and any(adaptive_presence) and not all(adaptive_presence):
+        raise AnalyzerError("mixed adaptive_batching field presence across trial reports")
+    if arrival_presence and any(arrival_presence) and not all(arrival_presence):
+        raise AnalyzerError("mixed arrival_aware_batching field presence across trial reports")
+    adaptive_all_missing = bool(adaptive_presence) and not any(adaptive_presence)
+    arrival_all_missing = bool(arrival_presence) and not any(arrival_presence)
+    arrival_all_present = bool(arrival_presence) and all(arrival_presence)
+    adaptive_all_present = bool(adaptive_presence) and all(adaptive_presence)
+    pair = (queried.get("git_commit"), queried.get("benchmark_binary_sha256"))
+
+    if legacy_pre_adaptive_identity:
+        if adaptive_true:
+            raise AnalyzerError(
+                "legacy adaptive identity forbids adaptive_batching true "
+                f"in {', '.join(adaptive_true)}"
+            )
+        if arrival_true:
+            raise AnalyzerError(
+                "legacy adaptive identity forbids arrival_aware_batching true "
+                f"in {', '.join(arrival_true)}"
+            )
+        if not adaptive_all_missing or not arrival_all_missing:
+            raise AnalyzerError(
+                "legacy Generation A requires homogeneous missing "
+                "scheduler.adaptive_batching and scheduler.arrival_aware_batching"
+            )
+        if pair not in LEGACY_PRE_ADAPTIVE_IDENTITY_PAIRS:
+            raise AnalyzerError(
+                "legacy adaptive identity pair is not allowlisted "
+                f"(commit={pair[0]!r}, binary_sha256={pair[1]!r})"
+            )
+        return {
+            "adaptive_identity_status": "legacy_authorized",
+            "policy_identity_generation": "A",
+            "require_adaptive_batching_field": False,
+            "require_arrival_aware_batching_field": False,
+            "adaptive_batching": False,
+            "arrival_aware_batching": False,
+            "limitations": list(LEGACY_ADAPTIVE_IDENTITY_LIMITATIONS),
+        }
+
+    if legacy_pre_arrival_aware_identity:
+        if not adaptive_all_present:
+            raise AnalyzerError(
+                "legacy Generation B requires homogeneous scheduler.adaptive_batching"
+            )
+        if not arrival_all_missing:
+            raise AnalyzerError(
+                "legacy Generation B requires homogeneous missing "
+                "scheduler.arrival_aware_batching"
+            )
+        if arrival_true:
+            raise AnalyzerError(
+                "legacy Generation B forbids arrival_aware_batching true "
+                f"in {', '.join(arrival_true)}"
+            )
+        if pair not in LEGACY_PRE_ARRIVAL_AWARE_IDENTITY_PAIRS:
+            raise AnalyzerError(
+                "legacy pre-arrival-aware identity pair is not allowlisted "
+                f"(commit={pair[0]!r}, binary_sha256={pair[1]!r})"
+            )
+        return {
+            "adaptive_identity_status": "legacy_pre_arrival_aware_authorized",
+            "policy_identity_generation": "B",
+            "require_adaptive_batching_field": True,
+            "require_arrival_aware_batching_field": False,
+            "arrival_aware_batching": False,
+            "limitations": list(LEGACY_PRE_ARRIVAL_AWARE_IDENTITY_LIMITATIONS),
+        }
+
+    if adaptive_all_missing:
+        raise AnalyzerError(
+            "new-runner Generation C requires scheduler.adaptive_batching "
+            "(pass --legacy-pre-adaptive-identity only for authorized Generation A evidence)"
+        )
+    if not arrival_all_present:
+        raise AnalyzerError(
+            "new-runner Generation C requires scheduler.arrival_aware_batching "
+            "(pass --legacy-pre-arrival-aware-identity only for authorized Generation B evidence)"
+        )
+    return {
+        "adaptive_identity_status": "strict_new",
+        "policy_identity_generation": "C",
+        "require_adaptive_batching_field": True,
+        "require_arrival_aware_batching_field": True,
+        "arrival_aware_batching": False,
+        "limitations": [],
+    }
+
+
 def _resolve_adaptive_identity(
     *,
     queried: dict,
     loaded_reports: dict[str, dict],
     legacy_pre_adaptive_identity: bool,
+    legacy_pre_arrival_aware_identity: bool = False,
 ) -> dict:
-    """Return strict-new or authorized-legacy adaptive identity settings."""
-    presence = []
-    true_values = []
-    for trial_id, document in loaded_reports.items():
-        scheduler = document.get("scheduler")
-        if not isinstance(scheduler, dict):
-            raise AnalyzerError(f"{trial_id} scheduler object is missing")
-        has_field = "adaptive_batching" in scheduler
-        presence.append(has_field)
-        if has_field and scheduler.get("adaptive_batching") is True:
-            true_values.append(trial_id)
-    if presence and any(presence) and not all(presence):
-        raise AnalyzerError("mixed adaptive_batching field presence across trial reports")
-    all_missing = bool(presence) and not any(presence)
-
-    if not legacy_pre_adaptive_identity:
-        if all_missing:
-            raise AnalyzerError(
-                "new-runner adaptive identity requires scheduler.adaptive_batching "
-                "(pass --legacy-pre-adaptive-identity only for authorized pre-R1 evidence)"
-            )
-        return {
-            "adaptive_identity_status": "strict_new",
-            "require_adaptive_batching_field": True,
-            "adaptive_batching": False,
-            "limitations": [],
-        }
-
-    if true_values:
-        raise AnalyzerError(
-            "legacy adaptive identity forbids adaptive_batching true "
-            f"in {', '.join(true_values)}"
-        )
-    if not all_missing:
-        raise AnalyzerError(
-            "legacy adaptive identity requires homogeneous missing scheduler.adaptive_batching"
-        )
-    pair = (queried.get("git_commit"), queried.get("benchmark_binary_sha256"))
-    if pair not in LEGACY_PRE_ADAPTIVE_IDENTITY_PAIRS:
-        raise AnalyzerError(
-            "legacy adaptive identity pair is not allowlisted "
-            f"(commit={pair[0]!r}, binary_sha256={pair[1]!r})"
-        )
-    return {
-        "adaptive_identity_status": "legacy_authorized",
-        "require_adaptive_batching_field": False,
-        "adaptive_batching": False,
-        "limitations": list(LEGACY_ADAPTIVE_IDENTITY_LIMITATIONS),
-    }
+    """Compatibility wrapper around Generation A/B/C policy identity resolution."""
+    return _resolve_policy_identity(
+        queried=queried,
+        loaded_reports=loaded_reports,
+        legacy_pre_adaptive_identity=legacy_pre_adaptive_identity,
+        legacy_pre_arrival_aware_identity=legacy_pre_arrival_aware_identity,
+    )
 
 
 def analyze(
-    run_set: pathlib.Path, *, legacy_pre_adaptive_identity: bool = False
+    run_set: pathlib.Path,
+    *,
+    legacy_pre_adaptive_identity: bool = False,
+    legacy_pre_arrival_aware_identity: bool = False,
 ) -> pathlib.Path:
     run_set = pathlib.Path(run_set)
     aggregate_path = run_set / "aggregate.json"
@@ -746,7 +842,7 @@ def analyze(
         expected_position_counts = contrast.get("expected_position_counts")
         if contrast.get("legacy_adaptive_identity_prohibited") and legacy_pre_adaptive_identity:
             raise AnalyzerError(
-                "legacy adaptive identity is prohibited for the three-arm contrast"
+                "legacy Generation A identity is prohibited for the three-arm contrast"
             )
     else:
         cell_map = _cell_map_from_definitions(protocol.get("cell_definitions"), tuple(cells))
@@ -810,6 +906,7 @@ def analyze(
         queried=queried,
         loaded_reports=loaded_reports,
         legacy_pre_adaptive_identity=legacy_pre_adaptive_identity,
+        legacy_pre_arrival_aware_identity=legacy_pre_arrival_aware_identity,
     )
     reports: dict[str, dict] = {}
     fairness: list[dict] = []
@@ -862,7 +959,11 @@ def analyze(
             "max_batch_size": cell["max_batch_size"],
             "max_batch_delay_ms": cell["max_batch_delay_ms"],
             "adaptive_batching": expected_adaptive,
+            "arrival_aware_batching": bool(identity.get("arrival_aware_batching", False)),
             "require_adaptive_batching_field": identity["require_adaptive_batching_field"],
+            "require_arrival_aware_batching_field": identity[
+                "require_arrival_aware_batching_field"
+            ],
             "warmup_requests": protocol["measurement"]["warmup_requests"],
             "check_interval": protocol["measurement"]["check_interval"],
             "duration_ms": protocol["measurement"]["duration_ms"],
@@ -1202,9 +1303,20 @@ def main(argv: list[str] | None = None) -> int:
         "--legacy-pre-adaptive-identity",
         action="store_true",
         help=(
-            "Authorize revalidation of pre-R1 reports that omit scheduler.adaptive_batching. "
+            "Authorize Generation A revalidation of reports that omit both policy fields. "
             "Requires an allowlisted (git_commit, benchmark_binary_sha256) pair and "
-            "homogeneous missing fields. Default analysis stays strict."
+            "homogeneous missing fields. Default analysis stays Generation C strict."
+        ),
+    )
+    parser.add_argument(
+        "--legacy-pre-arrival-aware-identity",
+        action="store_true",
+        help=(
+            "Authorize Generation B revalidation of reports that include "
+            "scheduler.adaptive_batching but omit scheduler.arrival_aware_batching. "
+            "Requires an allowlisted (git_commit, benchmark_binary_sha256) pair and "
+            "homogeneous field presence. Mutually exclusive with "
+            "--legacy-pre-adaptive-identity."
         ),
     )
     args = parser.parse_args(argv)
@@ -1212,6 +1324,7 @@ def main(argv: list[str] | None = None) -> int:
         analyze(
             pathlib.Path(args.run_set),
             legacy_pre_adaptive_identity=bool(args.legacy_pre_adaptive_identity),
+            legacy_pre_arrival_aware_identity=bool(args.legacy_pre_arrival_aware_identity),
         )
     except AnalyzerError as exc:
         print(f"error: {exc}", file=sys.stderr)

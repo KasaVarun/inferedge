@@ -162,12 +162,13 @@ class ValidationTest(unittest.TestCase):
 
 
 class AdaptiveIdentityValidationTest(unittest.TestCase):
-    """New overhead collection must require scheduler.adaptive_batching=false."""
+    """New overhead collection must require Generation C policy identity false/false."""
 
-    def test_adaptive_false_accepted_for_both_arms(self) -> None:
+    def test_policy_false_accepted_for_both_arms(self) -> None:
         for arm in ("off", "on"):
             document = _arm_report(arm)
             self.assertIs(document["scheduler"]["adaptive_batching"], False)
+            self.assertIs(document["scheduler"]["arrival_aware_batching"], False)
             _parsed, status, problems = validate_arm(dump_report(document), arm, MODEL)
             self.assertEqual(problems, [], arm)
             self.assertTrue(status["collector_valid"], arm)
@@ -181,6 +182,18 @@ class AdaptiveIdentityValidationTest(unittest.TestCase):
             self.assertTrue(problems, arm)
             self.assertTrue(
                 any("adaptive_batching" in item for item in problems),
+                problems,
+            )
+            self.assertNotEqual(status["delivery_class"], "STRICT_PRIMARY", arm)
+
+    def test_arrival_aware_true_rejected_for_both_arms(self) -> None:
+        for arm in ("off", "on"):
+            document = _arm_report(arm)
+            document["scheduler"]["arrival_aware_batching"] = True
+            _parsed, status, problems = validate_arm(dump_report(document), arm, MODEL)
+            self.assertTrue(problems, arm)
+            self.assertTrue(
+                any("arrival_aware_batching" in item for item in problems),
                 problems,
             )
             self.assertNotEqual(status["delivery_class"], "STRICT_PRIMARY", arm)
@@ -204,6 +217,18 @@ class AdaptiveIdentityValidationTest(unittest.TestCase):
             self.assertTrue(problems, arm)
             self.assertTrue(
                 any("adaptive_batching" in item for item in problems),
+                problems,
+            )
+            self.assertNotEqual(status["delivery_class"], "STRICT_PRIMARY", arm)
+
+    def test_arrival_aware_field_missing_rejected_for_both_arms(self) -> None:
+        for arm in ("off", "on"):
+            document = _arm_report(arm)
+            del document["scheduler"]["arrival_aware_batching"]
+            _parsed, status, problems = validate_arm(dump_report(document), arm, MODEL)
+            self.assertTrue(problems, arm)
+            self.assertTrue(
+                any("arrival_aware_batching" in item for item in problems),
                 problems,
             )
             self.assertNotEqual(status["delivery_class"], "STRICT_PRIMARY", arm)
@@ -243,6 +268,7 @@ class AdaptiveIdentityValidationTest(unittest.TestCase):
         self.assertEqual(on_document["schema_version"], PRECISION_SCHEMA_VERSION)
         self.assertTrue(on_document["scheduler"]["enable_completion_timing"])
         self.assertIs(on_document["scheduler"]["adaptive_batching"], False)
+        self.assertIs(on_document["scheduler"]["arrival_aware_batching"], False)
         self.assertEqual(on_status["analysis_protocol_version"], 3)
         off_document, off_status, off_problems = validate_arm(
             dump_report(_arm_report("off")), "off", MODEL
@@ -251,6 +277,7 @@ class AdaptiveIdentityValidationTest(unittest.TestCase):
         self.assertEqual(off_document["schema_version"], SCHEMA_VERSION)
         self.assertNotIn("enable_completion_timing", off_document["scheduler"])
         self.assertIs(off_document["scheduler"]["adaptive_batching"], False)
+        self.assertIs(off_document["scheduler"]["arrival_aware_batching"], False)
         self.assertEqual(off_status["analysis_protocol_version"], 2)
 
 

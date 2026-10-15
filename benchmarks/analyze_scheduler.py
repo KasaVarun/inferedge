@@ -293,6 +293,11 @@ def _expected_for(environment: dict, meta: dict) -> dict:
         "enable_batching": cell["enable_batching"],
         "max_batch_size": cell["max_batch_size"],
         "max_batch_delay_ms": cell["max_batch_delay_ms"],
+        # New Add revalidation is Generation C: both policy booleans required false.
+        "adaptive_batching": False,
+        "arrival_aware_batching": False,
+        "require_adaptive_batching_field": True,
+        "require_arrival_aware_batching_field": True,
         "warmup_requests": measurement["warmup_requests"],
         "check_interval": measurement["check_interval"],
         "duration_ms": measurement["duration_ms"],

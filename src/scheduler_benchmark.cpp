@@ -199,6 +199,9 @@ std::string validate_config(const SchedulerBenchmarkConfig& config) {
     if (!batch_bounds_ok(config)) {
         return "batch bounds are outside the scheduler limits";
     }
+    if (config.adaptive_batching && config.arrival_aware_batching) {
+        return "adaptive_batching and arrival_aware_batching are mutually exclusive";
+    }
     if (config.adaptive_batching) {
         if (!config.enable_batching) {
             return "adaptive_batching requires enable_batching";
@@ -208,6 +211,17 @@ std::string validate_config(const SchedulerBenchmarkConfig& config) {
         }
         if (config.max_batch_delay <= std::chrono::milliseconds::zero()) {
             return "adaptive_batching requires max_batch_delay > 0";
+        }
+    }
+    if (config.arrival_aware_batching) {
+        if (!config.enable_batching) {
+            return "arrival_aware_batching requires enable_batching";
+        }
+        if (config.max_batch_size < 2) {
+            return "arrival_aware_batching requires max_batch_size >= 2";
+        }
+        if (config.max_batch_delay <= std::chrono::milliseconds::zero()) {
+            return "arrival_aware_batching requires max_batch_delay > 0";
         }
     }
     if (config.max_offered < 1 || config.max_offered > kMaxSchedulerBenchmarkOffered) {
@@ -1054,6 +1068,7 @@ SchedulerBenchmarkReport make_report(const SchedulerBenchmarkConfig& config, Sha
     report.max_batch_size = config.max_batch_size;
     report.max_batch_delay = config.max_batch_delay;
     report.adaptive_batching = config.adaptive_batching;
+    report.arrival_aware_batching = config.arrival_aware_batching;
     report.enable_metrics = config.enable_metrics;
     report.completion_timing_enabled = config.enable_completion_timing;
     report.steady_clock_period_num = std::chrono::steady_clock::period::num;
@@ -1718,6 +1733,7 @@ SchedulerConfig scheduler_config(const SchedulerBenchmarkConfig& config) {
     built.max_batch_size = config.max_batch_size;
     built.max_batch_delay = config.max_batch_delay;
     built.adaptive_batching = config.adaptive_batching;
+    built.arrival_aware_batching = config.arrival_aware_batching;
     built.enable_metrics = config.enable_metrics;
     built.enable_completion_timing = config.enable_completion_timing;
     return built;

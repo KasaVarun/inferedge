@@ -961,7 +961,7 @@ def adaptive_identity_consistency_problems(
     expected: dict,
     document: dict,
 ) -> list[str]:
-    """Require cell, command, expected launch, and runner JSON adaptive identity agree."""
+    """Require cell, command, expected launch, and runner JSON policy identity agree."""
     problems: list[str] = []
     try:
         configured = adaptive_batching_for_cell(cell)
@@ -974,11 +974,18 @@ def adaptive_identity_consistency_problems(
             f"{'present' if flag_present else 'absent'} disagrees with cell "
             f"adaptive_batching={configured}"
         )
+    if "--arrival-aware-batching" in command:
+        problems.append("command must not emit --arrival-aware-batching before G4 cell support")
     expected_adaptive = expected.get("adaptive_batching")
     if type(expected_adaptive) is not bool or expected_adaptive is not configured:
         problems.append(
             f"expected launch adaptive_batching is {expected_adaptive!r}, "
             f"disagrees with cell adaptive_batching={configured}"
+        )
+    expected_arrival = expected.get("arrival_aware_batching")
+    if expected_arrival is not False:
+        problems.append(
+            f"expected launch arrival_aware_batching is {expected_arrival!r}, expected False"
         )
     scheduler = document.get("scheduler")
     if not isinstance(scheduler, dict):
@@ -994,6 +1001,16 @@ def adaptive_identity_consistency_problems(
         problems.append(
             f"scheduler.adaptive_batching is {reported}, expected {configured}"
         )
+    if "arrival_aware_batching" not in scheduler:
+        problems.append("scheduler.arrival_aware_batching is missing")
+    else:
+        reported_arrival = scheduler["arrival_aware_batching"]
+        if type(reported_arrival) is not bool:
+            problems.append("scheduler.arrival_aware_batching is not a JSON boolean")
+        elif reported_arrival is not False:
+            problems.append(
+                f"scheduler.arrival_aware_batching is {reported_arrival}, expected False"
+            )
     return problems
 
 
@@ -1358,7 +1375,9 @@ def _expected_launch(checked: dict, cell: dict, profile: dict) -> dict:
         "max_batch_size": cell["max_batch_size"],
         "max_batch_delay_ms": cell["max_batch_delay_ms"],
         "adaptive_batching": adaptive_batching_for_cell(cell),
+        "arrival_aware_batching": False,
         "require_adaptive_batching_field": True,
+        "require_arrival_aware_batching_field": True,
         "warmup_requests": measurement["warmup_requests"],
         "check_interval": measurement["check_interval"],
         "duration_ms": measurement["duration_ms"],

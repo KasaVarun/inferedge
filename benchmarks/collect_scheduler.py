@@ -231,7 +231,12 @@ SCHEDULER_KEYS = (
     "max_batch_delay_ms",
     "enable_metrics",
 )
+# Generation B: adaptive identity present; arrival-aware absent.
 SCHEDULER_KEYS_WITH_ADAPTIVE = SCHEDULER_KEYS[:5] + ("adaptive_batching",) + SCHEDULER_KEYS[5:]
+# Generation C: both policy booleans present (new runner evidence).
+SCHEDULER_KEYS_WITH_POLICY = (
+    SCHEDULER_KEYS[:5] + ("adaptive_batching", "arrival_aware_batching") + SCHEDULER_KEYS[5:]
+)
 GENERATOR_KEYS = (
     "lag_definition",
     "lag_policy",
@@ -1277,21 +1282,31 @@ def _check_observation(document: dict, workload: str, problems: list[str]) -> No
 
 
 def _scheduler_keys_for_expected(expected: dict, scheduler: dict) -> tuple[str, ...]:
-    """Select exact scheduler keys for new, legacy, or transitional callers.
+    """Select exact scheduler keys for Generation A, B, or C.
 
-    require_adaptive_batching_field True: new evidence; adaptive field mandatory.
-    False: authorized legacy; adaptive field forbidden.
-    Absent: if the report already carries adaptive_batching, validate it; else
-    accept the pre-R1 key set (for unupdated callers such as overhead fixtures).
+    require_adaptive_batching_field / require_arrival_aware_batching_field:
+      True/True   -> Generation C (both policy booleans mandatory)
+      True/False  -> Generation B (adaptive mandatory; arrival-aware forbidden)
+      False/False -> Generation A (both policy fields forbidden)
+    New collection always uses Generation C. Legacy modes must set both flags
+    explicitly. Ambiguous Absent combinations fail closed to Generation C when
+    arrival_aware_batching is already present, else Generation B when adaptive
+    is present, else Generation A.
     """
-    require_field = expected.get("require_adaptive_batching_field")
-    base = SCHEDULER_KEYS
-    if require_field is True:
+    require_adaptive = expected.get("require_adaptive_batching_field")
+    require_arrival = expected.get("require_arrival_aware_batching_field")
+    if require_adaptive is True and require_arrival is True:
+        base = SCHEDULER_KEYS_WITH_POLICY
+    elif require_adaptive is True and require_arrival is False:
         base = SCHEDULER_KEYS_WITH_ADAPTIVE
-    elif require_field is False:
+    elif require_adaptive is False and require_arrival is False:
         base = SCHEDULER_KEYS
+    elif "arrival_aware_batching" in scheduler:
+        base = SCHEDULER_KEYS_WITH_POLICY
     elif "adaptive_batching" in scheduler:
         base = SCHEDULER_KEYS_WITH_ADAPTIVE
+    else:
+        base = SCHEDULER_KEYS
     if analysis_protocol_of(expected) == 3:
         return base + ("enable_completion_timing",)
     return base
@@ -1301,9 +1316,14 @@ def _check_scheduler(document: dict, expected: dict, problems: list[str]) -> Non
     scheduler = _object(document["scheduler"], "scheduler", problems)
     if scheduler is None:
         return
-    require_field = expected.get("require_adaptive_batching_field")
-    if require_field is False and "adaptive_batching" in scheduler:
+    require_adaptive = expected.get("require_adaptive_batching_field")
+    require_arrival = expected.get("require_arrival_aware_batching_field")
+    if require_adaptive is False and "adaptive_batching" in scheduler:
         problems.append("legacy adaptive identity forbids scheduler.adaptive_batching")
+    if require_arrival is False and "arrival_aware_batching" in scheduler:
+        problems.append(
+            "legacy pre-arrival-aware identity forbids scheduler.arrival_aware_batching"
+        )
     scheduler_keys = _scheduler_keys_for_expected(expected, scheduler)
     require_exact_keys(scheduler, scheduler_keys, "scheduler", problems)
     if any(key not in scheduler for key in scheduler_keys):
@@ -1328,15 +1348,37 @@ def _check_scheduler(document: dict, expected: dict, problems: list[str]) -> Non
     batching = _bool(scheduler["enable_batching"], "scheduler.enable_batching", problems)
     if batching is not None and batching != expected["enable_batching"]:
         problems.append("scheduler.enable_batching does not match the cell")
+    adaptive_value = None
+    arrival_value = None
     if "adaptive_batching" in scheduler_keys:
-        adaptive = _bool(scheduler["adaptive_batching"], "scheduler.adaptive_batching", problems)
+        adaptive_value = _bool(
+            scheduler["adaptive_batching"], "scheduler.adaptive_batching", problems
+        )
         expected_adaptive = bool(expected.get("adaptive_batching", False))
-        if adaptive is not None and adaptive != expected_adaptive:
+        if adaptive_value is not None and adaptive_value != expected_adaptive:
             problems.append(
-                f"scheduler.adaptive_batching is {adaptive}, expected {expected_adaptive}"
+                f"scheduler.adaptive_batching is {adaptive_value}, expected {expected_adaptive}"
             )
-    elif require_field is True:
+    elif require_adaptive is True:
         problems.append("scheduler.adaptive_batching is required for new runner evidence")
+    if "arrival_aware_batching" in scheduler_keys:
+        arrival_value = _bool(
+            scheduler["arrival_aware_batching"],
+            "scheduler.arrival_aware_batching",
+            problems,
+        )
+        expected_arrival = bool(expected.get("arrival_aware_batching", False))
+        if arrival_value is not None and arrival_value != expected_arrival:
+            problems.append(
+                f"scheduler.arrival_aware_batching is {arrival_value}, "
+                f"expected {expected_arrival}"
+            )
+    elif require_arrival is True:
+        problems.append("scheduler.arrival_aware_batching is required for new runner evidence")
+    if adaptive_value is True and arrival_value is True:
+        problems.append(
+            "scheduler.adaptive_batching and scheduler.arrival_aware_batching conflict"
+        )
     metrics = _bool(scheduler["enable_metrics"], "scheduler.enable_metrics", problems)
     if metrics is not None and metrics is not True:
         problems.append("scheduler metrics are disabled")
@@ -1942,7 +1984,9 @@ def _expected_launch(checked: dict, cell: dict, profile: dict) -> dict:
         "max_batch_size": cell["max_batch_size"],
         "max_batch_delay_ms": cell["max_batch_delay_ms"],
         "adaptive_batching": False,
+        "arrival_aware_batching": False,
         "require_adaptive_batching_field": True,
+        "require_arrival_aware_batching_field": True,
         "warmup_requests": measurement["warmup_requests"],
         "check_interval": measurement["check_interval"],
         "duration_ms": measurement["duration_ms"],

@@ -108,6 +108,8 @@ def _gemm_report(model_path: str, cell_id: str = "A", **overrides) -> dict:
             "enable_batching": cell["enable_batching"],
             "max_batch_size": cell["max_batch_size"],
             "max_batch_delay_ms": cell["max_batch_delay_ms"],
+            "adaptive_batching": False,
+            "arrival_aware_batching": False,
             "enable_metrics": True,
         },
     )
@@ -292,14 +294,18 @@ class CommandAndPlanTest(unittest.TestCase):
             checked, resolve_neural_cell("G2"), open_loop_profile("neural_open", 1000.0)
         )
         self.assertTrue(expected["require_adaptive_batching_field"])
+        self.assertTrue(expected["require_arrival_aware_batching_field"])
         self.assertFalse(expected["adaptive_batching"])
+        self.assertFalse(expected["arrival_aware_batching"])
         g3_expected = _expected_launch(
             checked,
             resolve_neural_cell("G3", allow_g3=True),
             open_loop_profile("neural_open", 1000.0),
         )
         self.assertTrue(g3_expected["require_adaptive_batching_field"])
+        self.assertTrue(g3_expected["require_arrival_aware_batching_field"])
         self.assertTrue(g3_expected["adaptive_batching"])
+        self.assertFalse(g3_expected["arrival_aware_batching"])
 
     def test_a_g1_g2_runner_argv(self) -> None:
         binary = pathlib.Path("/tmp") / BINARY_NAME
@@ -446,6 +452,7 @@ class ValidationGateTest(unittest.TestCase):
                 "max_batch_size": 4,
                 "max_batch_delay_ms": 2,
                 "adaptive_batching": False,
+                "arrival_aware_batching": False,
                 "enable_metrics": True,
             },
         )
@@ -459,7 +466,9 @@ class ValidationGateTest(unittest.TestCase):
             "max_batch_size": 4,
             "max_batch_delay_ms": 1,
             "adaptive_batching": False,
+            "arrival_aware_batching": False,
             "require_adaptive_batching_field": True,
+            "require_arrival_aware_batching_field": True,
             "warmup_requests": 100,
             "check_interval": 1,
             "duration_ms": 1000,
@@ -1162,6 +1171,7 @@ class G3AdaptiveCalibrationTest(unittest.TestCase):
             "max_batch_size": 4,
             "max_batch_delay_ms": 2,
             "adaptive_batching": True,
+            "arrival_aware_batching": False,
             "enable_metrics": True,
         }
         document["generator"]["warmup_requests"] = 100
@@ -1196,6 +1206,7 @@ class G3AdaptiveCalibrationTest(unittest.TestCase):
         self.assertTrue(any("adaptive_batching" in item for item in rejected_missing))
 
         document["scheduler"]["adaptive_batching"] = True
+        document["scheduler"]["arrival_aware_batching"] = False
         document["scheduler"]["max_batch_delay_ms"] = 1
         _doc, _status, rejected_delay = validate_trial(
             dump_report(document),
@@ -1264,6 +1275,7 @@ class G3AdaptiveCalibrationTest(unittest.TestCase):
             "max_batch_size": 4,
             "max_batch_delay_ms": 2,
             "adaptive_batching": True,
+            "arrival_aware_batching": False,
             "enable_metrics": True,
         }
         document["generator"]["warmup_requests"] = 100
