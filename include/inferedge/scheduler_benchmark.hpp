@@ -41,6 +41,7 @@ enum class SchedulerBenchmarkModelId {
     kMlpSmallF32,
     kMlpMediumF32,
     kGemmF32,
+    kResnet18F32,
 };
 
 // Open-loop catch-up is stop-and-record. The generator sleeps until the
@@ -385,14 +386,21 @@ measure_generator_lag(std::chrono::steady_clock::time_point scheduled,
 [[nodiscard]] SchedulerBenchmarkDigest
 scheduler_benchmark_sha256_file(const std::filesystem::path& path);
 
+// Empty string means names, ranks, dtypes, and static axes match the pin.
+// That is not a numerical success. resnet18_f32 is rank-4 images and rank-2
+// logits with no sidecar.
+[[nodiscard]] std::string scheduler_benchmark_metadata_error(SchedulerBenchmarkModelId model,
+                                                             const InferenceEngine& engine);
+
 // attempt_id selects deterministic float32[1, 2] inputs for batch_add_f32.
 // Expected C is the exact integer sum of those inputs.
 [[nodiscard]] SchedulerBenchmarkTensors scheduler_benchmark_request(std::uint64_t attempt_id);
 
-// batch_add_f32 keeps the one-argument request. Neural ids use one features
-// row, float32(uint32(attempt_id % 251 + index)) * 0x1p-10. The values repeat
-// every 251 attempt ids and are not globally unique. Neural expected outputs
-// are not stored here.
+// batch_add_f32 keeps the one-argument request. MLP and GEMM ids use one
+// features row, float32(uint32(attempt_id % 251 + index)) * 0x1p-10. Those
+// values repeat every 251 attempt ids and are not globally unique. Neural
+// expected outputs are not stored here. kResnet18F32 does not generate
+// tensors: it requires an explicit fixture identity, not attempt_id.
 [[nodiscard]] SchedulerBenchmarkTensors scheduler_benchmark_request(SchedulerBenchmarkModelId model,
                                                                     std::uint64_t attempt_id);
 

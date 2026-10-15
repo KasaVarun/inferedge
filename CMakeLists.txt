@@ -235,6 +235,7 @@ add_library(
     src/inference_engine.cpp
     src/tensor_batch.cpp
     src/neural_reference.cpp
+    src/resnet18_fixtures.cpp
 )
 if(NOT CMAKE_CXX_COMPILER_ID MATCHES "AppleClang|Clang|GNU")
     message(FATAL_ERROR "neural_reference.cpp requires -ffp-contract=off")
@@ -386,6 +387,7 @@ add_executable(
     tests/mnist_inference_test.cpp
     tests/neural_reference_test.cpp
     tests/dynamic_workload_inference_test.cpp
+    tests/resnet18_inference_test.cpp
     tests/benchmark_runner_test.cpp
     tests/concurrent_inference_test.cpp
     tests/concurrent_benchmark_test.cpp
@@ -397,6 +399,7 @@ target_link_libraries(
         inferedge_warnings
         inferedge_benchmark
         inferedge_concurrent_benchmark
+        inferedge_scheduler_benchmark
         GTest::gtest_main
 )
 target_compile_definitions(
@@ -417,6 +420,8 @@ target_compile_definitions(
         "INFEREDGE_MLP_SMALL_FIXTURE_DIR=\"${INFEREDGE_MLP_SMALL_FIXTURE_DIR}\""
         "INFEREDGE_MLP_MEDIUM_FIXTURE_DIR=\"${INFEREDGE_MLP_MEDIUM_FIXTURE_DIR}\""
         "INFEREDGE_GEMM_FIXTURE_DIR=\"${INFEREDGE_GEMM_FIXTURE_DIR}\""
+        "INFEREDGE_RESNET18_MODEL_PATH=\"${INFEREDGE_RESNET18_MODEL}\""
+        "INFEREDGE_RESNET18_FIXTURE_DIR=\"${INFEREDGE_RESNET18_FIXTURE_DIR}\""
 )
 set_target_properties(inferedge_onnx_smoke PROPERTIES
     BUILD_RPATH "${INFEREDGE_ONNXRUNTIME_LIB_DIR}"

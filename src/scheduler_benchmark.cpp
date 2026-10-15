@@ -1,6 +1,7 @@
 #include "inferedge/scheduler_benchmark.hpp"
 
 #include "inferedge/neural_reference.hpp"
+#include "inferedge/resnet18_fixtures.hpp"
 
 #include <algorithm>
 #include <array>
@@ -320,6 +321,9 @@ std::string prepare_inflight_expectation(const PreparedModel& model,
     item.expected_c0 = tensors.expected_c0;
     item.expected_c1 = tensors.expected_c1;
     item.expected_outputs.clear();
+    if (model_id == SchedulerBenchmarkModelId::kResnet18F32) {
+        return "resnet18_f32 requires an explicit fixture identity";
+    }
     if (!model.neural) {
         return {};
     }
@@ -1459,6 +1463,16 @@ ModelPin pin_for(SchedulerBenchmarkModelId id) {
                 kGemmWeightsSha256,
                 true,
                 NeuralWorkload::kGemm};
+    case SchedulerBenchmarkModelId::kResnet18F32:
+        return {kResNet18InputName,
+                kResNet18OutputName,
+                0,
+                kResNet18LogitElements,
+                kResNet18OnnxSha256,
+                nullptr,
+                nullptr,
+                true,
+                NeuralWorkload::kMlpSmall};
     case SchedulerBenchmarkModelId::kBatchAddF32:
         break;
     }
@@ -1645,10 +1659,24 @@ bool static_batch_row(const TensorMetadata& metadata, std::int64_t width) {
            metadata.dimensions[0] < 0 && metadata.dimensions[1] == width;
 }
 
+bool static_batch_nchw(const TensorMetadata& metadata) {
+    return metadata.element_type == ElementType::kFloat32 && metadata.dimensions.size() == 4 &&
+           metadata.dimensions[0] < 0 && metadata.dimensions[1] == 3 &&
+           metadata.dimensions[2] == 224 && metadata.dimensions[3] == 224;
+}
+
 std::string metadata_matches(const InferenceEngine& engine, const ModelPin& pin,
                              SchedulerBenchmarkModelId id) {
     const std::vector<TensorMetadata>& inputs = engine.inputs();
     const std::vector<TensorMetadata>& outputs = engine.outputs();
+    if (id == SchedulerBenchmarkModelId::kResnet18F32) {
+        if (inputs.size() != 1 || outputs.size() != 1 || inputs[0].name != pin.input_name ||
+            outputs[0].name != pin.output_name || !static_batch_nchw(inputs[0]) ||
+            !static_batch_row(outputs[0], static_cast<std::int64_t>(pin.output_width))) {
+            return "model metadata does not match resnet18_f32";
+        }
+        return {};
+    }
     if (!pin.neural) {
         if (inputs.size() != 2 || outputs.size() != 1 || inputs[0].name != "A" ||
             inputs[1].name != "B" || outputs[0].name != "C" || !static_batch_row(inputs[0], 2) ||
@@ -1703,7 +1731,7 @@ PrepareResult prepare_model(const SchedulerBenchmarkConfig& config) {
     prepared->neural = pin.neural;
     prepared->workload = pin.workload;
     prepared->model_digest = model_digest.hex;
-    if (pin.neural) {
+    if (pin.neural && pin.weights_file != nullptr) {
         prepared->weights_path =
             std::filesystem::path{config.model_path}.parent_path() / "fixtures" / pin.weights_file;
         const SchedulerBenchmarkDigest weights_digest = hash_regular_file(prepared->weights_path);
@@ -1738,7 +1766,7 @@ std::string recheck_identity(const PreparedModel& model, const SchedulerBenchmar
     if (model_digest.hex != model.model_digest) {
         return "model bytes changed before measured execution";
     }
-    if (!model.neural) {
+    if (!model.neural || model.weights_path.empty()) {
         return {};
     }
     const SchedulerBenchmarkDigest weights_digest = hash_regular_file(model.weights_path);
@@ -1752,6 +1780,11 @@ std::string recheck_identity(const PreparedModel& model, const SchedulerBenchmar
 }
 
 } // namespace
+
+std::string scheduler_benchmark_metadata_error(SchedulerBenchmarkModelId model,
+                                               const InferenceEngine& engine) {
+    return metadata_matches(engine, pin_for(model), model);
+}
 
 SchedulerConfig scheduler_config(const SchedulerBenchmarkConfig& config) {
     SchedulerConfig built;
@@ -1863,6 +1896,9 @@ SchedulerBenchmarkTensors scheduler_benchmark_request(SchedulerBenchmarkModelId 
                                                       std::uint64_t attempt_id) {
     const ModelPin pin = pin_for(model);
     SchedulerBenchmarkTensors tensors;
+    if (model == SchedulerBenchmarkModelId::kResnet18F32) {
+        return tensors;
+    }
     if (!pin.neural) {
         const float a0 = static_cast<float>(attempt_id % 1000U);
         const float a1 = static_cast<float>((attempt_id / 1000U) % 1000U);
@@ -1905,6 +1941,12 @@ SchedulerBenchmarkOutputCheck scheduler_benchmark_check_output(SchedulerBenchmar
     }
     if (reference.size() != pin.output_width) {
         checked.message = "reference width mismatch";
+        return checked;
+    }
+    if (model == SchedulerBenchmarkModelId::kResnet18F32) {
+        const ResNet18OutputCheck resnet = resnet18_check_logits(output, reference);
+        checked.matched = resnet.matched;
+        checked.message = resnet.message;
         return checked;
     }
     if (!pin.neural) {
