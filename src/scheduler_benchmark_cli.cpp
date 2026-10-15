@@ -120,6 +120,8 @@ std::string scheduler_benchmark_help_message() {
            "\n"
            "Benchmark one InferenceScheduler. --format json is schema 3.\n"
            "--completion-timing selects schema 4 and one pre-publication stamp.\n"
+           "--batch-decision-timing with --batch-decision-event-capacity selects schema 5.\n"
+           "Schema 5 with --completion-timing keeps every schema-4 timing field.\n"
            "Warm-up uses a separate scheduler and is excluded from the report.\n"
            "Open-loop lag above --lag-tolerance-ms stops the rest of the schedule.\n"
            "An outstanding-cap hit skips that opportunity and is not a rejection.\n"
@@ -151,6 +153,10 @@ std::string scheduler_benchmark_help_message() {
            "  --arrival-aware-batching       arrival-rate-aware early seal (opt-in; not adaptive)\n"
            "  --disable-metrics              leave scheduler metrics off\n"
            "  --completion-timing            schema 4 pre-publication stamps (default off)\n"
+           "  --batch-decision-timing        schema 5 sealed-batch open/seal stamps (default off)\n"
+           "  --batch-decision-event-capacity <n>\n"
+           "                                 per-worker event capacity 1..65536 (required with\n"
+           "                                 --batch-decision-timing; rejected alone)\n"
            "  --format <text|json>           default text\n"
            "  --help, -h\n"
            "  --version, -V\n";
@@ -213,6 +219,8 @@ parse_scheduler_benchmark_cli(const std::vector<std::string_view>& args) {
     bool saw_format = false;
     bool saw_metrics = false;
     bool saw_timing = false;
+    bool saw_batch_decision = false;
+    bool saw_batch_decision_capacity = false;
 
     for (std::size_t index = 0; index < args.size(); ++index) {
         const std::string_view argument = args[index];
@@ -252,6 +260,14 @@ parse_scheduler_benchmark_cli(const std::vector<std::string_view>& args) {
                 return error_result(duplicated);
             }
             parsed.config.enable_completion_timing = true;
+            continue;
+        }
+        if (argument == "--batch-decision-timing") {
+            if (const std::string duplicated = assign_once(saw_batch_decision, argument);
+                !duplicated.empty()) {
+                return error_result(duplicated);
+            }
+            parsed.config.enable_batch_decision_timing = true;
             continue;
         }
         if (argument == "--disable-metrics") {
@@ -351,6 +367,8 @@ parse_scheduler_benchmark_cli(const std::vector<std::string_view>& args) {
              NumberKind::kNonZero},
             {"--burst-low-ms", &saw_low_ms, nullptr, kMaxSchedulerBenchmarkDurationMs,
              NumberKind::kNonZero},
+            {"--batch-decision-event-capacity", &saw_batch_decision_capacity, nullptr,
+             kMaxBatchDecisionEventCapacity, NumberKind::kNonZero},
         };
         for (const U64Flag& flag : flags) {
             if (argument != flag.name && !argument.starts_with(std::string{flag.name} + "=")) {
@@ -396,6 +414,8 @@ parse_scheduler_benchmark_cli(const std::vector<std::string_view>& args) {
             } else if (flag.name == "--burst-low-ms") {
                 parsed.config.burst_low =
                     std::chrono::milliseconds{static_cast<std::int64_t>(number)};
+            } else if (flag.name == "--batch-decision-event-capacity") {
+                parsed.config.batch_decision_event_capacity = static_cast<std::uint32_t>(number);
             }
             break;
         }
@@ -491,6 +511,20 @@ parse_scheduler_benchmark_cli(const std::vector<std::string_view>& args) {
             return error_result(
                 "error: --arrival-aware-batching requires --max-batch-delay-ms > 0\n");
         }
+    }
+    if (parsed.config.enable_batch_decision_timing) {
+        if (!saw_batch_decision_capacity) {
+            return error_result(
+                "error: --batch-decision-timing requires --batch-decision-event-capacity\n");
+        }
+        if (parsed.config.batch_decision_event_capacity < 1 ||
+            parsed.config.batch_decision_event_capacity > kMaxBatchDecisionEventCapacity) {
+            return error_result(
+                "error: --batch-decision-event-capacity must be from 1 through 65536\n");
+        }
+    } else if (saw_batch_decision_capacity) {
+        return error_result(
+            "error: --batch-decision-event-capacity requires --batch-decision-timing\n");
     }
     return parsed;
 }

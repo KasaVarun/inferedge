@@ -1597,3 +1597,497 @@ TEST(SchedulerBenchmarkNeuralTest, DistinctAttemptRowsFailWhenSwapped) {
             inferedge::SchedulerBenchmarkModelId::kMlpSmallF32, early_as_early, expected_early)
             .matched);
 }
+
+namespace {
+
+std::vector<std::string_view> RequiredCliBase() {
+    return {"--model",
+            "model.onnx",
+            "--workers",
+            "1",
+            "--queue-capacity",
+            "4",
+            "--workload",
+            "closed_loop",
+            "--max-offered",
+            "1",
+            "--max-outstanding",
+            "1",
+            "--duration-ms",
+            "50",
+            "--completion-timeout-ms",
+            "1000"};
+}
+
+SchedulerBenchmarkReport MinimalJsonReport() {
+    SchedulerBenchmarkReport report;
+    report.valid = true;
+    report.model = "models/batch_add_f32.onnx";
+    report.workload = "closed_loop";
+    report.completion_observation = "closed_loop_producer_wait";
+    report.worker_count = 1;
+    report.queue_capacity = 4;
+    report.enable_batching = true;
+    report.max_batch_size = 4;
+    report.max_batch_delay = 2ms;
+    report.enable_metrics = true;
+    report.metrics.enabled = true;
+    report.metrics.finalized = true;
+    report.warmup_uses_separate_scheduler = true;
+    report.arrival_stop_reason = "max_offered";
+    return report;
+}
+
+inferedge::BatchDecisionEvent MakeEvent(std::uint64_t batch_id, std::uint32_t worker,
+                                        std::int64_t open_ns, std::int64_t seal_ns,
+                                        std::uint32_t size, inferedge::BatchSealReason reason) {
+    inferedge::BatchDecisionEvent event;
+    event.batch_id = batch_id;
+    event.worker_index = worker;
+    event.batch_open_ns = open_ns;
+    event.batch_seal_ns = seal_ns;
+    event.batch_size = size;
+    event.seal_reason = reason;
+    return event;
+}
+
+} // namespace
+
+TEST(SchedulerBenchmarkBatchDecisionCliTest, DefaultsLeaveTimingOff) {
+    const auto parsed = inferedge::parse_scheduler_benchmark_cli(RequiredCliBase());
+    ASSERT_EQ(parsed.action, SchedulerBenchmarkCliAction::kRun) << parsed.message;
+    EXPECT_FALSE(parsed.config.enable_batch_decision_timing);
+    EXPECT_EQ(parsed.config.batch_decision_event_capacity, 0U);
+    EXPECT_FALSE(parsed.config.enable_completion_timing);
+}
+
+TEST(SchedulerBenchmarkBatchDecisionCliTest, ExplicitTimingRequiresCapacity) {
+    auto args = RequiredCliBase();
+    args.push_back("--batch-decision-timing");
+    const auto missing = inferedge::parse_scheduler_benchmark_cli(args);
+    EXPECT_EQ(missing.action, SchedulerBenchmarkCliAction::kError);
+    EXPECT_NE(missing.message.find("--batch-decision-event-capacity"), std::string::npos);
+
+    args.push_back("--batch-decision-event-capacity");
+    args.push_back("8");
+    const auto ok = inferedge::parse_scheduler_benchmark_cli(args);
+    ASSERT_EQ(ok.action, SchedulerBenchmarkCliAction::kRun) << ok.message;
+    EXPECT_TRUE(ok.config.enable_batch_decision_timing);
+    EXPECT_EQ(ok.config.batch_decision_event_capacity, 8U);
+}
+
+TEST(SchedulerBenchmarkBatchDecisionCliTest, CapacityOnlyIsRejected) {
+    auto args = RequiredCliBase();
+    args.push_back("--batch-decision-event-capacity");
+    args.push_back("8");
+    const auto parsed = inferedge::parse_scheduler_benchmark_cli(args);
+    EXPECT_EQ(parsed.action, SchedulerBenchmarkCliAction::kError);
+    EXPECT_NE(parsed.message.find("--batch-decision-timing"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkBatchDecisionCliTest, CapacityRangeIsValidated) {
+    auto zero_args = RequiredCliBase();
+    zero_args.push_back("--batch-decision-timing");
+    zero_args.push_back("--batch-decision-event-capacity");
+    zero_args.push_back("0");
+    EXPECT_EQ(inferedge::parse_scheduler_benchmark_cli(zero_args).action,
+              SchedulerBenchmarkCliAction::kError);
+
+    auto high_args = RequiredCliBase();
+    high_args.push_back("--batch-decision-timing");
+    high_args.push_back("--batch-decision-event-capacity");
+    high_args.push_back("65537");
+    EXPECT_EQ(inferedge::parse_scheduler_benchmark_cli(high_args).action,
+              SchedulerBenchmarkCliAction::kError);
+}
+
+TEST(SchedulerBenchmarkBatchDecisionJsonTest, SchemaMatrixUsesEffectiveFlags) {
+    SchedulerBenchmarkReport report = MinimalJsonReport();
+    {
+        const auto json = inferedge::write_scheduler_benchmark_json(report, "0.1.0");
+        ASSERT_TRUE(json.error.empty()) << json.error;
+        EXPECT_NE(json.text.find("\"schema_version\": 3"), std::string::npos);
+        EXPECT_EQ(json.text.find("\"batch_decision\""), std::string::npos);
+        EXPECT_EQ(json.text.find("enable_batch_decision_timing"), std::string::npos);
+    }
+    report.completion_timing_enabled = true;
+    report.steady_clock_period_num = 1;
+    report.steady_clock_period_den = 1000000000;
+    report.pre_publication_latency.mean_nanoseconds = 1.0;
+    report.pre_publication_to_observation_delay.mean_nanoseconds = 1.0;
+    {
+        const auto json = inferedge::write_scheduler_benchmark_json(report, "0.1.0");
+        ASSERT_TRUE(json.error.empty()) << json.error;
+        EXPECT_NE(json.text.find("\"schema_version\": 4"), std::string::npos);
+        EXPECT_EQ(json.text.find("\"batch_decision\""), std::string::npos);
+    }
+    report.enable_batch_decision_timing = true;
+    report.batch_decision_event_capacity = 4;
+    report.batch_decision.enabled = true;
+    report.batch_decision.timing_data_valid = true;
+    report.batch_decision.buffer_capacity_per_worker = 4;
+    {
+        const auto json = inferedge::write_scheduler_benchmark_json(report, "0.1.0");
+        ASSERT_TRUE(json.error.empty()) << json.error;
+        EXPECT_NE(json.text.find("\"schema_version\": 5"), std::string::npos);
+        EXPECT_NE(json.text.find("\"batch_decision\""), std::string::npos);
+        EXPECT_NE(json.text.find("\"enable_completion_timing\": true"), std::string::npos);
+        EXPECT_NE(json.text.find("\"pre_publication_latency\""), std::string::npos);
+        EXPECT_NE(json.text.find("\"enable_batch_decision_timing\": true"), std::string::npos);
+        EXPECT_NE(json.text.find("\"batch_decision_event_capacity\": 4"), std::string::npos);
+    }
+    report.completion_timing_enabled = false;
+    {
+        const auto json = inferedge::write_scheduler_benchmark_json(report, "0.1.0");
+        ASSERT_TRUE(json.error.empty()) << json.error;
+        EXPECT_NE(json.text.find("\"schema_version\": 5"), std::string::npos);
+        EXPECT_EQ(json.text.find("\"pre_publication_latency\""), std::string::npos);
+        EXPECT_EQ(json.text.find("completion_timing_enabled"), std::string::npos);
+    }
+}
+
+TEST(SchedulerBenchmarkBatchDecisionJsonTest, Schema5SerializesRequiredFieldsAndReasons) {
+    SchedulerBenchmarkReport report = MinimalJsonReport();
+    report.enable_batch_decision_timing = true;
+    report.batch_decision_event_capacity = 8;
+    report.batch_decision.enabled = true;
+    report.batch_decision.timing_data_valid = true;
+    report.batch_decision.buffer_capacity_per_worker = 8;
+    report.batch_decision.sealed_batches_total = 6;
+    report.batch_decision.events_recorded = 6;
+    report.batch_decision.events = {
+        MakeEvent(1, 0, 10, 20, 1, inferedge::BatchSealReason::kCapacityReached),
+        MakeEvent(2, 0, 30, 40, 1, inferedge::BatchSealReason::kDeadlineExpired),
+        MakeEvent(3, 0, 50, 60, 2, inferedge::BatchSealReason::kG3MinimumTarget),
+        MakeEvent(4, 0, 70, 80, 2, inferedge::BatchSealReason::kG4ArrivalAware),
+        MakeEvent(5, 0, 90, 100, 1, inferedge::BatchSealReason::kQueueClosed),
+        MakeEvent(6, 0, 110, 120, 1, inferedge::BatchSealReason::kShutdownOrOther),
+    };
+    const auto json = inferedge::write_scheduler_benchmark_json(report, "0.1.0");
+    ASSERT_TRUE(json.error.empty()) << json.error;
+    EXPECT_NE(json.text.find("\"schema_version\": 5"), std::string::npos);
+    EXPECT_NE(json.text.find("\"clock\": \"steady_clock\""), std::string::npos);
+    EXPECT_NE(json.text.find("\"timestamp_unit\": \"nanoseconds\""), std::string::npos);
+    EXPECT_NE(json.text.find("\"timestamp_epoch\": \"steady_clock_time_since_epoch\""),
+              std::string::npos);
+    EXPECT_NE(json.text.find("\"seal_reason\": \"capacity_reached\""), std::string::npos);
+    EXPECT_NE(json.text.find("\"seal_reason\": \"deadline_expired\""), std::string::npos);
+    EXPECT_NE(json.text.find("\"seal_reason\": \"g3_minimum_target\""), std::string::npos);
+    EXPECT_NE(json.text.find("\"seal_reason\": \"g4_arrival_aware\""), std::string::npos);
+    EXPECT_NE(json.text.find("\"seal_reason\": \"queue_closed\""), std::string::npos);
+    EXPECT_NE(json.text.find("\"seal_reason\": \"shutdown_or_other\""), std::string::npos);
+    EXPECT_EQ(json.text.find("request_id"), std::string::npos);
+    EXPECT_EQ(json.text.find("payload"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkBatchDecisionJsonTest, ZeroEventTraceCanBeValid) {
+    SchedulerBenchmarkReport report = MinimalJsonReport();
+    report.enable_batching = false;
+    report.max_batch_size = 1;
+    report.enable_batch_decision_timing = true;
+    report.batch_decision_event_capacity = 4;
+    report.batch_decision.enabled = true;
+    report.batch_decision.timing_data_valid = true;
+    report.batch_decision.buffer_capacity_per_worker = 4;
+    report.batch_decision.sealed_batches_total = 0;
+    report.batch_decision.events_recorded = 0;
+    report.batch_decision.events_dropped = 0;
+    const auto json = inferedge::write_scheduler_benchmark_json(report, "0.1.0");
+    ASSERT_TRUE(json.error.empty()) << json.error;
+    EXPECT_NE(json.text.find("\"schema_version\": 5"), std::string::npos);
+    EXPECT_NE(json.text.find("\"timing_data_valid\": true"), std::string::npos);
+    EXPECT_NE(json.text.find("\"events\": []"), std::string::npos);
+    EXPECT_NE(json.text.find("\"sealed_batches_total\": 0"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkBatchDecisionJsonTest, OverflowTraceIsInvalidButSerializable) {
+    SchedulerBenchmarkReport report = MinimalJsonReport();
+    report.enable_batch_decision_timing = true;
+    report.batch_decision_event_capacity = 1;
+    report.batch_decision.enabled = true;
+    report.batch_decision.timing_data_valid = false;
+    report.batch_decision.trace_overflow = true;
+    report.batch_decision.buffer_capacity_per_worker = 1;
+    report.batch_decision.sealed_batches_total = 2;
+    report.batch_decision.events_recorded = 1;
+    report.batch_decision.events_dropped = 1;
+    report.batch_decision.events = {
+        MakeEvent(1, 0, 10, 20, 1, inferedge::BatchSealReason::kDeadlineExpired),
+    };
+    const auto json = inferedge::write_scheduler_benchmark_json(report, "0.1.0");
+    ASSERT_TRUE(json.error.empty()) << json.error;
+    EXPECT_NE(json.text.find("\"trace_overflow\": true"), std::string::npos);
+    EXPECT_NE(json.text.find("\"timing_data_valid\": false"), std::string::npos);
+    EXPECT_NE(json.text.find("\"events_dropped\": 1"), std::string::npos);
+    EXPECT_TRUE(report.valid);
+}
+
+TEST(SchedulerBenchmarkBatchDecisionJsonTest, RejectsClaimedValidWithNegativeDuration) {
+    SchedulerBenchmarkReport report = MinimalJsonReport();
+    report.enable_batch_decision_timing = true;
+    report.batch_decision_event_capacity = 1;
+    report.batch_decision.enabled = true;
+    report.batch_decision.timing_data_valid = true;
+    report.batch_decision.buffer_capacity_per_worker = 1;
+    report.batch_decision.sealed_batches_total = 1;
+    report.batch_decision.events_recorded = 1;
+    report.batch_decision.events = {
+        MakeEvent(1, 0, 50, 40, 1, inferedge::BatchSealReason::kDeadlineExpired),
+    };
+    const auto json = inferedge::write_scheduler_benchmark_json(report, "0.1.0");
+    EXPECT_FALSE(json.error.empty());
+    EXPECT_TRUE(json.text.empty());
+}
+
+TEST(SchedulerBenchmarkBatchDecisionJsonTest, RejectsUnknownReasonAndDuplicateIds) {
+    SchedulerBenchmarkReport report = MinimalJsonReport();
+    report.enable_batch_decision_timing = true;
+    report.batch_decision_event_capacity = 2;
+    report.batch_decision.enabled = true;
+    report.batch_decision.timing_data_valid = false;
+    report.batch_decision.buffer_capacity_per_worker = 2;
+    report.batch_decision.sealed_batches_total = 1;
+    report.batch_decision.events_recorded = 1;
+    report.batch_decision.events = {
+        MakeEvent(1, 0, 10, 20, 1, static_cast<inferedge::BatchSealReason>(255)),
+    };
+    EXPECT_FALSE(inferedge::write_scheduler_benchmark_json(report, "0.1.0").error.empty());
+
+    report.batch_decision.events = {
+        MakeEvent(7, 0, 10, 20, 1, inferedge::BatchSealReason::kDeadlineExpired),
+        MakeEvent(7, 0, 30, 40, 1, inferedge::BatchSealReason::kCapacityReached),
+    };
+    report.batch_decision.events_recorded = 2;
+    report.batch_decision.sealed_batches_total = 2;
+    EXPECT_FALSE(inferedge::write_scheduler_benchmark_json(report, "0.1.0").error.empty());
+}
+
+TEST(SchedulerBenchmarkBatchDecisionJsonTest, RejectsOverflowClaimedValid) {
+    SchedulerBenchmarkReport report = MinimalJsonReport();
+    report.enable_batch_decision_timing = true;
+    report.batch_decision_event_capacity = 1;
+    report.batch_decision.enabled = true;
+    report.batch_decision.timing_data_valid = true;
+    report.batch_decision.trace_overflow = true;
+    report.batch_decision.buffer_capacity_per_worker = 1;
+    report.batch_decision.sealed_batches_total = 1;
+    report.batch_decision.events_recorded = 1;
+    report.batch_decision.events_dropped = 0;
+    report.batch_decision.events = {
+        MakeEvent(1, 0, 10, 20, 1, inferedge::BatchSealReason::kDeadlineExpired),
+    };
+    EXPECT_FALSE(inferedge::write_scheduler_benchmark_json(report, "0.1.0").error.empty());
+}
+
+TEST(SchedulerBenchmarkBatchDecisionJsonTest, EmitsBooleansNotIntegers) {
+    SchedulerBenchmarkReport report = MinimalJsonReport();
+    report.enable_batch_decision_timing = true;
+    report.batch_decision_event_capacity = 1;
+    report.batch_decision.enabled = true;
+    report.batch_decision.timing_data_valid = true;
+    report.batch_decision.buffer_capacity_per_worker = 1;
+    const auto json = inferedge::write_scheduler_benchmark_json(report, "0.1.0");
+    ASSERT_TRUE(json.error.empty()) << json.error;
+    EXPECT_NE(json.text.find("\"timing_data_valid\": true"), std::string::npos);
+    EXPECT_NE(json.text.find("\"trace_overflow\": false"), std::string::npos);
+    EXPECT_NE(json.text.find("\"enabled\": true"), std::string::npos);
+    EXPECT_EQ(json.text.find("\"timing_data_valid\": 1"), std::string::npos);
+    EXPECT_EQ(json.text.find("\"trace_overflow\": 0"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkBatchDecisionJsonTest, RejectsOutOfRangeWorkerIndex) {
+    SchedulerBenchmarkReport report = MinimalJsonReport();
+    report.worker_count = 1;
+    report.enable_batch_decision_timing = true;
+    report.batch_decision_event_capacity = 1;
+    report.batch_decision.enabled = true;
+    report.batch_decision.timing_data_valid = false;
+    report.batch_decision.buffer_capacity_per_worker = 1;
+    report.batch_decision.sealed_batches_total = 1;
+    report.batch_decision.events_recorded = 1;
+    report.batch_decision.events = {
+        MakeEvent(1, 3, 10, 20, 1, inferedge::BatchSealReason::kDeadlineExpired),
+    };
+    EXPECT_FALSE(inferedge::write_scheduler_benchmark_json(report, "0.1.0").error.empty());
+}
+
+TEST(SchedulerBenchmarkBatchDecisionRunTest, UnbatchedPathEmitsValidZeroEventSchema5) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.max_offered = 2;
+    config.max_outstanding = 2;
+    config.enable_batching = false;
+    config.enable_batch_decision_timing = true;
+    config.batch_decision_event_capacity = 8;
+    EXPECT_TRUE(inferedge::scheduler_config(config).enable_batch_decision_timing);
+    EXPECT_EQ(inferedge::scheduler_config(config).batch_decision_event_capacity, 8U);
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.valid);
+    EXPECT_TRUE(run.report.enable_batch_decision_timing);
+    EXPECT_TRUE(run.report.batch_decision.enabled);
+    EXPECT_TRUE(run.report.batch_decision.timing_data_valid);
+    EXPECT_EQ(run.report.batch_decision.sealed_batches_total, 0U);
+    EXPECT_TRUE(run.report.batch_decision.events.empty());
+    const auto json = inferedge::write_scheduler_benchmark_json(run.report, "0.1.0");
+    ASSERT_TRUE(json.error.empty()) << json.error;
+    EXPECT_NE(json.text.find("\"schema_version\": 5"), std::string::npos);
+    EXPECT_NE(json.text.find("\"events\": []"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkBatchDecisionRunTest, G2DeadlineEventIsRecorded) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.max_offered = 1;
+    config.max_outstanding = 1;
+    config.enable_batching = true;
+    config.max_batch_size = 4;
+    // delay 0: wait_for_more is false, so the size-one group seals on the
+    // deadline branch before drain can close the queue.
+    config.max_batch_delay = 0ms;
+    config.enable_batch_decision_timing = true;
+    config.batch_decision_event_capacity = 16;
+    config.model_path = INFEREDGE_BATCH_ADD_MODEL_PATH;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.valid);
+    ASSERT_TRUE(run.report.batch_decision.timing_data_valid);
+    ASSERT_EQ(run.report.batch_decision.events.size(), 1U);
+    EXPECT_EQ(run.report.batch_decision.events[0].seal_reason,
+              inferedge::BatchSealReason::kDeadlineExpired);
+    EXPECT_GE(run.report.batch_decision.events[0].batch_seal_ns,
+              run.report.batch_decision.events[0].batch_open_ns);
+    EXPECT_EQ(run.report.batch_decision.events[0].batch_size, 1U);
+    const auto json = inferedge::write_scheduler_benchmark_json(run.report, "0.1.0");
+    ASSERT_TRUE(json.error.empty()) << json.error;
+    EXPECT_NE(json.text.find("\"seal_reason\": \"deadline_expired\""), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkBatchDecisionRunTest, G3MinimumTargetEventIsRecorded) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.max_offered = 2;
+    config.max_outstanding = 2;
+    config.enable_batching = true;
+    config.max_batch_size = 4;
+    config.max_batch_delay = 50ms;
+    config.adaptive_batching = true;
+    config.enable_batch_decision_timing = true;
+    config.batch_decision_event_capacity = 16;
+    config.model_path = INFEREDGE_BATCH_ADD_MODEL_PATH;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.valid);
+    ASSERT_TRUE(run.report.batch_decision.timing_data_valid);
+    ASSERT_FALSE(run.report.batch_decision.events.empty());
+    bool saw_g3 = false;
+    for (const auto& event : run.report.batch_decision.events) {
+        if (event.seal_reason == inferedge::BatchSealReason::kG3MinimumTarget) {
+            saw_g3 = true;
+            EXPECT_GE(event.batch_size, 2U);
+        }
+    }
+    EXPECT_TRUE(saw_g3);
+    const auto json = inferedge::write_scheduler_benchmark_json(run.report, "0.1.0");
+    ASSERT_TRUE(json.error.empty()) << json.error;
+    EXPECT_NE(json.text.find("\"adaptive_batching\": true"), std::string::npos);
+    EXPECT_NE(json.text.find("\"seal_reason\": \"g3_minimum_target\""), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkBatchDecisionRunTest, G4ArrivalAwareOrDeadlineIsRecorded) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.max_offered = 4;
+    config.max_outstanding = 4;
+    config.enable_batching = true;
+    config.max_batch_size = 4;
+    config.max_batch_delay = 20ms;
+    config.arrival_aware_batching = true;
+    config.enable_batch_decision_timing = true;
+    config.batch_decision_event_capacity = 32;
+    config.model_path = INFEREDGE_BATCH_ADD_MODEL_PATH;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.valid);
+    ASSERT_TRUE(run.report.batch_decision.timing_data_valid);
+    ASSERT_FALSE(run.report.batch_decision.events.empty());
+    for (const auto& event : run.report.batch_decision.events) {
+        EXPECT_TRUE(event.seal_reason == inferedge::BatchSealReason::kG4ArrivalAware ||
+                    event.seal_reason == inferedge::BatchSealReason::kDeadlineExpired ||
+                    event.seal_reason == inferedge::BatchSealReason::kCapacityReached ||
+                    event.seal_reason == inferedge::BatchSealReason::kQueueClosed);
+    }
+    const auto json = inferedge::write_scheduler_benchmark_json(run.report, "0.1.0");
+    ASSERT_TRUE(json.error.empty()) << json.error;
+    EXPECT_NE(json.text.find("\"arrival_aware_batching\": true"), std::string::npos);
+    EXPECT_NE(json.text.find("\"schema_version\": 5"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkBatchDecisionRunTest, CombinedCompletionTimingKeepsSchema4Fields) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.max_offered = 1;
+    config.max_outstanding = 1;
+    config.enable_batching = true;
+    config.max_batch_size = 4;
+    config.max_batch_delay = 5ms;
+    config.enable_completion_timing = true;
+    config.enable_batch_decision_timing = true;
+    config.batch_decision_event_capacity = 8;
+    config.model_path = INFEREDGE_BATCH_ADD_MODEL_PATH;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.valid);
+    EXPECT_TRUE(run.report.completion_timing_enabled);
+    EXPECT_TRUE(run.report.batch_decision.timing_data_valid);
+    const auto json = inferedge::write_scheduler_benchmark_json(run.report, "0.1.0");
+    ASSERT_TRUE(json.error.empty()) << json.error;
+    EXPECT_NE(json.text.find("\"schema_version\": 5"), std::string::npos);
+    EXPECT_NE(json.text.find("\"completion_timing_enabled\": true"), std::string::npos);
+    EXPECT_NE(json.text.find("\"pre_publication_latency\""), std::string::npos);
+    EXPECT_NE(json.text.find("\"pre_publication_to_observation_delay\""), std::string::npos);
+    EXPECT_NE(json.text.find("\"batch_decision\""), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkBatchDecisionRunTest, OverflowDoesNotInvalidateCorrectness) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.max_offered = 4;
+    config.max_outstanding = 4;
+    config.enable_batching = true;
+    config.max_batch_size = 1;
+    config.max_batch_delay = 1ms;
+    config.enable_batch_decision_timing = true;
+    config.batch_decision_event_capacity = 1;
+    config.model_path = INFEREDGE_BATCH_ADD_MODEL_PATH;
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_TRUE(run.report.valid);
+    EXPECT_EQ(run.report.correctness_mismatches, 0U);
+    EXPECT_TRUE(run.report.batch_decision.trace_overflow);
+    EXPECT_FALSE(run.report.batch_decision.timing_data_valid);
+    EXPECT_GT(run.report.batch_decision.events_dropped, 0U);
+    EXPECT_EQ(run.report.batch_decision.events_recorded + run.report.batch_decision.events_dropped,
+              run.report.batch_decision.sealed_batches_total);
+    const auto json = inferedge::write_scheduler_benchmark_json(run.report, "0.1.0");
+    ASSERT_TRUE(json.error.empty()) << json.error;
+    EXPECT_NE(json.text.find("\"timing_data_valid\": false"), std::string::npos);
+    EXPECT_NE(json.text.find("\"valid\": true"), std::string::npos);
+}
+
+TEST(SchedulerBenchmarkBatchDecisionRunTest, ConfigBridgeMatchesReportIdentity) {
+    SchedulerBenchmarkConfig config = MeasuredConfig();
+    config.max_offered = 1;
+    config.max_outstanding = 1;
+    config.enable_batch_decision_timing = true;
+    config.batch_decision_event_capacity = 3;
+    const auto bridged = inferedge::scheduler_config(config);
+    EXPECT_TRUE(bridged.enable_batch_decision_timing);
+    EXPECT_EQ(bridged.batch_decision_event_capacity, 3U);
+    const SchedulerBenchmarkRun run = inferedge::run_scheduler_benchmark(config);
+    ASSERT_EQ(run.kind, SchedulerBenchmarkErrorKind::kNone) << run.message;
+    EXPECT_EQ(run.report.enable_batch_decision_timing, bridged.enable_batch_decision_timing);
+    EXPECT_EQ(run.report.batch_decision_event_capacity, bridged.batch_decision_event_capacity);
+}
+
+TEST(SchedulerBenchmarkBatchDecisionCliTest, HelpMentionsBatchDecisionFlags) {
+    const auto parsed = inferedge::parse_scheduler_benchmark_cli({});
+    ASSERT_EQ(parsed.action, SchedulerBenchmarkCliAction::kHelp);
+    EXPECT_NE(parsed.message.find("--batch-decision-timing"), std::string::npos);
+    EXPECT_NE(parsed.message.find("--batch-decision-event-capacity"), std::string::npos);
+    EXPECT_NE(parsed.message.find("schema 5"), std::string::npos);
+}

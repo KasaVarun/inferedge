@@ -4,11 +4,98 @@
 #include <cmath>
 #include <string>
 #include <system_error>
+#include <unordered_set>
 
 namespace inferedge {
 namespace {
 
 constexpr const char* kToolName = "inferedge-bench-scheduler";
+
+[[nodiscard]] std::uint64_t schema_version_for(const SchedulerBenchmarkReport& report) noexcept {
+    if (report.enable_batch_decision_timing) {
+        return 5;
+    }
+    if (report.completion_timing_enabled) {
+        return 4;
+    }
+    return 3;
+}
+
+[[nodiscard]] const char* seal_reason_name(BatchSealReason reason) noexcept {
+    switch (reason) {
+    case BatchSealReason::kCapacityReached:
+        return "capacity_reached";
+    case BatchSealReason::kDeadlineExpired:
+        return "deadline_expired";
+    case BatchSealReason::kG3MinimumTarget:
+        return "g3_minimum_target";
+    case BatchSealReason::kG4ArrivalAware:
+        return "g4_arrival_aware";
+    case BatchSealReason::kQueueClosed:
+        return "queue_closed";
+    case BatchSealReason::kShutdownOrOther:
+        return "shutdown_or_other";
+    }
+    return nullptr;
+}
+
+// Returns an empty string when the snapshot may be serialized. When
+// timing_data_valid is claimed true, every integrity rule must hold. When it
+// is false, structural rules still apply so diagnostics cannot invent a
+// complete valid trace or unknown reason strings.
+[[nodiscard]] std::string validate_batch_decision_for_json(const SchedulerBenchmarkReport& report) {
+    const BatchDecisionTimingSnapshot& snap = report.batch_decision;
+    if (!report.enable_batch_decision_timing) {
+        return {};
+    }
+    if (!snap.enabled) {
+        return "batch_decision.enabled must be true when batch-decision timing is enabled";
+    }
+    if (snap.buffer_capacity_per_worker != report.batch_decision_event_capacity) {
+        return "batch_decision.buffer_capacity_per_worker must match the effective capacity";
+    }
+    if (snap.events.size() != snap.events_recorded) {
+        return "batch_decision.events length must equal events_recorded";
+    }
+    if (snap.events_recorded + snap.events_dropped != snap.sealed_batches_total) {
+        return "batch_decision recorded+dropped must equal sealed_batches_total";
+    }
+    if (snap.trace_overflow && snap.timing_data_valid) {
+        return "batch_decision.timing_data_valid must be false when trace_overflow is true";
+    }
+    if (snap.events_dropped > 0 && snap.timing_data_valid) {
+        return "batch_decision.timing_data_valid must be false when events were dropped";
+    }
+    const std::uint32_t max_batch = report.max_batch_size == 0 ? 1U : report.max_batch_size;
+    std::unordered_set<std::uint64_t> seen_ids;
+    seen_ids.reserve(snap.events.size());
+    for (const BatchDecisionEvent& event : snap.events) {
+        if (seal_reason_name(event.seal_reason) == nullptr) {
+            return "batch_decision event has an unknown seal_reason";
+        }
+        if (event.batch_size < 1) {
+            return "batch_decision event batch_size must be at least 1";
+        }
+        if (event.batch_size > max_batch) {
+            return "batch_decision event batch_size exceeds configured maximum";
+        }
+        if (event.batch_seal_ns < event.batch_open_ns) {
+            return "batch_decision event seal timestamp precedes open";
+        }
+        if (report.worker_count > 0 && event.worker_index >= report.worker_count) {
+            return "batch_decision event worker_index is out of range";
+        }
+        if (!seen_ids.insert(event.batch_id).second) {
+            return "batch_decision event batch_id is not unique";
+        }
+    }
+    if (snap.timing_data_valid) {
+        if (snap.trace_overflow || snap.events_dropped != 0) {
+            return "batch_decision.timing_data_valid claims a complete trace with loss";
+        }
+    }
+    return {};
+}
 
 struct Writer {
     std::string text;
@@ -135,9 +222,15 @@ SchedulerBenchmarkJsonResult write_scheduler_benchmark_json(const SchedulerBench
     if (!finite_report(report)) {
         return failure("JSON numbers must be finite");
     }
+    if (const std::string problem = validate_batch_decision_for_json(report); !problem.empty()) {
+        SchedulerBenchmarkJsonResult rejected;
+        rejected.error = problem;
+        return rejected;
+    }
+    const std::uint64_t schema_version = schema_version_for(report);
     Writer writer;
     writer.raw("{\n  \"schema_version\": ");
-    writer.u64(report.completion_timing_enabled ? 4 : 3);
+    writer.u64(schema_version);
     writer.raw(",\n  \"tool\": ");
     writer.string(kToolName);
     writer.raw(",\n  \"tool_version\": ");
@@ -178,6 +271,12 @@ SchedulerBenchmarkJsonResult write_scheduler_benchmark_json(const SchedulerBench
     writer.boolean(report.enable_metrics);
     if (report.completion_timing_enabled) {
         writer.raw(",\n    \"enable_completion_timing\": true");
+    }
+    if (schema_version >= 5) {
+        writer.raw(",\n    \"enable_batch_decision_timing\": ");
+        writer.boolean(report.enable_batch_decision_timing);
+        writer.raw(",\n    \"batch_decision_event_capacity\": ");
+        writer.u64(report.batch_decision_event_capacity);
     }
     writer.raw("\n  },\n  \"generator\": {\n    \"lag_definition\": "
                "\"actual_submit_start_minus_scheduled_arrival\",\n    \"lag_policy\": "
@@ -413,6 +512,50 @@ SchedulerBenchmarkJsonResult write_scheduler_benchmark_json(const SchedulerBench
     writer.u64(report.executing);
     writer.raw(",\n  \"live_workers\": ");
     writer.u64(report.live_workers);
+    if (schema_version >= 5) {
+        const BatchDecisionTimingSnapshot& snap = report.batch_decision;
+        writer.raw(",\n  \"batch_decision\": {\n    \"enabled\": ");
+        writer.boolean(snap.enabled);
+        writer.raw(",\n    \"clock\": \"steady_clock\",\n    \"timestamp_unit\": \"nanoseconds\",\n"
+                   "    \"timestamp_epoch\": \"steady_clock_time_since_epoch\",\n    "
+                   "\"buffer_capacity_per_worker\": ");
+        writer.u64(snap.buffer_capacity_per_worker);
+        writer.raw(",\n    \"sealed_batches_total\": ");
+        writer.u64(snap.sealed_batches_total);
+        writer.raw(",\n    \"events_recorded\": ");
+        writer.u64(snap.events_recorded);
+        writer.raw(",\n    \"events_dropped\": ");
+        writer.u64(snap.events_dropped);
+        writer.raw(",\n    \"trace_overflow\": ");
+        writer.boolean(snap.trace_overflow);
+        writer.raw(",\n    \"timing_data_valid\": ");
+        writer.boolean(snap.timing_data_valid);
+        writer.raw(",\n    \"events\": [");
+        for (std::size_t index = 0; index < snap.events.size(); ++index) {
+            if (index != 0) {
+                writer.raw(", ");
+            }
+            const BatchDecisionEvent& event = snap.events[index];
+            const char* reason = seal_reason_name(event.seal_reason);
+            if (reason == nullptr) {
+                return failure("batch_decision event has an unknown seal_reason");
+            }
+            writer.raw("{\n      \"batch_id\": ");
+            writer.u64(event.batch_id);
+            writer.raw(",\n      \"worker_index\": ");
+            writer.u64(event.worker_index);
+            writer.raw(",\n      \"batch_open_ns\": ");
+            writer.i64(event.batch_open_ns);
+            writer.raw(",\n      \"batch_seal_ns\": ");
+            writer.i64(event.batch_seal_ns);
+            writer.raw(",\n      \"batch_size\": ");
+            writer.u64(event.batch_size);
+            writer.raw(",\n      \"seal_reason\": ");
+            writer.string(reason);
+            writer.raw("\n    }");
+        }
+        writer.raw("]\n  }");
+    }
     writer.raw(",\n  \"exceptional_promise_backstop\": \"a completion stored only by the request "
                "destructor is absent from scheduler terminal counters\"\n}\n");
     if (!writer.ok) {

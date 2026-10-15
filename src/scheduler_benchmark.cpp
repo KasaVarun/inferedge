@@ -224,6 +224,19 @@ std::string validate_config(const SchedulerBenchmarkConfig& config) {
             return "arrival_aware_batching requires max_batch_delay > 0";
         }
     }
+    if (config.enable_batch_decision_timing) {
+        if (config.batch_decision_event_capacity < 1 ||
+            config.batch_decision_event_capacity > kMaxBatchDecisionEventCapacity) {
+            return "batch_decision_event_capacity must be from 1 through 65536 when "
+                   "enable_batch_decision_timing is true";
+        }
+        if (!BatchDecisionAllocationFits(config.worker_count,
+                                         config.batch_decision_event_capacity)) {
+            return "batch_decision_event_capacity allocation size overflows";
+        }
+    } else if (config.batch_decision_event_capacity != 0) {
+        return "batch_decision_event_capacity requires enable_batch_decision_timing";
+    }
     if (config.max_offered < 1 || config.max_offered > kMaxSchedulerBenchmarkOffered) {
         return "max_offered is outside 1..100000";
     }
@@ -1057,7 +1070,8 @@ SchedulerBenchmarkReport make_report(const SchedulerBenchmarkConfig& config, Sha
                                      const SchedulerBenchmarkPlan& plan,
                                      std::chrono::nanoseconds arrival_window,
                                      std::chrono::nanoseconds completion,
-                                     const SchedulerMetrics& metrics, const SchedulerStats& stats) {
+                                     const SchedulerMetrics& metrics, const SchedulerStats& stats,
+                                     BatchDecisionTimingSnapshot batch_decision) {
     check_last_success(trial, config);
     SchedulerBenchmarkReport report;
     report.model = config.model_path;
@@ -1071,6 +1085,21 @@ SchedulerBenchmarkReport make_report(const SchedulerBenchmarkConfig& config, Sha
     report.arrival_aware_batching = config.arrival_aware_batching;
     report.enable_metrics = config.enable_metrics;
     report.completion_timing_enabled = config.enable_completion_timing;
+    report.enable_batch_decision_timing = config.enable_batch_decision_timing;
+    report.batch_decision_event_capacity = config.batch_decision_event_capacity;
+    report.batch_decision = std::move(batch_decision);
+    // Trace validity is scheduler-published. Never invent a valid complete trace
+    // here. Overflow or dropped events stay explicit. Methodology validity
+    // (report.valid) does not depend on batch-decision timing_data_valid.
+    if (config.enable_batch_decision_timing) {
+        if (!report.batch_decision.enabled) {
+            report.batch_decision.enabled = true;
+            report.batch_decision.timing_data_valid = false;
+            report.batch_decision.buffer_capacity_per_worker = config.batch_decision_event_capacity;
+        }
+    } else {
+        report.batch_decision = BatchDecisionTimingSnapshot{};
+    }
     report.steady_clock_period_num = std::chrono::steady_clock::period::num;
     report.steady_clock_period_den = std::chrono::steady_clock::period::den;
     report.warmup_requests = config.warmup_requests;
@@ -1736,6 +1765,8 @@ SchedulerConfig scheduler_config(const SchedulerBenchmarkConfig& config) {
     built.arrival_aware_batching = config.arrival_aware_batching;
     built.enable_metrics = config.enable_metrics;
     built.enable_completion_timing = config.enable_completion_timing;
+    built.enable_batch_decision_timing = config.enable_batch_decision_timing;
+    built.batch_decision_event_capacity = config.batch_decision_event_capacity;
     return built;
 }
 
@@ -2078,9 +2109,10 @@ SchedulerBenchmarkRun run_scheduler_benchmark(const SchedulerBenchmarkConfig& co
             const auto completion = std::chrono::steady_clock::now() - arrival_end;
             const SchedulerMetrics metrics = scheduler.metrics();
             const SchedulerStats stats = scheduler.stats();
+            BatchDecisionTimingSnapshot batch_decision = scheduler.batch_decision_timing();
             SchedulerBenchmarkRun run;
             run.report = make_report(config, trial, planned.plan, arrival_end - window_start,
-                                     completion, metrics, stats);
+                                     completion, metrics, stats, std::move(batch_decision));
             return run;
         }
     } catch (const std::exception& exception) {
@@ -2095,9 +2127,10 @@ SchedulerBenchmarkRun run_scheduler_benchmark(const SchedulerBenchmarkConfig& co
     const auto completion = std::chrono::steady_clock::now() - arrival_end;
     const SchedulerMetrics metrics = scheduler.metrics();
     const SchedulerStats stats = scheduler.stats();
+    BatchDecisionTimingSnapshot batch_decision = scheduler.batch_decision_timing();
     SchedulerBenchmarkRun run;
     run.report = make_report(config, trial, planned.plan, arrival_end - window_start, completion,
-                             metrics, stats);
+                             metrics, stats, std::move(batch_decision));
     return run;
 }
 

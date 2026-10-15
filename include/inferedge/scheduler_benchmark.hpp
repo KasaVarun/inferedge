@@ -89,7 +89,14 @@ struct SchedulerBenchmarkConfig {
     bool enable_metrics{true};
     // Off keeps schema 3. On records one pre-publication stamp per published
     // completion and writes schema 4. It does not record a post-publication time.
+    // Schema 5 when enable_batch_decision_timing is also on still includes every
+    // schema-4 completion-timing field.
     bool enable_completion_timing{false};
+    // Opt-in sealed-batch open/seal instrumentation. Default false. When true,
+    // requires batch_decision_event_capacity in 1..65536 per worker and selects
+    // JSON schema 5. Capacity alone does not enable collection.
+    bool enable_batch_decision_timing{false};
+    std::uint32_t batch_decision_event_capacity{0};
     SchedulerWorkloadKind workload{SchedulerWorkloadKind::kOpenLoopConstant};
     // Default keeps the Add request, exact C check, and schema documents.
     SchedulerBenchmarkModelId model_id{SchedulerBenchmarkModelId::kBatchAddF32};
@@ -287,6 +294,11 @@ struct SchedulerBenchmarkReport {
     bool arrival_aware_batching{false};
     bool enable_metrics{false};
     bool completion_timing_enabled{false};
+    bool enable_batch_decision_timing{false};
+    std::uint32_t batch_decision_event_capacity{0};
+    // Post-join scheduler snapshot. timing_data_valid is independent of report
+    // methodology validity and of enable_metrics / completion timing.
+    BatchDecisionTimingSnapshot batch_decision;
     std::intmax_t steady_clock_period_num{0};
     std::intmax_t steady_clock_period_den{1};
     std::uint64_t warmup_requests{0};
