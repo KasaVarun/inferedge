@@ -15,11 +15,16 @@ from benchmarks.collect_neural_scheduler import (
     AG2_OFFERED_RATE,
     AG2G3_OFFERED_RATE,
     ARRIVAL_AWARE_BATCHING_CELLS,
+    ARRIVAL_AWARE_BATCHING_DURATION_MS,
     ARRIVAL_AWARE_BATCHING_RATE,
+    ARRIVAL_AWARE_SPARSE_COUNTED_RUNS,
+    ARRIVAL_AWARE_SPARSE_DURATION_MS,
+    ARRIVAL_AWARE_SPARSE_RATES,
     ARRIVAL_SCREEN_MAX_LAG_NS,
     CALIBRATION_ONLY_NEURAL_CELLS,
     CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1,
     CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1,
+    CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_V1,
     CALIBRATION_VARIANT_NONZERO_BATCH_DELAY_V1,
     CELL_DEFINITION_ADAPTIVE_KEY,
     CELL_DEFINITION_ARRIVAL_KEY,
@@ -38,6 +43,7 @@ from benchmarks.collect_neural_scheduler import (
     REPORTABLE_CONTRAST_AG2,
     REPORTABLE_CONTRAST_AG2G3,
     REPORTABLE_MODEL_ID,
+    STRICT_CALIBRATION_VARIANTS,
     THREE_ARM_POSITION_COUNTS_20,
     NeuralCollectorError,
     adaptive_batching_for_cell,
@@ -46,6 +52,7 @@ from benchmarks.collect_neural_scheduler import (
     bind_commands,
     build_plan,
     build_parser,
+    coarse_max_lag_v1,
     collect,
     counted_runs_for,
     evidence_class_for,
@@ -2240,6 +2247,573 @@ class G4ArrivalAwareCollectionTest(unittest.TestCase):
         )
         self.assertFalse(meta["collector_valid"])
         self.assertNotIn("calibration_infeasible_markers", meta)
+
+
+def _measurement_sparse(duration_ms: int = ARRIVAL_AWARE_SPARSE_DURATION_MS) -> dict:
+    return {
+        "worker_count": 1,
+        "queue_capacity": 64,
+        "duration_ms": duration_ms,
+        "max_offered": 10000,
+        "max_outstanding": 64,
+        "completion_timeout_ms": 5000,
+        "warmup_requests": 100,
+        "lag_tolerance_ms": 1000,
+        "check_interval": 1,
+    }
+
+
+class G4ArrivalAwareSparseCalibrationTest(unittest.TestCase):
+    def _g4_cells(self) -> list[dict]:
+        return resolve_neural_cells(list(ARRIVAL_AWARE_BATCHING_CELLS), "calibration")
+
+    def test_sparse_rates_accepted(self) -> None:
+        self.assertEqual(ARRIVAL_AWARE_SPARSE_RATES, frozenset({50.0, 100.0}))
+        self.assertEqual(ARRIVAL_AWARE_SPARSE_DURATION_MS, 5000)
+        self.assertEqual(ARRIVAL_AWARE_SPARSE_COUNTED_RUNS, 1)
+        self.assertIn(CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_V1, STRICT_CALIBRATION_VARIANTS)
+        for rate in (50.0, 100.0, 50, 100):
+            self.assertEqual(
+                resolve_calibration_variant(
+                    mode="calibration",
+                    cells=self._g4_cells(),
+                    model_id=REPORTABLE_MODEL_ID,
+                    profile=open_loop_profile("neural_open", float(rate)),
+                    measurement=_measurement_sparse(),
+                    counted_runs=1,
+                ),
+                CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_V1,
+            )
+
+    def test_e7_still_selected_at_1000_1000(self) -> None:
+        self.assertEqual(
+            resolve_calibration_variant(
+                mode="calibration",
+                cells=self._g4_cells(),
+                model_id=REPORTABLE_MODEL_ID,
+                profile=open_loop_profile("neural_open", ARRIVAL_AWARE_BATCHING_RATE),
+                measurement=_measurement_g4(),
+                counted_runs=1,
+            ),
+            CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1,
+        )
+        self.assertEqual(ARRIVAL_AWARE_BATCHING_DURATION_MS, 1000)
+        self.assertEqual(ARRIVAL_AWARE_BATCHING_RATE, 1000.0)
+
+    def test_mismatched_rate_duration_rejected(self) -> None:
+        cases = (
+            (50.0, 1000),
+            (100.0, 1000),
+            (1000.0, 5000),
+            (200.0, 5000),
+            (75.0, 5000),
+            (25.0, 5000),
+        )
+        for rate, duration in cases:
+            with self.subTest(rate=rate, duration=duration):
+                with self.assertRaises(NeuralCollectorError) as raised:
+                    resolve_calibration_variant(
+                        mode="calibration",
+                        cells=self._g4_cells(),
+                        model_id=REPORTABLE_MODEL_ID,
+                        profile=open_loop_profile("neural_open", rate),
+                        measurement=_measurement_sparse(duration_ms=duration),
+                        counted_runs=1,
+                    )
+                message = str(raised.exception)
+                self.assertIn(CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_V1, message)
+                self.assertIn(CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1, message)
+
+    def test_wrong_workers_counted_runs_model_cells(self) -> None:
+        with self.assertRaises(NeuralCollectorError):
+            resolve_calibration_variant(
+                mode="calibration",
+                cells=self._g4_cells(),
+                model_id=REPORTABLE_MODEL_ID,
+                profile=open_loop_profile("neural_open", 50.0),
+                measurement={**_measurement_sparse(), "worker_count": 2},
+                counted_runs=1,
+            )
+        with self.assertRaises(NeuralCollectorError):
+            resolve_calibration_variant(
+                mode="calibration",
+                cells=self._g4_cells(),
+                model_id=REPORTABLE_MODEL_ID,
+                profile=open_loop_profile("neural_open", 50.0),
+                measurement=_measurement_sparse(),
+                counted_runs=2,
+            )
+        with self.assertRaises(NeuralCollectorError):
+            resolve_calibration_variant(
+                mode="calibration",
+                cells=self._g4_cells(),
+                model_id="mlp_small_f32",
+                profile=open_loop_profile("neural_open", 50.0),
+                measurement=_measurement_sparse(),
+                counted_runs=1,
+            )
+        with self.assertRaises(NeuralCollectorError) as wrong_set:
+            resolve_calibration_variant(
+                mode="calibration",
+                cells=resolve_neural_cells(["A", "G4"], "calibration"),
+                model_id=REPORTABLE_MODEL_ID,
+                profile=open_loop_profile("neural_open", 50.0),
+                measurement=_measurement_sparse(),
+                counted_runs=1,
+            )
+        self.assertIn("A,G2,G3,G4", str(wrong_set.exception))
+        with self.assertRaises(NeuralCollectorError) as wrong_order:
+            resolve_calibration_variant(
+                mode="calibration",
+                cells=resolve_neural_cells(["A", "G3", "G2", "G4"], "calibration"),
+                model_id=REPORTABLE_MODEL_ID,
+                profile=open_loop_profile("neural_open", 50.0),
+                measurement=_measurement_sparse(),
+                counted_runs=1,
+            )
+        self.assertIn("A,G2,G3,G4", str(wrong_order.exception))
+
+    def test_bool_settings_rejected(self) -> None:
+        with self.assertRaises(NeuralCollectorError):
+            resolve_calibration_variant(
+                mode="calibration",
+                cells=self._g4_cells(),
+                model_id=REPORTABLE_MODEL_ID,
+                profile={"id": "neural_open", "family": "open_loop", "workload": "open_loop_constant", "target_rps": True},
+                measurement=_measurement_sparse(),
+                counted_runs=1,
+            )
+        with self.assertRaises(NeuralCollectorError):
+            resolve_calibration_variant(
+                mode="calibration",
+                cells=self._g4_cells(),
+                model_id=REPORTABLE_MODEL_ID,
+                profile=open_loop_profile("neural_open", 50.0),
+                measurement={**_measurement_sparse(), "worker_count": True},
+                counted_runs=1,
+            )
+        with self.assertRaises(NeuralCollectorError):
+            resolve_calibration_variant(
+                mode="calibration",
+                cells=self._g4_cells(),
+                model_id=REPORTABLE_MODEL_ID,
+                profile=open_loop_profile("neural_open", 50.0),
+                measurement={**_measurement_sparse(), "duration_ms": True},
+                counted_runs=1,
+            )
+        with self.assertRaises(NeuralCollectorError):
+            resolve_calibration_variant(
+                mode="calibration",
+                cells=self._g4_cells(),
+                model_id=REPORTABLE_MODEL_ID,
+                profile=open_loop_profile("neural_open", 50.0),
+                measurement=_measurement_sparse(),
+                counted_runs=True,  # type: ignore[arg-type]
+            )
+
+    def test_no_implicit_sparse_for_non_g4(self) -> None:
+        g3 = resolve_neural_cells(list(ADAPTIVE_EARLY_SEAL_CELLS), "calibration")
+        with self.assertRaises(NeuralCollectorError):
+            resolve_calibration_variant(
+                mode="calibration",
+                cells=g3,
+                model_id=REPORTABLE_MODEL_ID,
+                profile=open_loop_profile("neural_open", 50.0),
+                measurement=_measurement_sparse(),
+                counted_runs=1,
+            )
+        delay = resolve_neural_cells(["A", "G2"], "calibration")
+        self.assertEqual(
+            resolve_calibration_variant(
+                mode="calibration",
+                cells=delay,
+                model_id=REPORTABLE_MODEL_ID,
+                profile=open_loop_profile("neural_open", 50.0),
+                measurement=_measurement_sparse(),
+                counted_runs=1,
+            ),
+            CALIBRATION_VARIANT_NONZERO_BATCH_DELAY_V1,
+        )
+
+    def test_eight_trial_plans_at_sparse_rates(self) -> None:
+        expected_ids = [
+            "pilot-A-neural_open",
+            "pilot-G2-neural_open",
+            "pilot-G3-neural_open",
+            "pilot-G4-neural_open",
+            "A-neural_open-01",
+            "G2-neural_open-01",
+            "G3-neural_open-01",
+            "G4-neural_open-01",
+        ]
+        for rate in (50.0, 100.0):
+            with self.subTest(rate=rate):
+                plan = build_plan(
+                    self._g4_cells(),
+                    [open_loop_profile("neural_open", rate)],
+                    1,
+                )
+                self.assertEqual(len(plan), 8)
+                self.assertEqual([trial["trial_id"] for trial in plan], expected_ids)
+                self.assertEqual(
+                    [trial["pilot"] for trial in plan],
+                    [True, True, True, True, False, False, False, False],
+                )
+
+    def test_six_key_metadata_sparse_and_e7(self) -> None:
+        six = serialize_cell_definitions(
+            self._g4_cells(), include_adaptive=True, include_arrival_aware=True
+        )
+        self.assertEqual(len(six), 4)
+        expected = {
+            "A": (False, False),
+            "G2": (False, False),
+            "G3": (True, False),
+            "G4": (False, True),
+        }
+        for cell in six:
+            self.assertEqual(len(cell), 6)
+            adaptive, arrival = expected[cell["id"]]
+            self.assertIs(cell["adaptive_batching"], adaptive)
+            self.assertIs(cell["arrival_aware_batching"], arrival)
+        four_ac = serialize_cell_definitions(
+            [resolve_neural_cell("A"), resolve_neural_cell("C")],
+            include_adaptive=False,
+        )
+        for cell in four_ac:
+            self.assertEqual(set(cell), set(CELL_DEFINITION_KEYS))
+        four_ag2 = serialize_cell_definitions(
+            [resolve_neural_cell("A"), resolve_neural_cell("G2")],
+            include_adaptive=False,
+        )
+        for cell in four_ag2:
+            self.assertEqual(set(cell), set(CELL_DEFINITION_KEYS))
+        five = serialize_cell_definitions(
+            resolve_neural_cells(["A", "G2", "G3"], "calibration"),
+            include_adaptive=True,
+        )
+        for cell in five:
+            self.assertEqual(len(cell), 5)
+            self.assertNotIn(CELL_DEFINITION_ARRIVAL_KEY, cell)
+
+    def test_g3_g4_cli_flags(self) -> None:
+        measurement = _measurement_sparse()
+        binary = pathlib.Path("/tmp/inferedge-bench-scheduler")
+        model = pathlib.Path("/models/gemm_f32.onnx")
+        profile = open_loop_profile("neural_open", 50.0)
+        by_id = {cell["id"]: cell for cell in self._g4_cells()}
+        a_cmd = neural_scheduler_command(binary, model, REPORTABLE_MODEL_ID, by_id["A"], profile, measurement)
+        g2_cmd = neural_scheduler_command(binary, model, REPORTABLE_MODEL_ID, by_id["G2"], profile, measurement)
+        g3_cmd = neural_scheduler_command(binary, model, REPORTABLE_MODEL_ID, by_id["G3"], profile, measurement)
+        g4_cmd = neural_scheduler_command(binary, model, REPORTABLE_MODEL_ID, by_id["G4"], profile, measurement)
+        for command in (a_cmd, g2_cmd):
+            self.assertNotIn("--adaptive-batching", command)
+            self.assertNotIn("--arrival-aware-batching", command)
+        self.assertIn("--adaptive-batching", g3_cmd)
+        self.assertNotIn("--arrival-aware-batching", g3_cmd)
+        self.assertIn("--arrival-aware-batching", g4_cmd)
+        self.assertNotIn("--adaptive-batching", g4_cmd)
+        self.assertIn("--enable-batching", g4_cmd)
+        self.assertIn("--max-batch-size", g4_cmd)
+        self.assertEqual(g4_cmd[g4_cmd.index("--max-batch-size") + 1], "4")
+        self.assertEqual(g4_cmd[g4_cmd.index("--max-batch-delay-ms") + 1], "2")
+        self.assertEqual(g4_cmd[g4_cmd.index("--duration-ms") + 1], "5000")
+
+    def test_strict_gen_c_and_hard_gates(self) -> None:
+        from benchmarks.collect_neural_scheduler import _expected_launch
+
+        checked = {
+            "paths": {"model": pathlib.Path("/models/gemm_f32.onnx")},
+            "collection_protocol": {
+                "measurement": {
+                    "worker_count": 1,
+                    "queue_capacity": 64,
+                    "warmup_requests": 100,
+                    "check_interval": 1,
+                    "duration_ms": 5000,
+                    "lag_tolerance_ms": 1000,
+                }
+            },
+        }
+        cell = resolve_neural_cell("G4", allow_g4=True)
+        expected = _expected_launch(checked, cell, open_loop_profile("neural_open", 50.0))
+        document = sample_report(model="/models/gemm_f32.onnx")
+        document["configured_duration_nanoseconds"] = 5_000_000_000
+        document["arrival_window_nanoseconds"] = 5_000_000_000
+        document["scheduled_span_nanoseconds"] = 4_990_000_000
+        document["total_trial_nanoseconds"] = (
+            document["arrival_window_nanoseconds"] + document["completion_nanoseconds"]
+        )
+        document["scheduler"] = {
+            "worker_count": 1,
+            "queue_capacity": 64,
+            "enable_batching": True,
+            "max_batch_size": 4,
+            "max_batch_delay_ms": 2,
+            "adaptive_batching": False,
+            "arrival_aware_batching": True,
+            "enable_metrics": True,
+        }
+        document["generator"]["warmup_requests"] = 100
+        _doc, status, problems = validate_trial(
+            dump_report(document),
+            expected=expected,
+            mode="calibration",
+            require_zero_rejections=True,
+            require_strict_generator_delivery=True,
+        )
+        self.assertEqual(problems, [])
+        self.assertEqual(status["delivery_class"], "STRICT_PRIMARY")
+
+        document["scheduler"]["adaptive_batching"] = True
+        _doc, _status, both = validate_trial(
+            dump_report(document),
+            expected=expected,
+            mode="calibration",
+            require_zero_rejections=True,
+            require_strict_generator_delivery=True,
+        )
+        self.assertTrue(any("adaptive_batching" in item for item in both))
+
+        document["scheduler"]["adaptive_batching"] = False
+        del document["scheduler"]["arrival_aware_batching"]
+        _doc, _status, missing = validate_trial(
+            dump_report(document),
+            expected=expected,
+            mode="calibration",
+            require_zero_rejections=True,
+            require_strict_generator_delivery=True,
+        )
+        self.assertTrue(any("arrival_aware_batching" in item for item in missing))
+
+        document["scheduler"]["arrival_aware_batching"] = False
+        _doc, _status, wrong = validate_trial(
+            dump_report(document),
+            expected=expected,
+            mode="calibration",
+            require_zero_rejections=True,
+            require_strict_generator_delivery=True,
+        )
+        self.assertTrue(any("arrival_aware_batching" in item for item in wrong))
+
+        document["scheduler"]["arrival_aware_batching"] = True
+        document["rejections"] = {"full": 1, "closed": 0, "not_running": 0}
+        document["accepted"] = document["submit_attempts"] - 1
+        document["succeeded"] = document["accepted"]
+        _doc, _status, rejected = validate_trial(
+            dump_report(document),
+            expected=expected,
+            mode="calibration",
+            require_zero_rejections=True,
+            require_strict_generator_delivery=True,
+        )
+        self.assertTrue(any("admission rejection" in item for item in rejected))
+
+    def test_low_mean_and_all_size_one_remain_valid(self) -> None:
+        from benchmarks.collect_neural_scheduler import _expected_launch
+
+        document = sample_report(model="/models/gemm_f32.onnx")
+        document["configured_duration_nanoseconds"] = 5_000_000_000
+        document["arrival_window_nanoseconds"] = 5_000_000_000
+        document["scheduled_span_nanoseconds"] = 4_990_000_000
+        document["total_trial_nanoseconds"] = (
+            document["arrival_window_nanoseconds"] + document["completion_nanoseconds"]
+        )
+        document["metrics"]["batch_size_histogram"] = [0, 10] + [0] * 31
+        document["metrics"]["engine_run_count"] = 10
+        document["metrics"]["requests_entered_engine_runs"] = 10
+        mean, mean_problems = realized_mean_batch_size(document)
+        self.assertEqual(mean_problems, [])
+        self.assertEqual(mean, 1.0)
+        checked = {
+            "paths": {"model": pathlib.Path("/models/gemm_f32.onnx")},
+            "collection_protocol": {
+                "measurement": {
+                    "worker_count": 1,
+                    "queue_capacity": 64,
+                    "warmup_requests": 100,
+                    "check_interval": 1,
+                    "duration_ms": 5000,
+                    "lag_tolerance_ms": 1000,
+                }
+            },
+        }
+        cell = resolve_neural_cell("G4", allow_g4=True)
+        expected = _expected_launch(checked, cell, open_loop_profile("neural_open", 50.0))
+        document["scheduler"] = {
+            "worker_count": 1,
+            "queue_capacity": 64,
+            "enable_batching": True,
+            "max_batch_size": 4,
+            "max_batch_delay_ms": 2,
+            "adaptive_batching": False,
+            "arrival_aware_batching": True,
+            "enable_metrics": True,
+        }
+        document["generator"]["warmup_requests"] = 100
+        _doc, status, problems = validate_trial(
+            dump_report(document),
+            expected=expected,
+            mode="calibration",
+            require_zero_rejections=True,
+            require_strict_generator_delivery=True,
+        )
+        self.assertEqual(problems, [])
+        self.assertEqual(status["delivery_class"], "STRICT_PRIMARY")
+        self.assertLess(mean, 2.0)
+
+    def test_coarse_max_lag_diagnostic_non_gating(self) -> None:
+        document = sample_report(model="/models/gemm_f32.onnx")
+        self.assertTrue(coarse_max_lag_v1(document))
+        document["generator_lag"]["maximum_nanoseconds"] = ARRIVAL_SCREEN_MAX_LAG_NS
+        self.assertTrue(coarse_max_lag_v1(document))
+        document["generator_lag"]["maximum_nanoseconds"] = ARRIVAL_SCREEN_MAX_LAG_NS + 1
+        self.assertFalse(coarse_max_lag_v1(document))
+        del document["generator_lag"]
+        self.assertIsNone(coarse_max_lag_v1(document))
+        self.assertEqual(arrival_screen_problems(sample_report(), ARRIVAL_SCREEN_MAX_LAG_NS), [])
+
+    def test_no_reportable_g4_and_no_add_registry(self) -> None:
+        for contrast in (
+            REPORTABLE_CONTRAST_AC,
+            REPORTABLE_CONTRAST_AG2,
+            REPORTABLE_CONTRAST_AG2G3,
+        ):
+            self.assertNotIn("G4", contrast["allow_neural_local_cells"])
+            self.assertNotIn("G4", contrast["cells"])
+        self.assertNotIn("G4", CELL_BY_ID)
+
+
+class G4ArrivalAwareSparseCollectionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.world = NeuralWorld(pathlib.Path(self.temporary.name))
+        self.world.build()
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _args(self, *, rate: str, duration_ms: str = "5000", **extra: str) -> list[str]:
+        values = {
+            "binary": str(self.world.binary),
+            "repo-root": str(self.world.repo),
+            "expected-commit": COMMIT,
+            "mode": "calibration",
+            "model-id": "gemm_f32",
+            "cells": "A,G2,G3,G4",
+            "baseline-cell": "A",
+            "alternative-cell": "G4",
+            "target-rps": rate,
+            "counted-runs": "1",
+            "duration-ms": duration_ms,
+            "output-root": str(pathlib.Path(self.temporary.name) / f"out-{rate}"),
+        }
+        values.update({key.replace("_", "-"): value for key, value in extra.items()})
+        argv: list[str] = []
+        for key, value in values.items():
+            argv.extend([f"--{key}", value])
+        return argv
+
+    def test_sparse_calibration_50_and_100(self) -> None:
+        for rate in ("50", "100"):
+            with self.subTest(rate=rate):
+                self.world.trial_calls.clear()
+                args = build_parser().parse_args(self._args(rate=rate))
+                run_set = collect(args, runner=self.world.runner)
+                self.assertEqual(len(self.world.trial_calls), 8)
+                environment = json.loads(
+                    (run_set / "environment.json").read_text(encoding="utf-8")
+                )
+                protocol = environment["collection_protocol"]
+                self.assertEqual(
+                    protocol["calibration_variant"],
+                    CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_V1,
+                )
+                self.assertEqual(protocol["measurement"]["duration_ms"], 5000)
+                self.assertEqual(protocol["offered_rate"], float(rate))
+                self.assertEqual(protocol["counted_runs_per_cell"], 1)
+                self.assertEqual(protocol["measurement"]["worker_count"], 1)
+                self.assertTrue(protocol["zero_admission_rejection_required"])
+                self.assertTrue(protocol["require_strict_generator_delivery"])
+                for cell in protocol["cell_definitions"]:
+                    self.assertEqual(len(cell), 6)
+                definitions = {cell["id"]: cell for cell in protocol["cell_definitions"]}
+                self.assertEqual(
+                    (
+                        definitions["G4"]["adaptive_batching"],
+                        definitions["G4"]["arrival_aware_batching"],
+                    ),
+                    (False, True),
+                )
+                plan = json.loads(
+                    (run_set / "execution_plan.json").read_text(encoding="utf-8")
+                )["trials"]
+                self.assertEqual(len(plan), 8)
+                g4_cmd = next(
+                    trial["command"] for trial in plan if trial["trial_id"] == "G4-neural_open-01"
+                )
+                self.assertIn("--arrival-aware-batching", g4_cmd)
+                self.assertNotIn("--adaptive-batching", g4_cmd)
+                self.assertEqual(g4_cmd[g4_cmd.index("--duration-ms") + 1], "5000")
+                meta = json.loads(
+                    (run_set / "runs" / "G4-neural_open-01.meta.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertTrue(meta["collector_valid"])
+                self.assertIn("realized_mean_batch_size", meta)
+                self.assertIn("coarse_max_lag_v1", meta)
+                self.assertIs(meta["coarse_max_lag_v1"], True)
+
+    def test_sparse_hard_invalid_stops_without_soft_promote(self) -> None:
+        original = self.world.runner
+
+        def weak_delivery(args, cwd=None, env=None, timeout_seconds=None):
+            result = original(args, cwd=cwd, env=env, timeout_seconds=timeout_seconds)
+            if pathlib.Path(args[0]).name != BINARY_NAME or "--format" not in args:
+                return result
+            document = json.loads(result.stdout)
+            document["submit_attempts"] = document["scheduled_opportunities"] - 1
+            document["generator_skips_outstanding"] = 1
+            document["accepted"] = document["submit_attempts"]
+            document["succeeded"] = document["accepted"]
+            document["successful_e2e_latency"]["sample_count"] = document["succeeded"]
+            document["metrics"]["engine_run_count"] = document["succeeded"]
+            document["metrics"]["requests_entered_engine_runs"] = document["succeeded"]
+            document["metrics"]["batch_size_histogram"] = [0, document["succeeded"]] + [0] * 31
+            document["correctness_checked"] = document["succeeded"]
+            document["generator_lag"]["count"] = document["submit_attempts"]
+            from benchmarks.collect_baseline import ProcessResult
+
+            return ProcessResult(0, dump_report(document), "")
+
+        with self.assertRaises(NeuralCollectorError) as raised:
+            collect(
+                build_parser().parse_args(self._args(rate="50")),
+                runner=weak_delivery,
+            )
+        run_set = raised.exception.run_set
+        assert run_set is not None
+        failure = json.loads((run_set / "failure.json").read_text(encoding="utf-8"))
+        self.assertFalse(failure["accepted"])
+        meta = json.loads(
+            (run_set / "runs" / f"{failure['trial_id']}.meta.json").read_text(encoding="utf-8")
+        )
+        self.assertFalse(meta["collector_valid"])
+        self.assertNotIn("calibration_infeasible_markers", meta)
+
+    def test_mismatched_cli_rate_duration_rejected(self) -> None:
+        with self.assertRaises(NeuralCollectorError):
+            collect(
+                build_parser().parse_args(self._args(rate="50", duration_ms="1000")),
+                runner=self.world.runner,
+            )
+        with self.assertRaises(NeuralCollectorError):
+            collect(
+                build_parser().parse_args(self._args(rate="1000", duration_ms="5000")),
+                runner=self.world.runner,
+            )
+        self.assertEqual(self.world.trial_calls, [])
 
 
 if __name__ == "__main__":

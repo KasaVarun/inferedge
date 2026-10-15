@@ -122,16 +122,22 @@ CALIBRATION_ONLY_NEURAL_CELLS = frozenset(NEURAL_LOCAL_CELL_BY_ID)
 CALIBRATION_VARIANT_NONZERO_BATCH_DELAY_V1 = "nonzero_batch_delay_v1"
 CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1 = "adaptive_early_seal_v1"
 CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1 = "arrival_aware_batching_v1"
+CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_V1 = "arrival_aware_sparse_v1"
 ADAPTIVE_EARLY_SEAL_CELLS = ("A", "G2", "G3")
 ARRIVAL_AWARE_BATCHING_CELLS = ("A", "G2", "G3", "G4")
 ADAPTIVE_EARLY_SEAL_RATE = 1000.0
 ADAPTIVE_EARLY_SEAL_COUNTED_RUNS = 1
 ARRIVAL_AWARE_BATCHING_RATE = 1000.0
 ARRIVAL_AWARE_BATCHING_COUNTED_RUNS = 1
+ARRIVAL_AWARE_BATCHING_DURATION_MS = 1000
+ARRIVAL_AWARE_SPARSE_RATES = frozenset({50.0, 100.0})
+ARRIVAL_AWARE_SPARSE_DURATION_MS = 5000
+ARRIVAL_AWARE_SPARSE_COUNTED_RUNS = 1
 STRICT_CALIBRATION_VARIANTS = frozenset(
     {
         CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1,
         CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1,
+        CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_V1,
     }
 )
 CELL_DEFINITION_KEYS = ("id", "enable_batching", "max_batch_size", "max_batch_delay_ms")
@@ -530,9 +536,9 @@ def serialize_cell_definitions(
     Historical A/C and A/G2 reportable keep four-key on-disk shapes.
     adaptive_early_seal_v1 calibration and the A/G2/G3 reportable contrast
     require five-key definitions for every cell. arrival_aware_batching_v1
-    requires six-key definitions for every cell. Format is chosen by the
-    caller from the validated calibration / reportable variant, not inferred
-    from arbitrary cell dictionary keys.
+    and arrival_aware_sparse_v1 require six-key definitions for every cell.
+    Format is chosen by the caller from the validated calibration / reportable
+    variant, not inferred from arbitrary cell dictionary keys.
     """
     if include_arrival_aware and not include_adaptive:
         raise NeuralCollectorError(
@@ -555,6 +561,25 @@ def serialize_cell_definitions(
     return serialized
 
 
+def _require_finite_number(value: object, label: str) -> float:
+    """Return a finite float; reject bools and non-numeric values."""
+    if type(value) is bool or type(value) not in (int, float):
+        raise NeuralCollectorError(f"{label} must be a finite number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise NeuralCollectorError(f"{label} must be a finite number")
+    return number
+
+
+def _require_exact_int(value: object, label: str, expected: int) -> int:
+    """Return an exact integer match; reject bools (bool is a subclass of int)."""
+    if type(value) is not int:
+        raise NeuralCollectorError(f"{label} must be an integer")
+    if value != expected:
+        raise NeuralCollectorError(f"{label} must be {expected}")
+    return value
+
+
 def resolve_calibration_variant(
     *,
     mode: str,
@@ -566,11 +591,14 @@ def resolve_calibration_variant(
 ) -> str | None:
     """Return a named calibration variant or None.
 
-    arrival_aware_batching_v1 is exact-set only: gemm_f32 A,G2,G3,G4 at 1000 RPS,
-    workers=1, duration_ms=1000, counted_runs=1. It is selected before the G3
-    adaptive_early_seal_v1 branch. adaptive_early_seal_v1 remains gemm_f32
-    A,G2,G3 at the same measurement shape. Other neural-local delay calibrations
-    keep nonzero_batch_delay_v1.
+    G4 cell set A,G2,G3,G4 dispatches exactly:
+    - arrival_aware_batching_v1: gemm_f32, 1000 RPS, duration_ms=1000, workers=1,
+      counted_runs=1 (E7 plumbing contract)
+    - arrival_aware_sparse_v1: gemm_f32, target_rps in {50,100}, duration_ms=5000,
+      workers=1, counted_runs=1 (one rate per run set)
+    Any other G4 rate/duration combination is rejected. G3 adaptive_early_seal_v1
+    remains gemm_f32 A,G2,G3 at 1000 RPS / 1000 ms. Other neural-local delay
+    calibrations keep nonzero_batch_delay_v1.
     """
     if mode != "calibration":
         return None
@@ -578,30 +606,46 @@ def resolve_calibration_variant(
     if "G4" in cell_ids or cell_ids == ARRIVAL_AWARE_BATCHING_CELLS:
         if cell_ids != ARRIVAL_AWARE_BATCHING_CELLS:
             raise NeuralCollectorError(
-                "arrival_aware_batching_v1 requires cells A,G2,G3,G4 in that order; "
+                "G4 arrival-aware calibration requires cells A,G2,G3,G4 in that order; "
                 f"got {','.join(cell_ids)!r}"
             )
         if model_id != REPORTABLE_MODEL_ID:
             raise NeuralCollectorError(
-                f"arrival_aware_batching_v1 requires model_id {REPORTABLE_MODEL_ID}"
+                f"G4 arrival-aware calibration requires model_id {REPORTABLE_MODEL_ID}"
             )
-        rate = profile.get("target_rps")
-        if not isinstance(rate, (int, float)) or float(rate) != ARRIVAL_AWARE_BATCHING_RATE:
-            raise NeuralCollectorError(
-                f"arrival_aware_batching_v1 requires target_rps {ARRIVAL_AWARE_BATCHING_RATE:g}"
-            )
-        if int(measurement.get("worker_count", -1)) != 1:
-            raise NeuralCollectorError("arrival_aware_batching_v1 requires worker_count=1")
-        if int(measurement.get("duration_ms", -1)) != 1000:
-            raise NeuralCollectorError("arrival_aware_batching_v1 requires duration_ms=1000")
-        if counted_runs != ARRIVAL_AWARE_BATCHING_COUNTED_RUNS:
-            raise NeuralCollectorError(
-                f"arrival_aware_batching_v1 requires counted_runs="
-                f"{ARRIVAL_AWARE_BATCHING_COUNTED_RUNS}"
-            )
-        for cell in cells:
-            normalize_cell_definition(cell)
-        return CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1
+        rate = _require_finite_number(profile.get("target_rps"), "target_rps")
+        _require_exact_int(measurement.get("worker_count", -1), "worker_count", 1)
+        duration = measurement.get("duration_ms")
+        if type(duration) is not int:
+            raise NeuralCollectorError("duration_ms must be an integer")
+        if type(counted_runs) is not int:
+            raise NeuralCollectorError("counted_runs must be an integer")
+        if (
+            rate == ARRIVAL_AWARE_BATCHING_RATE
+            and duration == ARRIVAL_AWARE_BATCHING_DURATION_MS
+            and counted_runs == ARRIVAL_AWARE_BATCHING_COUNTED_RUNS
+        ):
+            for cell in cells:
+                normalize_cell_definition(cell)
+            return CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1
+        if (
+            rate in ARRIVAL_AWARE_SPARSE_RATES
+            and duration == ARRIVAL_AWARE_SPARSE_DURATION_MS
+            and counted_runs == ARRIVAL_AWARE_SPARSE_COUNTED_RUNS
+        ):
+            for cell in cells:
+                normalize_cell_definition(cell)
+            return CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_V1
+        raise NeuralCollectorError(
+            "G4 arrival-aware calibration requires either "
+            f"{CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1} "
+            f"(target_rps={ARRIVAL_AWARE_BATCHING_RATE:g}, "
+            f"duration_ms={ARRIVAL_AWARE_BATCHING_DURATION_MS}) or "
+            f"{CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_V1} "
+            f"(target_rps in {{{', '.join(f'{item:g}' for item in sorted(ARRIVAL_AWARE_SPARSE_RATES))}}}, "
+            f"duration_ms={ARRIVAL_AWARE_SPARSE_DURATION_MS}); "
+            f"got target_rps={rate:g}, duration_ms={duration}, counted_runs={counted_runs}"
+        )
     if "G3" in cell_ids or cell_ids == ADAPTIVE_EARLY_SEAL_CELLS:
         if cell_ids != ADAPTIVE_EARLY_SEAL_CELLS:
             raise NeuralCollectorError(
@@ -735,6 +779,21 @@ def arrival_screen_problems(document: dict, max_lag_ns: int) -> list[str]:
             f"exceeds arrival screen {max_lag_ns} (inclusive)"
         ]
     return []
+
+
+def coarse_max_lag_v1(document: dict, max_lag_ns: int = ARRIVAL_SCREEN_MAX_LAG_NS) -> bool | None:
+    """Derived non-gating coarse lag screen.
+
+    True when generator_lag.maximum_nanoseconds <= max_lag_ns. None when the
+    lag summary is unavailable. Not an arrival-fidelity certificate.
+    """
+    lag = document.get("generator_lag")
+    if not isinstance(lag, dict):
+        return None
+    maximum = lag.get("maximum_nanoseconds")
+    if type(maximum) is not int:
+        return None
+    return maximum <= int(max_lag_ns)
 
 
 def counted_rotation_position_counts(plan: list[dict]) -> dict[str, dict[int, int]]:
@@ -1242,9 +1301,10 @@ def neural_preflight(
         measurement=measurement,
         counted_runs=counted_runs,
     )
-    include_arrival_aware_definitions = (
-        calibration_variant == CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1
-    )
+    include_arrival_aware_definitions = calibration_variant in {
+        CALIBRATION_VARIANT_ARRIVAL_AWARE_BATCHING_V1,
+        CALIBRATION_VARIANT_ARRIVAL_AWARE_SPARSE_V1,
+    }
     include_adaptive_definitions = (
         calibration_variant == CALIBRATION_VARIANT_ADAPTIVE_EARLY_SEAL_V1
         or include_arrival_aware_definitions
@@ -1713,7 +1773,7 @@ def execute_plan(
                         document=document,
                     )
                 )
-                # Diagnostic only: surface batch-formation stats without failing plumbing.
+                # Diagnostic only: surface batch-formation and coarse lag without failing.
                 mean, mean_problems = realized_mean_batch_size(document)
                 if not mean_problems and mean is not None:
                     status = dict(status)
@@ -1724,6 +1784,10 @@ def execute_plan(
                     batch_fraction, batch_problems = multi_size_batch_fraction(document)
                     if not batch_problems and batch_fraction is not None:
                         status["multi_size_batch_fraction"] = batch_fraction
+                lag_screen = coarse_max_lag_v1(document)
+                if lag_screen is not None:
+                    status = dict(status)
+                    status["coarse_max_lag_v1"] = lag_screen
             if (
                 mode == "calibration"
                 and document is not None
@@ -1782,6 +1846,7 @@ def execute_plan(
             "realized_mean_batch_size",
             "multi_request_batch_fraction",
             "multi_size_batch_fraction",
+            "coarse_max_lag_v1",
         ):
             if diagnostic_key in status:
                 meta[diagnostic_key] = status[diagnostic_key]
