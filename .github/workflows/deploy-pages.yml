@@ -1,0 +1,325 @@
+name: Deploy Pages
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: inferedge-github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Test, build, and package static site
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Require the main branch
+        working-directory: .
+        run: |
+          set -eu
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "Refusing to package Pages from ${GITHUB_REF}"
+            exit 1
+          fi
+          if [ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]; then
+            echo "Refusing unexpected event ${GITHUB_EVENT_NAME}"
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Install website dependencies
+        run: npm ci
+
+      - name: Run website tests
+        run: npm test
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Production build
+        run: npm run build
+
+      - name: Verify the static artifact
+        working-directory: .
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import hashlib
+          import os
+          import pathlib
+          import re
+          import stat
+          import sys
+          from html.parser import HTMLParser
+
+          root = pathlib.Path(".").absolute()
+          forbidden_names = {
+              "scheduler_runs",
+              "baselines",
+              "concurrent_runs",
+              "experiments",
+              "node_modules",
+          }
+          allowed_directories = {"assets", "data", "figures"}
+          publications = [
+              ("docs/benchmarks/arrival-aware-sparse-gemm.md", "data/arrival-aware-sparse-gemm.md"),
+              ("docs/benchmarks/arrival-aware-sparse-gemm-results.json", "data/arrival-aware-sparse-gemm-results.json"),
+              ("docs/benchmarks/arrival-aware-sparse-gemm-p50.png", "figures/arrival-aware-sparse-gemm-p50.png"),
+              (
+                  "docs/benchmarks/arrival-aware-sparse-gemm-paired-deltas.png",
+                  "figures/arrival-aware-sparse-gemm-paired-deltas.png",
+              ),
+              ("docs/benchmarks/neural-batching-gemm.md", "data/neural-batching-gemm.md"),
+              ("docs/benchmarks/neural-batching-gemm-results.json", "data/neural-batching-gemm-results.json"),
+              ("docs/benchmarks/adaptive-neural-batching-gemm.md", "data/adaptive-neural-batching-gemm.md"),
+              (
+                  "docs/benchmarks/adaptive-neural-batching-gemm-results.json",
+                  "data/adaptive-neural-batching-gemm-results.json",
+              ),
+          ]
+          asset_js = re.compile(r"^/inferedge/assets/[A-Za-z0-9][A-Za-z0-9._-]*\.js$")
+          asset_css = re.compile(r"^/inferedge/assets/[A-Za-z0-9][A-Za-z0-9._-]*\.css$")
+
+          def fail(message: str) -> None:
+              print(message)
+              sys.exit(1)
+
+          def is_link(path: pathlib.Path) -> bool:
+              try:
+                  return stat.S_ISLNK(os.lstat(path).st_mode)
+              except FileNotFoundError:
+                  return False
+
+          def walk_from_root(relative: str, label: str) -> pathlib.Path:
+              if not relative or relative.startswith("/") or "\\" in relative or "%" in relative:
+                  fail(f"Refusing unsafe path: {label}")
+              rel = pathlib.PurePosixPath(relative)
+              if not rel.parts or any(part in {"", ".", ".."} for part in rel.parts):
+                  fail(f"Refusing unsafe path: {label}")
+              if is_link(root):
+                  fail(f"Refusing symlink: {label}")
+              current = root
+              for part in rel.parts:
+                  current = current / part
+                  try:
+                      mode = os.lstat(current).st_mode
+                  except FileNotFoundError:
+                      fail(f"Missing required file: {label}")
+                  if stat.S_ISLNK(mode):
+                      fail(f"Refusing symlink: {label}")
+              resolved = current.resolve(strict=True)
+              trusted = root.resolve(strict=True)
+              if not resolved.is_relative_to(trusted):
+                  fail(f"Resolved path escapes trusted root: {label}")
+              return current
+
+          def require_regular_file(relative: str, label: str) -> pathlib.Path:
+              path = walk_from_root(relative, label)
+              if not path.is_file() or is_link(path):
+                  fail(f"Missing required file: {label}")
+              return path
+
+          def require_real_directory(relative: str, label: str) -> pathlib.Path:
+              path = walk_from_root(relative, label)
+              if not path.is_dir() or is_link(path):
+                  fail(f"{label} must be a real directory")
+              return path
+
+          walk_from_root("website", "website")
+          dist = require_real_directory("website/dist", "website/dist")
+          require_real_directory("docs", "docs")
+          require_real_directory("docs/benchmarks", "docs/benchmarks")
+
+          entries: list[pathlib.Path] = []
+          stack = [dist]
+          while stack:
+              current = stack.pop()
+              with os.scandir(current) as listing:
+                  children = list(listing)
+              for child in children:
+                  relative = pathlib.Path(child.path).relative_to(dist).as_posix()
+                  if child.is_symlink():
+                      fail(f"Refusing symlink: {relative}")
+                  name = child.name
+                  if name.startswith(".") or name in forbidden_names:
+                      fail(f"Refusing protected or hidden path in dist: {relative}")
+                  parts = set(pathlib.PurePosixPath(relative).parts)
+                  if parts & forbidden_names:
+                      fail(f"Refusing protected evidence path in dist: {relative}")
+                  if child.is_dir(follow_symlinks=False):
+                      top = pathlib.PurePosixPath(relative).parts[0]
+                      if top not in allowed_directories or len(pathlib.PurePosixPath(relative).parts) != 1:
+                          fail(f"Refusing unexpected directory: {relative}")
+                      stack.append(pathlib.Path(child.path))
+                      continue
+                  if not child.is_file(follow_symlinks=False):
+                      fail(f"Refusing unapproved artifact: {relative}")
+                  entries.append(pathlib.Path(child.path))
+
+          if not entries:
+              fail("website/dist contains no files")
+
+          index = require_regular_file("website/dist/index.html", "index.html")
+
+          class AssetParser(HTMLParser):
+              def __init__(self) -> None:
+                  super().__init__(convert_charrefs=True)
+                  self.refs: list[tuple[str, str]] = []
+                  self._in_script = False
+                  self._script_data: list[str] = []
+
+              def close(self) -> None:
+                  self._finish_script()
+                  super().close()
+
+              def _finish_script(self) -> None:
+                  if self._in_script and any(part.strip() for part in self._script_data):
+                      fail("Refusing inline script")
+                  self._in_script = False
+                  self._script_data = []
+
+              def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+                  tag_l = tag.lower()
+                  seen: set[str] = set()
+                  for key, _value in attrs:
+                      name = key.lower()
+                      if name in seen:
+                          fail(f"Duplicate attribute on <{tag_l}>: {key}")
+                      if name.startswith("on"):
+                          fail(f"Unsupported executable attribute on <{tag_l}>: {key}")
+                      seen.add(name)
+                  attr = {key.lower(): value or "" for key, value in attrs}
+                  if tag_l == "script":
+                      if self._in_script:
+                          fail("Unsupported nested script")
+                      allowed_script = {"src", "type", "crossorigin"}
+                      unexpected = sorted(set(attr) - allowed_script)
+                      if unexpected:
+                          fail(f"Unsupported script attribute: {unexpected[0]}")
+                      if "src" not in attr:
+                          fail("Script without src")
+                      if attr.get("type") != "module":
+                          fail("Unsupported script form")
+                      if "crossorigin" in attr and attr["crossorigin"] not in {"", "anonymous"}:
+                          fail("Unsupported script form")
+                      self.refs.append(("js", attr["src"]))
+                      self._in_script = True
+                      self._script_data = []
+                      return
+                  if tag_l == "link":
+                      allowed_link = {"rel", "href", "crossorigin"}
+                      unexpected = sorted(set(attr) - allowed_link)
+                      if unexpected:
+                          fail(f"Unsupported link attribute: {unexpected[0]}")
+                      if "href" not in attr or "rel" not in attr:
+                          fail("Unsupported link")
+                      if attr["rel"].casefold() != "stylesheet":
+                          fail(f"Unsupported link: {attr['rel']}")
+                      if "crossorigin" in attr and attr["crossorigin"] not in {"", "anonymous"}:
+                          fail("Unsupported link")
+                      self.refs.append(("css", attr["href"]))
+                      return
+                  for key in ("src", "href"):
+                      if key in attr:
+                          fail(f"Unsupported {tag_l} reference: {attr[key]}")
+
+              def handle_endtag(self, tag: str) -> None:
+                  if tag.lower() == "script":
+                      self._finish_script()
+
+              def handle_data(self, data: str) -> None:
+                  if self._in_script:
+                      self._script_data.append(data)
+
+          parser = AssetParser()
+          parser.feed(index.read_text(encoding="utf-8"))
+          parser.close()
+          if not parser.refs:
+              fail("index.html does not reference first-party assets")
+
+          def validate_asset(kind: str, raw: str) -> str:
+              if raw != raw.strip() or any(ord(char) < 32 or ord(char) == 127 for char in raw):
+                  fail(f"Malformed HTML reference: {raw!r}")
+              if "%" in raw:
+                  fail(f"Refusing percent-encoded asset: {raw}")
+              if "\\" in raw:
+                  fail(f"Refusing backslash asset path: {raw}")
+              pattern = asset_js if kind == "js" else asset_css
+              if pattern.fullmatch(raw) is None:
+                  fail(f"Unsupported asset reference: {raw}")
+              return raw[len("/inferedge/") :]
+
+          expected_assets: list[str] = []
+          seen_assets: set[str] = set()
+          has_js = False
+          has_css = False
+          for kind, raw in parser.refs:
+              relative = validate_asset(kind, raw)
+              if relative in seen_assets:
+                  fail(f"Duplicate asset reference: {raw}")
+              seen_assets.add(relative)
+              expected_assets.append(relative)
+              if kind == "js":
+                  has_js = True
+              else:
+                  has_css = True
+
+          if not has_js or not has_css:
+              fail("index.html must reference one JS asset and one CSS asset")
+
+          allowed = {"index.html"}
+          for relative in expected_assets:
+              allowed.add(relative)
+              require_regular_file(f"website/dist/{relative}", relative)
+          for source_name, dest_relative in publications:
+              allowed.add(dest_relative)
+              source = require_regular_file(source_name, source_name)
+              dest = require_regular_file(f"website/dist/{dest_relative}", dest_relative)
+              if hashlib.sha256(source.read_bytes()).hexdigest() != hashlib.sha256(dest.read_bytes()).hexdigest():
+                  fail(f"Publication hash mismatch: {source_name}")
+              print(f"OK {source.name}")
+
+          found = {path.relative_to(dist).as_posix() for path in entries}
+          unexpected = sorted(found - allowed)
+          if unexpected:
+              fail(f"Refusing unapproved artifact: {unexpected[0]}")
+          missing = sorted(allowed - found)
+          if missing:
+              fail(f"Missing required file: {missing[0]}")
+          print("Static artifact verified")
+          PY
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: website/dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
