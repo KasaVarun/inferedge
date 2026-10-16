@@ -8,7 +8,7 @@
     "sync:publications": "node scripts/sync-public-artifacts.mjs",
     "dev": "npm run sync:publications && vite",
     "typecheck": "tsc --noEmit",
-    "test": "node --test scripts/test-sync-public-artifacts.mjs && node --experimental-strip-types --test scripts/test-skip-to-main.ts scripts/test-gemm-publication.ts",
+    "test": "node --test scripts/test-sync-public-artifacts.mjs && node --experimental-strip-types --test scripts/test-skip-to-main.ts scripts/test-gemm-publication.ts scripts/test-scheduler-simulation.ts",
     "build": "npm run sync:publications && vite build",
     "preview": "vite preview"
   },
