@@ -81,6 +81,19 @@ public:
     BackendLease& operator=(const BackendLease&) = delete;
 };
 
+// Pinned llama.cpp default physical microbatch. One constant for production
+// load and the test accessor.
+constexpr std::uint32_t kLlamaPhysicalMicrobatch = 512;
+
+GenerativeContextSizing calculate_llama_context_sizing(std::uint32_t context_limit) noexcept {
+    GenerativeContextSizing sizing;
+    sizing.n_ctx = context_limit;
+    sizing.n_batch = context_limit;
+    sizing.n_ubatch = std::min(context_limit, kLlamaPhysicalMicrobatch);
+    sizing.n_seq_max = 1;
+    return sizing;
+}
+
 PackageStatus decode_token_piece(const llama_vocab* vocab, llama_token token, std::string& piece) {
     char probe[16];
     const int32_t first = llama_token_to_piece(vocab, token, probe, sizeof(probe), 0, false);
@@ -123,6 +136,11 @@ bool cancellation_adapter_should_abort(const CancellationFlag& flag) noexcept {
 int GenerativeSessionTestAccess::BackendLeaseCount() noexcept {
     std::lock_guard<std::mutex> lock(backend_mutex());
     return backend_count();
+}
+
+GenerativeContextSizing
+GenerativeSessionTestAccess::ContextSizing(std::uint32_t context_limit) noexcept {
+    return calculate_llama_context_sizing(context_limit);
 }
 
 GenerationStatus evaluate_generation_context_budget(std::uint32_t prompt_tokens,
@@ -220,10 +238,12 @@ GenerationStatus GenerativeSession::load(const std::filesystem::path& package_di
         return fail_status(GenerationError::kModelLoad, "llama.cpp rejected the GGUF");
     }
     llama_context_params context_params = llama_context_default_params();
-    context_params.n_ctx = impl->package.manifest.context_limit;
-    context_params.n_batch = 1;
-    context_params.n_ubatch = 1;
-    context_params.n_seq_max = 1;
+    const GenerativeContextSizing sizing =
+        calculate_llama_context_sizing(impl->package.manifest.context_limit);
+    context_params.n_ctx = sizing.n_ctx;
+    context_params.n_batch = sizing.n_batch;
+    context_params.n_ubatch = sizing.n_ubatch;
+    context_params.n_seq_max = sizing.n_seq_max;
     context_params.n_threads = 1;
     context_params.n_threads_batch = 1;
     context_params.embeddings = false;

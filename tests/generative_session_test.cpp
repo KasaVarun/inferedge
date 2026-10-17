@@ -195,6 +195,46 @@ TEST(GenerativeSessionTest, GeneratedTextBoundRejectsOverflow) {
     EXPECT_EQ(small, "ok");
 }
 
+TEST(GenerativeSessionTest, LlamaContextSizingMatchesContextLimitAndCappedMicrobatch) {
+    const std::uint32_t limits[] = {1, 2, 511, 512, 513, 4095, 4096};
+    for (const std::uint32_t limit : limits) {
+        const inferedge::GenerativeContextSizing sizing =
+            inferedge::GenerativeSessionTestAccess::ContextSizing(limit);
+        EXPECT_EQ(sizing.n_ctx, limit);
+        EXPECT_EQ(sizing.n_batch, limit);
+        const std::uint32_t expected_ubatch = limit < 512U ? limit : 512U;
+        EXPECT_EQ(sizing.n_ubatch, expected_ubatch);
+        EXPECT_GE(sizing.n_ubatch, 1U);
+        EXPECT_LE(sizing.n_ubatch, sizing.n_batch);
+        EXPECT_EQ(sizing.n_seq_max, 1U);
+        EXPECT_GE(sizing.n_batch, limit);
+    }
+}
+
+TEST(GenerativeSessionTest, LlamaContextSizingCanonical4096Is4096By4096By512By1) {
+    const inferedge::GenerativeContextSizing sizing =
+        inferedge::GenerativeSessionTestAccess::ContextSizing(4096);
+    EXPECT_EQ(sizing.n_ctx, 4096U);
+    EXPECT_EQ(sizing.n_batch, 4096U);
+    EXPECT_EQ(sizing.n_ubatch, 512U);
+    EXPECT_EQ(sizing.n_seq_max, 1U);
+}
+
+TEST(GenerativeSessionTest, LlamaContextSizingMicrobatchShrinksBelow512AndCapsAt512) {
+    const inferedge::GenerativeContextSizing small =
+        inferedge::GenerativeSessionTestAccess::ContextSizing(511);
+    EXPECT_EQ(small.n_batch, 511U);
+    EXPECT_EQ(small.n_ubatch, 511U);
+    const inferedge::GenerativeContextSizing exact =
+        inferedge::GenerativeSessionTestAccess::ContextSizing(512);
+    EXPECT_EQ(exact.n_batch, 512U);
+    EXPECT_EQ(exact.n_ubatch, 512U);
+    const inferedge::GenerativeContextSizing above =
+        inferedge::GenerativeSessionTestAccess::ContextSizing(513);
+    EXPECT_EQ(above.n_batch, 513U);
+    EXPECT_EQ(above.n_ubatch, 512U);
+}
+
 TEST(GenerativeSessionTest, SequentialGenerateWithoutLoadRemainsRejected) {
     inferedge::GenerativeSession session;
     inferedge::GenerationRequest request;

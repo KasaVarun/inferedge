@@ -108,10 +108,21 @@ private:
     friend class GenerativeSessionTestAccess;
 };
 
-// Test-only lease accounting. Production callers must not use this type.
+// Test-only view of the llama.cpp context sizes applied at load. Production
+// callers must not use this type.
+struct GenerativeContextSizing {
+    std::uint32_t n_ctx{0};
+    std::uint32_t n_batch{0};
+    std::uint32_t n_ubatch{0};
+    std::uint32_t n_seq_max{0};
+};
+
+// Test-only lease accounting and context-sizing access. Production callers
+// must not use this type.
 class GenerativeSessionTestAccess {
 public:
     static int BackendLeaseCount() noexcept;
+    static GenerativeContextSizing ContextSizing(std::uint32_t context_limit) noexcept;
 };
 
 } // namespace inferedge

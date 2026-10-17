@@ -18,7 +18,16 @@ ONNX Runtime GenAI 0.17.0 remains rejected.
 - CPU only
 - Apple arm64
 - One loaded model
-- Batch size one
+- One request processed at a time
+- One sequence: llama.cpp `n_seq_max=1`
+- `n_batch` is llama.cpp’s logical token capacity for one `llama_decode`
+  submission. InferEdge submits the complete rendered prompt in one call, so
+  logical capacity equals the accepted context limit
+- `n_ubatch` is the physical microbatch. It is capped at the pinned llama.cpp
+  default of 512, or the context limit when that limit is smaller. A prompt
+  may contain more tokens than `n_ubatch`; pinned llama.cpp splits causal
+  decoding into microbatches. This sizing is a correctness fix, not a
+  performance claim
 - Context at most 4096
 - Combined prompt-token and output-token context is enforced
 - Maximum generated tokens bounded and validated; never silently reduced
