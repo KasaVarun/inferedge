@@ -54,7 +54,7 @@ Neural reference checking follows `precomputed_reference_compare`. Independent e
 - A shared session pool or concurrent `InferenceEngine::run` on one engine. Do not add a collected concurrent baseline. Do not add a collected neural scheduler campaign. `inferedge-bench-concurrent` and JSON schema version 2 exist. They are not a production server, and no concurrency speedup has been measured
 - CUDA, TensorRT, or CoreML execution provider configuration
 - HTTP APIs, databases, frontends, or Python bindings
-- Dependencies beyond the C++ standard library, CMake, Ninja, GoogleTest fetched by CMake, the pinned ONNX Runtime 1.31.0 CPU archives, and clang-format
+- Dependencies beyond the C++ standard library, CMake, Ninja, GoogleTest fetched by CMake, the pinned ONNX Runtime 1.31.0 CPU archives, and clang-format. The optional default-OFF llama.cpp pin in Optional generative inference is the only additional dependency that a reviewed configure may use.
 
 `onnx==1.22.0` regenerates `models/add_f32.onnx`, `models/int64_echo.onnx`, `models/rank2_f32.onnx`, `models/batch_add_f32.onnx`, `models/mlp_small_f32.onnx`, `models/mlp_medium_f32.onnx`, and `models/gemm_f32.onnx`, plus matching sidecars and fixtures where those generators emit them. It is not a CMake dependency. Do not install it during configuration.
 
@@ -65,3 +65,7 @@ Configure with Ninja. Keep project warnings as errors. Run `ctest` before consid
 ## Code shape
 
 Keep `main` thin. Put behavior that should be tested in `include/inferedge` and `src`, not in the executable entry point.
+
+## Optional generative inference
+
+Existing ONNX Runtime 1.31.0 CPU and float32 `InferenceEngine` / `InferenceScheduler` behavior remains unchanged. ONNX Runtime GenAI 0.17.0 is rejected and must not be introduced. llama.cpp is an optional, default-OFF dependency behind `INFEREDGE_ENABLE_GENERATIVE`. The only accepted revision is tag `v0.7.0`, commit `620d2225cc436ab0b001e3200e590e3b286ef9ab`. The approved source archive SHA-256 is `55d67acf3ad2ad747a9bbeb75f9f0e173dbcc0d1753a471038a90c819421c5e1`. llama.cpp must be supplied from a verified local prefix through `INFEREDGE_LLAMA_CPP_ROOT`. Configure and ordinary CI must not download llama.cpp, model weights, or GGUF packages. The initial implementation is CPU arm64 only. Metal, CoreML, CUDA, Vulkan, server, HTTP, and telemetry support are excluded. Model weights and GGUF packages must remain outside Git and GitHub Pages. No model may download automatically. `trust_remote_code` must remain false. Qwen is the first manual integration target. Llama requires separate license acceptance and is not OSI open source. One model may be loaded, batch size is one, and context is at most 4096. Correctness must pass before benchmarking. Performance claims require a separately audited later phase. Prompt and output logging is not implemented and must not be added without a separately reviewed privacy design. Neural scheduling and training are not part of Phase 9-B1. Future learned policies must be offline, versioned, audited, reversible, and retain a deterministic fallback. Protected evidence roots remain off-limits.

@@ -1,0 +1,60 @@
+InferEdge model-package manifest schema 1
+
+Fixed UTF-8 text. One key=value pair per line. LF only. No JSON.
+
+Required keys, in any order, each exactly once:
+
+schema_version
+model_id
+source_repository
+source_revision
+runtime_project
+runtime_tag
+runtime_commit
+gguf_file
+gguf_sha256
+gguf_size_bytes
+gguf_architecture
+quantization
+license_id
+context_limit
+chat_template_file
+chat_template_sha256
+thinking_mode
+license_file
+license_sha256
+notice_file
+notice_sha256
+
+Fixed runtime values:
+
+runtime_project=llama.cpp
+runtime_tag=v0.7.0
+runtime_commit=620d2225cc436ab0b001e3200e590e3b286ef9ab
+
+Phase 9-B1 constraints:
+
+schema_version=1
+thinking_mode=disabled
+context_limit is an integer in 1..4096
+gguf_size_bytes is an integer in 1..2147483648
+gguf_architecture is qwen3 or llama
+quantization is one of Q4_K_M, Q5_K_M, Q8_0, F16, F32
+gguf_file is a safe basename ending in .gguf
+license_file is a required safe basename
+notice_file is a safe basename, or the token none
+chat_template_file is a safe basename
+SHA-256 fields are 64 lowercase hex characters
+file names reject /, \, %, ., .., absolute paths, and control characters
+
+license_file and notice_file were added so the package allowlist is exact.
+license_sha256 is a required lowercase 64-hex SHA-256 of license_file.
+notice_file=none requires notice_sha256=none. A declared NOTICE file
+requires a safe basename and a matching lowercase 64-hex SHA-256.
+
+The GGUF SHA-256 covers embedded tokenizer metadata. There is no separate
+tokenizer_sha256 field. Phase 9-B2 independently verifies tokenizer
+behavior against the pinned official tokenizer oracle.
+
+The reserved Qwen non-thinking template identity is qwen3-non-thinking-v1.txt.
+Phase 9-B1 does not certify that template against an official tokenizer.

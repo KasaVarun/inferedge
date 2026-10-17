@@ -76,6 +76,10 @@ add_executable(
     tests/native_resource_test.cpp
     tests/stl_container_test.cpp
     tests/template_test.cpp
+    src/model_package_manifest.cpp
+    src/generate_cli.cpp
+    tests/model_package_manifest_test.cpp
+    tests/generate_cli_test.cpp
 )
 target_link_libraries(inferedge_tests PRIVATE inferedge_core GTest::gtest_main)
 
@@ -698,5 +702,72 @@ if(INFEREDGE_ENABLE_LONG_STRESS)
         PROPERTIES
             ENVIRONMENT "ORT_DISABLE_TELEMETRY=1"
             TIMEOUT 300
+    )
+endif()
+
+# Optional llama.cpp generative CLI. Default OFF. Configure does not download llama.cpp.
+option(INFEREDGE_ENABLE_GENERATIVE
+    "Build inferedge-generate against a verified local llama.cpp prefix" OFF)
+if(INFEREDGE_ENABLE_GENERATIVE)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama_cpp.cmake")
+    add_library(
+        inferedge_generative
+        src/generative_session.cpp
+        src/model_package_manifest.cpp
+    )
+    target_include_directories(inferedge_generative PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_features(inferedge_generative PUBLIC cxx_std_20)
+    target_link_libraries(
+        inferedge_generative
+        PUBLIC inferedge_warnings
+        PRIVATE inferedge_llama_cpp
+    )
+    add_library(inferedge_generate_cli src/generate_cli.cpp)
+    target_include_directories(inferedge_generate_cli PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_features(inferedge_generate_cli PUBLIC cxx_std_20)
+    target_compile_definitions(
+        inferedge_generate_cli
+        PUBLIC INFEREDGE_VERSION="${PROJECT_VERSION}"
+    )
+    target_link_libraries(inferedge_generate_cli PUBLIC inferedge_warnings)
+    add_executable(inferedge-generate src/generate_main.cpp)
+    target_link_libraries(
+        inferedge-generate
+        PRIVATE inferedge_generate_cli inferedge_generative
+    )
+    set_target_properties(inferedge-generate PROPERTIES
+        BUILD_RPATH "${INFEREDGE_LLAMA_CPP_LIB_DIR}"
+    )
+    add_executable(
+        inferedge_generative_tests
+        tests/generative_session_test.cpp
+    )
+    target_link_libraries(
+        inferedge_generative_tests
+        PRIVATE
+            inferedge_warnings
+            inferedge_generative
+            inferedge_generate_cli
+            GTest::gtest_main
+    )
+    target_compile_definitions(
+        inferedge_generative_tests
+        PRIVATE
+            "INFEREDGE_GENERATE_EXECUTABLE=\"$<TARGET_FILE:inferedge-generate>\""
+    )
+    set_target_properties(inferedge_generative_tests PROPERTIES
+        BUILD_RPATH "${INFEREDGE_LLAMA_CPP_LIB_DIR}"
+    )
+    add_dependencies(inferedge_generative_tests inferedge-generate)
+    gtest_discover_tests(inferedge_generative_tests)
+    add_test(NAME inferedge_generate_help COMMAND inferedge-generate --help)
+    add_test(NAME inferedge_generate_version COMMAND inferedge-generate --version)
+    set_tests_properties(
+        inferedge_generate_help
+        PROPERTIES PASS_REGULAR_EXPRESSION "Usage: inferedge-generate"
+    )
+    set_tests_properties(
+        inferedge_generate_version
+        PROPERTIES PASS_REGULAR_EXPRESSION "inferedge-generate 0\\.1\\.0"
     )
 endif()
