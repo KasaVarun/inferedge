@@ -958,8 +958,6 @@ for raw in sys.stdin:
         time.sleep(delay_s)
     if behavior == "timeout":
         time.sleep(5)
-    if behavior == "just_below":
-        time.sleep(0.05)
     if behavior == "just_above":
         time.sleep(0.4)
     if behavior == "exact_deadline":
@@ -1569,15 +1567,29 @@ class WorkerTimeoutPolicyTests(unittest.TestCase):
             return
         self.fail("process group still exists")
 
-    def test_response_just_below_timeout_passes(self) -> None:
+    def test_delayed_response_below_timeout_passes_after_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            os.environ["FAKE_WORKER_BEHAVIOR"] = "just_below"
-            worker = self._session(Path(tmp), timeout_s=0.25)
+            os.environ["FAKE_WORKER_DELAY_S"] = "0.05"
+            os.environ["FAKE_WORKER_DELAY_OP"] = "load"
+            worker = self._session(Path(tmp), request_timeout_s=5.0)
+            assert worker.process is not None
+            pid = worker.process.pid
             try:
-                document = worker.request({"op": "identity"})
+                identity = worker.request({"op": "identity"})
+                self.assertTrue(identity["ok"])
+                sent_before_target = worker.requests_sent
+                self.assertEqual(sent_before_target, 1)
+                self.assertEqual(os.environ.get("FAKE_WORKER_DELAY_OP"), "load")
+                worker.request_timeout_s = 0.25
+                worker.timeout_s = 0.25
+                document = worker.request({"op": "load"})
                 self.assertTrue(document["ok"])
+                self.assertEqual(worker.requests_sent, sent_before_target + 1)
+                self.assertEqual(worker.requests_sent, 2)
             finally:
                 worker.close()
+            self._assert_worker_reaped(worker, pid)
+            self.assertIsNone(worker.cleanup_error)
 
     def test_response_exactly_at_deadline_is_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1932,13 +1944,31 @@ class WorkerIdentityTimeoutTests(unittest.TestCase):
                 harness.ie,
                 [str(harness.ie), "--worker-stdio", "--package", str(harness.package)],
                 "inferedge",
-                request_timeout_s=0.5,
+                request_timeout_s=5.0,
             )
+            assert worker.process is not None
+            pid = worker.process.pid
             try:
+                started = time.monotonic()
                 document = worker.request({"op": "identity"})
+                elapsed = time.monotonic() - started
                 self.assertTrue(document["ok"])
+                self.assertEqual(worker.requests_sent, 1)
+                self.assertEqual(os.environ.get("FAKE_WORKER_DELAY_OP"), "identity")
+                self.assertGreaterEqual(elapsed, 0.15)
             finally:
                 worker.close()
+            self.assertIsNone(worker.process)
+            self.assertTrue(worker.pending_empty())
+            self.assertIsNone(worker.cleanup_error)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+            try:
+                os.killpg(pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                self.fail("process group still exists")
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["FAKE_WORKER_DELAY_S"] = "0.25"
             os.environ["FAKE_WORKER_DELAY_OP"] = "identity"
@@ -1949,6 +1979,8 @@ class WorkerIdentityTimeoutTests(unittest.TestCase):
                 "reference",
                 request_timeout_s=0.08,
             )
+            assert worker.process is not None
+            fail_pid = worker.process.pid
             try:
                 with self.assertRaises(CollectorError) as caught:
                     worker.request({"op": "identity"})
@@ -1957,6 +1989,15 @@ class WorkerIdentityTimeoutTests(unittest.TestCase):
             finally:
                 worker.close()
             self.assertTrue(worker.pending_empty())
+            self.assertIsNone(worker.cleanup_error)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(fail_pid, 0)
+            try:
+                os.killpg(fail_pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                self.fail("process group still exists")
 
     def test_identity_partial_and_stderr_do_not_extend_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
