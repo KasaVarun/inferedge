@@ -90,6 +90,14 @@ jobs:
                   "docs/benchmarks/adaptive-neural-batching-gemm-results.json",
                   "data/adaptive-neural-batching-gemm-results.json",
               ),
+              (
+                  "docs/benchmarks/generative-overhead-qwen3-0.6b.md",
+                  "data/generative-overhead-qwen3-0.6b.md",
+              ),
+              (
+                  "docs/benchmarks/generative-overhead-qwen3-0.6b-results.json",
+                  "data/generative-overhead-qwen3-0.6b-results.json",
+              ),
           ]
           asset_js = re.compile(r"^/inferedge/assets/[A-Za-z0-9][A-Za-z0-9._-]*\.js$")
           asset_css = re.compile(r"^/inferedge/assets/[A-Za-z0-9][A-Za-z0-9._-]*\.css$")

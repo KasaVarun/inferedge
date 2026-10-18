@@ -1,0 +1,314 @@
+{
+  "publication_format_version": 1,
+  "study_id": "generative_overhead_qwen3_0_6b_c01",
+  "title": "Qwen3-0.6B generative-overhead benchmark: no directional winner under the frozen C01 protocol",
+  "evidence_class": "official_campaign",
+  "campaign": {
+    "campaign_class": "campaign",
+    "campaign_id": "phase-9-b3d-campaign-001",
+    "contract": "generative-overhead-r7-inventory-v1",
+    "source_commit": "f91cb463fd4026a3dd05af4b0ac7c6f9b3182955",
+    "start_utc": "2026-10-18T16:35:52.665569Z",
+    "end_utc": "2026-10-18T17:22:57.891498Z",
+    "complete_matrix": true,
+    "rejection_codes": []
+  },
+  "scope": {
+    "model_id": "qwen3-0.6b",
+    "gguf_filename": "qwen3-0.6b-Q4_K_M.gguf",
+    "quantization": "Q4_K_M",
+    "host_class": "one_tested_apple_silicon_host",
+    "host": {
+      "operating_system": "Darwin",
+      "cpu_architecture": "arm64",
+      "hardware_model": "Mac17,8",
+      "os_product_name": "macOS",
+      "os_product_version": "27.0.1"
+    },
+    "primary_cell": "C01",
+    "pair_count": 20,
+    "comparison": "inferedge_integration_versus_pinned_direct_llamacpp",
+    "backend": "cpu_native_as_recorded"
+  },
+  "provenance": {
+    "campaign_class": "campaign",
+    "campaign_id": "phase-9-b3d-campaign-001",
+    "source_commit": "f91cb463fd4026a3dd05af4b0ac7c6f9b3182955",
+    "protocol_document_sha256": "45e54f910d1c64df509d215150475f2ba40dccc1e3bc7f292cfcc5f8cd203651",
+    "collector_script_sha256": "8e289ebadf3f1323cb62ff4cf2eaa379c03bffa89dca214915d702b35edddab7",
+    "analyzer_script_sha256": "deee6b9bfcdc5f5d66845256e60b049deffd07c2ff7dd42d1de42089ef05ff1a",
+    "fixtures_sha256": "f4f0ef2640c8f459a8b871e92720053bb2227bf20a210a98e99f98b024cbd61c",
+    "gguf_sha256": "3f384c3796ca2547c5547be6bca3d487a18807cc1a2c259de6e0e1fa433bb76d",
+    "gguf_size_bytes": 484220192,
+    "inferedge_worker_sha256": "1820a52aaceb56477f7c329342e7438224ea02eaf466d582fab622d60d959db9",
+    "reference_worker_sha256": "44777c42fe2a40d2f44ac554a6da01f406c76550ac0d53d6245981845d8b2b91",
+    "campaign_manifest_sha256": "273fc869d45c26118297c36bdc5a37b7e21ff4845b231845af22d43f0cdef371",
+    "aggregate_sha256": "93da8a1fa8c97fc12e7c20079210f5484c1a151a8532fdd8450c3cfaa1ed9887",
+    "summary_sha256": "a4d020038e79b13ae4c3aa7cf0463cec0602d19c0010083fed4d850bab0eac48",
+    "schema_family": "generative_overhead",
+    "schema_version": 1,
+    "contract": "generative-overhead-r7-inventory-v1",
+    "compiler_identity": "Apple clang version 21.0.0 (clang-2100.3.34.2)",
+    "build_type": "Release",
+    "model_id": "qwen3-0.6b",
+    "gguf_filename": "qwen3-0.6b-Q4_K_M.gguf",
+    "quantization": "Q4_K_M",
+    "llama_tag": "v0.7.0",
+    "llama_commit": "620d2225cc436ab0b001e3200e590e3b286ef9ab",
+    "campaign_start_utc": "2026-10-18T16:35:52.665569Z",
+    "campaign_end_utc": "2026-10-18T17:22:57.891498Z",
+    "collector_process_start_utc": "2026-10-18T16:35:50.535790Z",
+    "collector_process_end_utc": "2026-10-18T17:22:58.079740Z",
+    "analyzer_process_start_utc": "2026-10-18T17:23:52.621731Z",
+    "aggregate_summary_deterministic_reproduction": "byte_identical_isolated_analysis_accepted",
+    "source_ci_run_url": "https://github.com/KasaVarun/inferedge/actions/runs/39143884593",
+    "ci_run_url": "https://github.com/KasaVarun/inferedge/actions/runs/39143884593"
+  },
+  "design": {
+    "primary_cell": "C01",
+    "fixture_id": "P_tiny",
+    "prompt_token_count": 13,
+    "max_new_tokens": 1,
+    "threads": 1,
+    "measurement_operation": "warm_request",
+    "pair_count": 20,
+    "pair_order_rule": "even ie_then_ref, odd ref_then_ie",
+    "n_ctx": 4096,
+    "n_batch": 4096,
+    "n_ubatch": 512,
+    "n_seq_max": 1,
+    "warmup_count_per_worker": 2,
+    "difference_definition": "inferedge_duration_ns_minus_reference_duration_ns"
+  },
+  "primary_c01": {
+    "cell_id": "C01",
+    "role": "primary",
+    "pair_count": 20,
+    "sum_ie_ns": 1490295957,
+    "sum_ref_ns": 1493768458,
+    "sum_d_ns": -3472501,
+    "inferedge_mean_ns": 74514797.85,
+    "reference_mean_ns": 74688422.9,
+    "mean_difference_ns": -173625.05,
+    "signed_direction_label": "inferedge_faster",
+    "signed_direction_is_winner": false,
+    "bootstrap_replicates": 10000,
+    "bootstrap_seed": 20261018,
+    "confidence_level": 0.95,
+    "ci_low_ns": -1060655.6224999994,
+    "ci_high_ns": 730089.1224999995,
+    "absolute_threshold_per_pair_ns": 2000000,
+    "absolute_threshold_20_pair_ns": 40000000,
+    "absolute_threshold_met": false,
+    "relative_threshold_numerator": 5,
+    "relative_threshold_denominator": 100,
+    "relative_threshold_met": false,
+    "ci_excludes_zero_strict": false,
+    "winner_declared": false,
+    "superiority_claimed": false,
+    "practical_equivalence_claimed": false,
+    "claim_status": "no_winner_below_threshold_or_ci",
+    "complete_matrix": true,
+    "rejection_codes": [],
+    "descriptive_statistics": {
+      "affects_winner_decision": false,
+      "p25_difference_ns": -1591001,
+      "p50_difference_ns": -407708,
+      "median_difference_ns": -407708,
+      "p75_difference_ns": 575333,
+      "p95_difference_ns": 3066958,
+      "iqr_difference_ns": 2166334,
+      "mad_difference_ns": 983041
+    },
+    "pairs": [
+      {
+        "pair_id": "00",
+        "arm_order": "ie_then_ref",
+        "inferedge_duration_ns": 75366500,
+        "reference_duration_ns": 74909250,
+        "difference_ns": 457250
+      },
+      {
+        "pair_id": "01",
+        "arm_order": "ref_then_ie",
+        "inferedge_duration_ns": 75062708,
+        "reference_duration_ns": 75750333,
+        "difference_ns": -687625
+      },
+      {
+        "pair_id": "02",
+        "arm_order": "ie_then_ref",
+        "inferedge_duration_ns": 75077459,
+        "reference_duration_ns": 75553250,
+        "difference_ns": -475791
+      },
+      {
+        "pair_id": "03",
+        "arm_order": "ref_then_ie",
+        "inferedge_duration_ns": 73028750,
+        "reference_duration_ns": 75614417,
+        "difference_ns": -2585667
+      },
+      {
+        "pair_id": "04",
+        "arm_order": "ie_then_ref",
+        "inferedge_duration_ns": 74766208,
+        "reference_duration_ns": 76357209,
+        "difference_ns": -1591001
+      },
+      {
+        "pair_id": "05",
+        "arm_order": "ref_then_ie",
+        "inferedge_duration_ns": 74979541,
+        "reference_duration_ns": 74404208,
+        "difference_ns": 575333
+      },
+      {
+        "pair_id": "06",
+        "arm_order": "ie_then_ref",
+        "inferedge_duration_ns": 71440458,
+        "reference_duration_ns": 75742834,
+        "difference_ns": -4302376
+      },
+      {
+        "pair_id": "07",
+        "arm_order": "ref_then_ie",
+        "inferedge_duration_ns": 75316291,
+        "reference_duration_ns": 75732625,
+        "difference_ns": -416334
+      },
+      {
+        "pair_id": "08",
+        "arm_order": "ie_then_ref",
+        "inferedge_duration_ns": 74644417,
+        "reference_duration_ns": 71888916,
+        "difference_ns": 2755501
+      },
+      {
+        "pair_id": "09",
+        "arm_order": "ref_then_ie",
+        "inferedge_duration_ns": 74682583,
+        "reference_duration_ns": 74466208,
+        "difference_ns": 216375
+      },
+      {
+        "pair_id": "10",
+        "arm_order": "ie_then_ref",
+        "inferedge_duration_ns": 74888375,
+        "reference_duration_ns": 75001666,
+        "difference_ns": -113291
+      },
+      {
+        "pair_id": "11",
+        "arm_order": "ref_then_ie",
+        "inferedge_duration_ns": 75210917,
+        "reference_duration_ns": 72143959,
+        "difference_ns": 3066958
+      },
+      {
+        "pair_id": "12",
+        "arm_order": "ie_then_ref",
+        "inferedge_duration_ns": 74106458,
+        "reference_duration_ns": 75361625,
+        "difference_ns": -1255167
+      },
+      {
+        "pair_id": "13",
+        "arm_order": "ref_then_ie",
+        "inferedge_duration_ns": 75050542,
+        "reference_duration_ns": 75458250,
+        "difference_ns": -407708
+      },
+      {
+        "pair_id": "14",
+        "arm_order": "ie_then_ref",
+        "inferedge_duration_ns": 75767083,
+        "reference_duration_ns": 72174708,
+        "difference_ns": 3592375
+      },
+      {
+        "pair_id": "15",
+        "arm_order": "ref_then_ie",
+        "inferedge_duration_ns": 75470125,
+        "reference_duration_ns": 75271250,
+        "difference_ns": 198875
+      },
+      {
+        "pair_id": "16",
+        "arm_order": "ie_then_ref",
+        "inferedge_duration_ns": 72016292,
+        "reference_duration_ns": 74339000,
+        "difference_ns": -2322708
+      },
+      {
+        "pair_id": "17",
+        "arm_order": "ref_then_ie",
+        "inferedge_duration_ns": 71963667,
+        "reference_duration_ns": 75393834,
+        "difference_ns": -3430167
+      },
+      {
+        "pair_id": "18",
+        "arm_order": "ie_then_ref",
+        "inferedge_duration_ns": 75715250,
+        "reference_duration_ns": 74881041,
+        "difference_ns": 834209
+      },
+      {
+        "pair_id": "19",
+        "arm_order": "ref_then_ie",
+        "inferedge_duration_ns": 75742333,
+        "reference_duration_ns": 73323875,
+        "difference_ns": 2418458
+      }
+    ]
+  },
+  "secondary_cells_policy": {
+    "C02_through_C11": "descriptive_only",
+    "L01": "descriptive_filesystem_cache_warm_load",
+    "enter_primary_c01_claim": false,
+    "may_rescue_or_override_c01": false,
+    "ranking_published": false,
+    "descriptive_only": true
+  },
+  "claim_policy": {
+    "primary_cell": "C01",
+    "estimator": "mean_paired_difference",
+    "pair_count": 20,
+    "bootstrap_replicates": 10000,
+    "bootstrap_seed": 20261018,
+    "confidence_level": 0.95,
+    "absolute_threshold_ns": 2000000,
+    "relative_threshold_numerator": 5,
+    "relative_threshold_denominator": 100,
+    "both_thresholds_required": true,
+    "strict_directional_ci_exclusion_required": true,
+    "secondary_cells_cannot_rescue_c01": true,
+    "equivalence_inference_allowed": false,
+    "winner_declared": false,
+    "superiority_claimed": false,
+    "practical_equivalence_claimed": false,
+    "claim_status": "no_winner_below_threshold_or_ci",
+    "complete_matrix": true,
+    "rejection_codes": []
+  },
+  "limitations": [
+    "one_host",
+    "one_official_campaign",
+    "one_frozen_qwen3_0_6b_q4_k_m_package",
+    "one_primary_prompt_token_thread_configuration",
+    "twenty_paired_c01_observations",
+    "cpu_native_backend_as_recorded",
+    "no_gpu_conclusion",
+    "no_concurrency_conclusion",
+    "no_energy_conclusion",
+    "no_model_quality_conclusion",
+    "no_training_or_continual_learning_conclusion",
+    "no_generalization_to_other_qwen_or_llama_models",
+    "no_production_wide_latency_conclusion",
+    "no_practical_equivalence_conclusion",
+    "raw_evidence_local_unpublished"
+  ],
+  "raw_evidence_published_on_github": false,
+  "publication_statement": "In one protocol-valid 20-pair C01 campaign on the frozen Qwen3-0.6B package and tested Apple host, neither implementation satisfied all prespecified practical-threshold and strict 95% bootstrap-interval criteria for a directional winner."
+}

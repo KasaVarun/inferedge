@@ -13,6 +13,15 @@ import {
   publicationUrl,
   type GemmG2G4Publication,
 } from "../performance/gemmPublication";
+import {
+  GENERATIVE_JSON,
+  GENERATIVE_MARKDOWN,
+  formatMillisecondInterval,
+  formatMilliseconds,
+  parseGenerativeOverheadPublication,
+  publicationUrl as generativePublicationUrl,
+  type GenerativeOverheadPublication,
+} from "../performance/generativePublication";
 import styles from "./PerformancePage.module.css";
 
 type LoadState =
@@ -20,8 +29,14 @@ type LoadState =
   | { status: "error"; message: string }
   | { status: "ready"; publication: GemmG2G4Publication };
 
+type GenerativeLoadState =
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | { status: "ready"; publication: GenerativeOverheadPublication };
+
 export function PerformancePage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
+  const [generativeState, setGenerativeState] = useState<GenerativeLoadState>({ status: "loading" });
   const baseUrl = import.meta.env.BASE_URL;
 
   useEffect(() => {
@@ -31,7 +46,7 @@ export function PerformancePage() {
     void fetch(url, { signal: controller.signal })
       .then(async (response) => {
         if (!response.ok) {
-          throw new Error("Published results JSON is not available");
+          throw new Error("Published GEMM results JSON is not available");
         }
         return (await response.json()) as unknown;
       })
@@ -42,40 +57,177 @@ export function PerformancePage() {
         if (controller.signal.aborted) {
           return;
         }
-        const message = error instanceof Error ? error.message : "Publication validation failed";
+        const message = error instanceof Error ? error.message : "GEMM publication validation failed";
         setState({ status: "error", message });
       });
 
     return () => controller.abort();
   }, [baseUrl]);
 
+  useEffect(() => {
+    const controller = new AbortController();
+    const url = generativePublicationUrl(baseUrl, GENERATIVE_JSON);
+
+    void fetch(url, { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error("Published generative-overhead JSON is not available");
+        }
+        return (await response.json()) as unknown;
+      })
+      .then((payload) => {
+        setGenerativeState({
+          status: "ready",
+          publication: parseGenerativeOverheadPublication(payload),
+        });
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) {
+          return;
+        }
+        const message =
+          error instanceof Error ? error.message : "Generative publication validation failed";
+        setGenerativeState({ status: "error", message });
+      });
+
+    return () => controller.abort();
+  }, [baseUrl]);
+
   return (
-    <PageLayout kicker="Performance" title="Audited GEMM scheduler extract">
+    <PageLayout kicker="Performance" title="Audited performance publications">
       <p className={styles.lede}>
-        This page presents one reviewed publication: producer-observed P50 for G2 versus G4 on a
-        frozen 100 requests/s <code>gemm_f32</code> ONNX Runtime CPU workload. Numbers come from the
-        committed JSON. Missing or altered fields are not replaced with invented statistics.
+        This page presents two reviewed publications that stay separate: a GEMM scheduler extract
+        and one official Qwen3-0.6B generative-overhead campaign. Each JSON is loaded and validated
+        on its own. Missing or altered fields are not replaced with invented statistics, and one
+        study is not substituted for the other.
       </p>
       <p className={styles.actions}>
-        <a className={styles.primary} href={githubDocUrl(PRIMARY_MARKDOWN)} rel="noreferrer">
-          Published Markdown
-        </a>
-        <a className={styles.secondary} href={githubDocUrl(PRIMARY_JSON)} rel="noreferrer">
-          Machine-readable JSON
-        </a>
         <a className={styles.secondary} href={GITHUB_REPO} rel="noreferrer">
           GitHub repository
         </a>
       </p>
-      {state.status === "loading" ? <p>Loading the published extract.</p> : null}
+      <section className={styles.section} aria-labelledby="gemm-study">
+        <h2 id="gemm-study">Audited GEMM scheduler extract</h2>
+        <p>
+          Producer-observed P50 for G2 versus G4 on a frozen 100 requests/s <code>gemm_f32</code>{" "}
+          ONNX Runtime CPU workload. This extract is not combined with the generative-overhead
+          campaign.
+        </p>
+        <p className={styles.actions}>
+          <a className={styles.primary} href={githubDocUrl(PRIMARY_MARKDOWN)} rel="noreferrer">
+            GEMM Markdown
+          </a>
+          <a className={styles.secondary} href={githubDocUrl(PRIMARY_JSON)} rel="noreferrer">
+            GEMM JSON
+          </a>
+        </p>
+        {state.status === "loading" ? <p>Loading the GEMM scheduler extract.</p> : null}
+        {state.status === "error" ? (
+          <p className={styles.error} role="alert">
+            The GEMM scheduler extract cannot be displayed: {state.message}. No substitute figures
+            are shown.
+          </p>
+        ) : null}
+        {state.status === "ready" ? <ReadyPublication publication={state.publication} /> : null}
+      </section>
+      <GenerativeSection state={generativeState} />
+    </PageLayout>
+  );
+}
+
+function GenerativeSection({ state }: { state: GenerativeLoadState }) {
+  return (
+    <section className={styles.section} aria-labelledby="generative-study">
+      <h2 id="generative-study">Qwen3-0.6B generative overhead: no directional winner</h2>
+      <p className={styles.actions}>
+        <a className={styles.primary} href={githubDocUrl(GENERATIVE_MARKDOWN)} rel="noreferrer">
+          Generative-overhead Markdown
+        </a>
+        <a className={styles.secondary} href={githubDocUrl(GENERATIVE_JSON)} rel="noreferrer">
+          Generative-overhead JSON
+        </a>
+      </p>
+      {state.status === "loading" ? <p>Loading the generative-overhead publication.</p> : null}
       {state.status === "error" ? (
         <p className={styles.error} role="alert">
-          The dashboard cannot display statistics: {state.message}. No substitute figures are
-          shown.
+          The generative-overhead publication cannot be displayed: {state.message}. No substitute
+          figures are shown.
         </p>
       ) : null}
-      {state.status === "ready" ? <ReadyPublication publication={state.publication} /> : null}
-    </PageLayout>
+      {state.status === "ready" ? <ReadyGenerative publication={state.publication} /> : null}
+    </section>
+  );
+}
+
+function ReadyGenerative({ publication }: { publication: GenerativeOverheadPublication }) {
+  return (
+    <>
+      <p>{publication.publicationStatement}</p>
+      <dl className={styles.stats}>
+        <div>
+          <dt>Model package</dt>
+          <dd>
+            <code>{publication.modelId}</code> · <code>{publication.quantization}</code> ·{" "}
+            <code>{publication.ggufFilename}</code>
+          </dd>
+        </div>
+        <div>
+          <dt>Host</dt>
+          <dd>One tested Apple host ({publication.hardwareModel})</dd>
+        </div>
+        <div>
+          <dt>C01 pair count</dt>
+          <dd>{publication.pairCount}</dd>
+        </div>
+        <div>
+          <dt>InferEdge mean</dt>
+          <dd>{formatMilliseconds(publication.inferedgeMeanNs)} ms</dd>
+        </div>
+        <div>
+          <dt>Reference mean</dt>
+          <dd>{formatMilliseconds(publication.referenceMeanNs)} ms</dd>
+        </div>
+        <div>
+          <dt>Mean paired difference</dt>
+          <dd>{formatMilliseconds(publication.meanDifferenceNs)} ms</dd>
+        </div>
+        <div>
+          <dt>95% bootstrap interval</dt>
+          <dd>{formatMillisecondInterval(publication.ciLowNs, publication.ciHighNs)} ms</dd>
+        </div>
+        <div>
+          <dt>Absolute threshold met</dt>
+          <dd>no</dd>
+        </div>
+        <div>
+          <dt>Relative threshold met</dt>
+          <dd>no</dd>
+        </div>
+        <div>
+          <dt>Strict directional CI exclusion</dt>
+          <dd>no</dd>
+        </div>
+        <div>
+          <dt>Winner declared</dt>
+          <dd>no</dd>
+        </div>
+        <div>
+          <dt>Practical equivalence claimed</dt>
+          <dd>no</dd>
+        </div>
+        <div>
+          <dt>Claim status</dt>
+          <dd>
+            <code>{publication.claimStatus}</code>
+          </dd>
+        </div>
+      </dl>
+      <p>
+        The protocol label <code>{publication.signedDirectionLabel}</code> records only the sign of
+        the paired sum. It is not a winner. Winner declared remains no, and practical equivalence is
+        not claimed.
+      </p>
+    </>
   );
 }
 

@@ -10,6 +10,7 @@ import {
   WEBSITE_CI,
   githubDocUrl,
 } from "../catalog/inferedgeEvidence";
+import { GENERATIVE_JSON, GENERATIVE_MARKDOWN } from "../performance/generativePublication";
 import { PageLayout } from "../components/PageLayout";
 import styles from "./ReproducibilityPage.module.css";
 
@@ -198,6 +199,30 @@ export function ReproducibilityPage() {
             prior A/G2/G3 GEMM
           </a>
           . Those related studies remain separate evidence.
+        </p>
+      </section>
+
+      <section className={styles.section} aria-labelledby="repro-generative">
+        <h2 id="repro-generative">I. Qwen3-0.6B generative-overhead publication</h2>
+        <p>
+          A separate official single campaign, <code>phase-9-b3d-campaign-001</code>, reports no
+          directional winner under the frozen C01 criteria. It is not a GEMM scheduler study and is
+          not combined with the extracts above.
+        </p>
+        <ul>
+          <li>Qwen3-0.6B generative-overhead study</li>
+          <li>Official single campaign</li>
+          <li>No directional winner under the frozen criteria</li>
+          <li>Separate from the GEMM scheduler studies</li>
+        </ul>
+        <p>
+          <a href={githubDocUrl(GENERATIVE_MARKDOWN)} rel="noreferrer">
+            {GENERATIVE_MARKDOWN}
+          </a>
+          {" · "}
+          <a href={githubDocUrl(GENERATIVE_JSON)} rel="noreferrer">
+            {GENERATIVE_JSON}
+          </a>
         </p>
       </section>
     </PageLayout>

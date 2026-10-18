@@ -17,6 +17,8 @@ export const REQUIRED = Object.freeze([
   { name: "arrival-aware-sparse-gemm-results.json", destDir: "data" },
   { name: "arrival-aware-sparse-gemm-p50.png", destDir: "figures" },
   { name: "arrival-aware-sparse-gemm-paired-deltas.png", destDir: "figures" },
+  { name: "generative-overhead-qwen3-0.6b.md", destDir: "data" },
+  { name: "generative-overhead-qwen3-0.6b-results.json", destDir: "data" },
 ]);
 
 export const OPTIONAL = Object.freeze([
@@ -188,6 +190,58 @@ export function inspectExistingDestPath(target, label, kind) {
   }
 }
 
+function removeRealTree(target) {
+  const stat = fs.lstatSync(target);
+  if (stat.isSymbolicLink()) {
+    throw new Error(`Refusing to prune through a symbolic link: ${target}`);
+  }
+  if (stat.isDirectory()) {
+    for (const name of fs.readdirSync(target)) {
+      removeRealTree(path.join(target, name));
+    }
+    fs.rmdirSync(target);
+    return;
+  }
+  if (stat.isFile()) {
+    fs.unlinkSync(target);
+    return;
+  }
+  throw new Error(`Refusing unexpected destination entry: ${target}`);
+}
+
+function pruneUnexpectedDestinations(destRoot, planned) {
+  const allowedByDir = new Map(ALLOWED_DEST_DIRS.map((dirName) => [dirName, new Set()]));
+  for (const item of planned) {
+    allowedByDir.get(item.entry.destDir).add(item.entry.name);
+  }
+  const rootStat = lstatOrThrow(destRoot, "Destination root");
+  assertDirectory(rootStat, "Destination root", destRoot);
+  for (const name of fs.readdirSync(destRoot)) {
+    const full = path.join(destRoot, name);
+    if (!ALLOWED_DEST_DIRS.includes(name)) {
+      removeRealTree(full);
+      continue;
+    }
+    const dirStat = lstatOrThrow(full, "Destination subdirectory");
+    assertDirectory(dirStat, "Destination subdirectory", full);
+    const allowed = allowedByDir.get(name);
+    for (const childName of fs.readdirSync(full)) {
+      const child = path.join(full, childName);
+      const childStat = fs.lstatSync(child);
+      if (childStat.isSymbolicLink()) {
+        throw new Error(`Destination is a symbolic link: ${child}`);
+      }
+      if (allowed.has(childName)) {
+        if (!childStat.isFile()) {
+          throw new Error(`Destination file is not a regular file: ${child}`);
+        }
+        continue;
+      }
+      removeRealTree(child);
+    }
+  }
+}
+
 function writeTempThenRename(sourcePath, destPath, destDir) {
   const bytes = readRegularFileBytes(sourcePath);
   const tempPath = path.join(
@@ -280,6 +334,7 @@ export function syncPublications(argv = process.argv.slice(2)) {
         throw new Error(`Byte mismatch after rename: ${temp.destPath}`);
       }
     }
+    pruneUnexpectedDestinations(destRoot, planned);
   } catch (error) {
     for (const temp of temps) {
       try {
