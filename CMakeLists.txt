@@ -770,4 +770,38 @@ if(INFEREDGE_ENABLE_GENERATIVE)
         inferedge_generate_version
         PROPERTIES PASS_REGULAR_EXPRESSION "inferedge-generate 0\\.1\\.0"
     )
+    add_executable(inferedge-overhead-ie src/generative_overhead_ie_worker.cpp)
+    target_link_libraries(
+        inferedge-overhead-ie
+        PRIVATE inferedge_warnings inferedge_generative inferedge_llama_cpp
+    )
+    set_target_properties(inferedge-overhead-ie PROPERTIES
+        BUILD_RPATH "${INFEREDGE_LLAMA_CPP_LIB_DIR}"
+    )
+    add_executable(
+        inferedge-overhead-ref
+        src/generative_overhead_ref_worker.cpp
+        src/model_package_manifest.cpp
+    )
+    target_include_directories(inferedge-overhead-ref PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_features(inferedge-overhead-ref PRIVATE cxx_std_20)
+    target_link_libraries(
+        inferedge-overhead-ref
+        PRIVATE inferedge_warnings inferedge_llama_cpp
+    )
+    set_target_properties(inferedge-overhead-ref PROPERTIES
+        BUILD_RPATH "${INFEREDGE_LLAMA_CPP_LIB_DIR}"
+    )
+    add_test(NAME inferedge_overhead_ie_help COMMAND inferedge-overhead-ie --help)
+    add_test(NAME inferedge_overhead_ref_help COMMAND inferedge-overhead-ref --help)
+    add_test(NAME inferedge_overhead_ie_version COMMAND inferedge-overhead-ie --version)
+    add_test(NAME inferedge_overhead_ref_version COMMAND inferedge-overhead-ref --version)
+    set_tests_properties(
+        inferedge_overhead_ie_version
+        PROPERTIES PASS_REGULAR_EXPRESSION "generative-overhead-r7-inventory-v1"
+    )
+    set_tests_properties(
+        inferedge_overhead_ref_version
+        PROPERTIES PASS_REGULAR_EXPRESSION "generative-overhead-r7-inventory-v1"
+    )
 endif()

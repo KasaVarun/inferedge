@@ -40,7 +40,7 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
       - name: Run Python benchmark tooling tests
-        run: python3 -m unittest benchmarks.test_collect_baseline benchmarks.test_analyze_baseline benchmarks.test_collect_concurrent benchmarks.test_analyze_concurrent benchmarks.test_collect_scheduler benchmarks.test_analyze_scheduler benchmarks.test_collect_overhead benchmarks.test_analyze_overhead benchmarks.test_collect_neural_scheduler benchmarks.test_analyze_neural_scheduler benchmarks.test_collect_neural_overhead benchmarks.test_analyze_neural_overhead
+        run: python3 -m unittest benchmarks.test_collect_baseline benchmarks.test_analyze_baseline benchmarks.test_collect_concurrent benchmarks.test_analyze_concurrent benchmarks.test_collect_scheduler benchmarks.test_analyze_scheduler benchmarks.test_collect_overhead benchmarks.test_analyze_overhead benchmarks.test_collect_neural_scheduler benchmarks.test_analyze_neural_scheduler benchmarks.test_collect_neural_overhead benchmarks.test_analyze_neural_overhead benchmarks.test_collect_generative benchmarks.test_analyze_generative
 
       # models/requirements.txt pins onnx==1.22.0 for generators and fixture checks.
       # A throwaway venv keeps that pin off the system interpreter used above.
