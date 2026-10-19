@@ -82,6 +82,8 @@ add_executable(
     tests/generate_cli_test.cpp
     src/admission_record.cpp
     tests/admission_record_test.cpp
+    src/tensor_canonical.cpp
+    tests/tensor_canonical_test.cpp
 )
 target_link_libraries(inferedge_tests PRIVATE inferedge_core GTest::gtest_main)
 
