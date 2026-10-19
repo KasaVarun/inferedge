@@ -80,6 +80,8 @@ add_executable(
     src/generate_cli.cpp
     tests/model_package_manifest_test.cpp
     tests/generate_cli_test.cpp
+    src/admission_record.cpp
+    tests/admission_record_test.cpp
 )
 target_link_libraries(inferedge_tests PRIVATE inferedge_core GTest::gtest_main)
 
