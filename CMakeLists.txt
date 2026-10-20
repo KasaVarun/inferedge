@@ -86,6 +86,8 @@ add_executable(
     tests/tensor_canonical_test.cpp
     src/oracle_digest.cpp
     tests/oracle_digest_test.cpp
+    src/evidence_store.cpp
+    tests/evidence_store_test.cpp
 )
 target_link_libraries(inferedge_tests PRIVATE inferedge_core GTest::gtest_main)
 
