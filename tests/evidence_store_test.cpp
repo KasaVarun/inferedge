@@ -5,10 +5,12 @@
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
+#include <filesystem>
 #include <gtest/gtest.h>
 #include <set>
 #include <string>
 #include <sys/stat.h>
+#include <system_error>
 #include <thread>
 #include <type_traits>
 #include <unistd.h>
@@ -76,15 +78,36 @@ public:
     }
 };
 
+// Host temporary directory from the standard library. Failure stays empty.
+// There is no hardcoded temporary root and no silent fallback.
+std::string make_temporary_directory(const char* prefix) {
+    std::error_code error;
+    const std::filesystem::path reported = std::filesystem::temp_directory_path(error);
+    if (error || reported.empty() || !reported.is_absolute()) {
+        return {};
+    }
+    // The store opens a caller root with O_NOFOLLOW from '/'. Darwin reports
+    // this directory through a symlink. The canonical path is the same directory.
+    const std::filesystem::path directory = std::filesystem::canonical(reported, error);
+    if (error || directory.empty() || !directory.is_absolute()) {
+        return {};
+    }
+    const std::string pattern = (directory / (std::string(prefix) + "XXXXXX")).string();
+    if (pattern.size() < 6 || pattern.compare(pattern.size() - 6, 6, "XXXXXX") != 0) {
+        return {};
+    }
+    std::vector<char> buffer(pattern.begin(), pattern.end());
+    buffer.push_back('\0');
+    if (mkdtemp(buffer.data()) == nullptr) {
+        return {};
+    }
+    return std::string(buffer.data());
+}
+
 class TempRoot {
 public:
-    TempRoot() {
-        char name[] = "/private/tmp/inferedge-9c6-XXXXXX";
-        if (mkdtemp(name) == nullptr) {
-            path_ = {};
-            return;
-        }
-        path_ = name;
+    explicit TempRoot(const char* prefix = "inferedge-9c6-") {
+        path_ = make_temporary_directory(prefix);
     }
     ~TempRoot() {
         if (!path_.empty()) {
@@ -707,37 +730,41 @@ TEST(EvidenceStore, LockWaitBudgetIsIndependentOfClockProgress) {
 }
 
 TEST(EvidenceStore, SymlinkAncestorsOfCallerRootsAreRejected) {
-    auto make = [](const char* pattern) {
-        std::string name = pattern;
-        EXPECT_NE(mkdtemp(name.data()), nullptr);
-        return name;
-    };
-    const std::string real = make("/private/tmp/inferedge-real-XXXXXX");
-    ASSERT_EQ(mkdir(join_path(real, "chain").c_str(), 0700), 0);
-    ASSERT_EQ(mkdir(join_path(real, "chain/mid").c_str(), 0700), 0);
-    ASSERT_EQ(mkdir(join_path(real, "chain/mid/root").c_str(), 0700), 0);
-    ASSERT_EQ(mkdir(join_path(real, "chain-evil").c_str(), 0700), 0);
-    plant(real, "chain-evil/secret.bin", "secret");
-    plant(real, "chain/mid/root/keep.bin", "keep");
+    TempRoot real("inferedge-real-");
+    TempRoot links("inferedge-link-");
+    ASSERT_TRUE(real.ok());
+    ASSERT_TRUE(links.ok());
+    ASSERT_EQ(mkdir(join_path(real.path(), "chain").c_str(), 0700), 0);
+    ASSERT_EQ(mkdir(join_path(real.path(), "chain/mid").c_str(), 0700), 0);
+    ASSERT_EQ(mkdir(join_path(real.path(), "chain/mid/root").c_str(), 0700), 0);
+    ASSERT_EQ(mkdir(join_path(real.path(), "chain-evil").c_str(), 0700), 0);
+    plant(real.path(), "chain-evil/secret.bin", "secret");
+    plant(real.path(), "chain/mid/root/keep.bin", "keep");
     std::uint64_t total = 0;
-    EXPECT_EQ(sum_evidence_root(join_path(real, "chain/mid/root"), total), EvidenceError::kOk);
+    EXPECT_EQ(sum_evidence_root(join_path(real.path(), "chain/mid/root"), total),
+              EvidenceError::kOk);
     EXPECT_EQ(total, 4u);
-    EXPECT_EQ(slurp(join_path(real, "chain-evil/secret.bin")), "secret");
+    EXPECT_EQ(slurp(join_path(real.path(), "chain-evil/secret.bin")), "secret");
 
-    const std::string links = make("/private/tmp/inferedge-link-XXXXXX");
-    ASSERT_EQ(symlink(join_path(real, "chain/mid/root").c_str(), join_path(links, "final").c_str()),
+    ASSERT_EQ(symlink(join_path(real.path(), "chain/mid/root").c_str(),
+                      join_path(links.path(), "final").c_str()),
               0);
-    EXPECT_EQ(sum_evidence_root(join_path(links, "final"), total), EvidenceError::kSymlink);
-    ASSERT_EQ(symlink(join_path(real, "chain/mid").c_str(), join_path(links, "parent").c_str()), 0);
-    EXPECT_EQ(sum_evidence_root(join_path(links, "parent/root"), total), EvidenceError::kSymlink);
-    ASSERT_EQ(symlink(join_path(real, "chain").c_str(), join_path(links, "middle").c_str()), 0);
-    EXPECT_EQ(sum_evidence_root(join_path(links, "middle/mid/root"), total),
+    EXPECT_EQ(sum_evidence_root(join_path(links.path(), "final"), total), EvidenceError::kSymlink);
+    ASSERT_EQ(symlink(join_path(real.path(), "chain/mid").c_str(),
+                      join_path(links.path(), "parent").c_str()),
+              0);
+    EXPECT_EQ(sum_evidence_root(join_path(links.path(), "parent/root"), total),
               EvidenceError::kSymlink);
-    ASSERT_EQ(symlink(real.c_str(), join_path(links, "first").c_str()), 0);
-    EXPECT_EQ(sum_evidence_root(join_path(links, "first/chain/mid/root"), total),
+    ASSERT_EQ(
+        symlink(join_path(real.path(), "chain").c_str(), join_path(links.path(), "middle").c_str()),
+        0);
+    EXPECT_EQ(sum_evidence_root(join_path(links.path(), "middle/mid/root"), total),
               EvidenceError::kSymlink);
-    EXPECT_EQ(slurp(join_path(real, "chain/mid/root/keep.bin")), "keep");
-    EXPECT_EQ(slurp(join_path(real, "chain-evil/secret.bin")), "secret");
+    ASSERT_EQ(symlink(real.path().c_str(), join_path(links.path(), "first").c_str()), 0);
+    EXPECT_EQ(sum_evidence_root(join_path(links.path(), "first/chain/mid/root"), total),
+              EvidenceError::kSymlink);
+    EXPECT_EQ(slurp(join_path(real.path(), "chain/mid/root/keep.bin")), "keep");
+    EXPECT_EQ(slurp(join_path(real.path(), "chain-evil/secret.bin")), "secret");
 }
 
 TEST(EvidenceStore, FrozenDigestAndParserRoundTrip) {
