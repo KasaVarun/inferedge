@@ -50,28 +50,28 @@ Each phase from 9-C1 through 9-C44 has one introducing owner. No phase 9-C45 exi
 | 9-C30 | `admission/policy/policy-<id>.record`, `admission/policy/action-map-<id>.record` |
 | 9-C31 | policy-review family `review-policy-note-<id>`, `review-policy-signature-<id>`, `review-policy-sigblob-<id>`, and `review-policy-sigindex-<id>`, `admission/decisions/accept-policy-<id>.record` |
 | 9-C32 | `admission/heads/<head-set-id>.record`, `admission/heads/<head-set-id>.members` |
-| 9-C33 | `tests/withdrawal_test.cpp`, the direct and dependent fixture triples under `tests/fixtures/withdrawal/`, `CMakeLists.txt` |
-| 9-C34 | `include/inferedge/trust_migration.hpp`, `src/trust_migration.cpp`, `tests/trust_migration_test.cpp`, `CMakeLists.txt`. The export operation in this phase receives `source_trust_admin_signer` and writes the imported lineage-origin family into the section 39 bundle. The import operation verifies that family and publishes those exact bytes to the section 4 trust-root paths before imported `current`. It also writes `import.transaction`. It does not sign the imported origin. It retains all ten section 39 files at their exact paths for the destination lifetime |
+| 9-C33 | `include/inferedge/trust_transition.hpp`, `src/trust_transition.cpp`, `tests/trust_transition_publication_test.cpp`, `tests/withdrawal_test.cpp`, the direct and dependent fixture triples under `tests/fixtures/withdrawal/`, `CMakeLists.txt`. This phase defines `publish_verified_transition`, `publish_verified_status`, `publish_withdrawal`, and `publish_ordinary_transition` exactly once. It does not define import, native bootstrap, rollback, governance, activation, export freeze, or retirement |
+| 9-C34 | `include/inferedge/trust_migration.hpp`, `src/trust_migration.cpp`, `tests/trust_migration_test.cpp`, `CMakeLists.txt`. This phase defines `publish_imported_initialization`, `publish_export_freeze`, and `publish_retirement` exactly once. The export operation receives `source_trust_admin_signer` and writes the imported lineage-origin family into the section 39 bundle. The import operation verifies that family and publishes those exact bytes to the section 4 trust-root paths before imported `current`. It also writes `import.transaction` and `import-destination.record`. It does not sign the imported origin and does not rewrite the imported successor. It retains all ten section 39 files at their exact paths for the destination lifetime |
 | 9-C35 | `tests/activation_record_test.cpp`, the activation fixture triple under `tests/fixtures/activation/`, `CMakeLists.txt` |
-| 9-C36 | `include/inferedge/trust_service.hpp`, `src/trust_service.cpp`, `tests/trust_service_test.cpp`, `docs/phase-9-c36-trust-bundle.md`, `CMakeLists.txt`, generation-1 trust, configuration, empty revocation set, first authority registry and envelope, `admission/root/manifest-<id>.record`, and the native lineage-origin family in section 4. `initialize_native_generation` receives `native_bootstrap_signer` and publishes that family before native `current` and active status |
-| 9-C37 | `docs/phase-9-c37-rollback.md`, `tests/rollback_test.cpp`, `CMakeLists.txt` |
-| 9-C38 | `tests/trust_transition_test.cpp`, `CMakeLists.txt` |
-| 9-C39 | `admission/governance/governance-<id>.record`, governance-review family `review-governance-note-<id>`, `review-governance-signature-<id>`, `review-governance-sigblob-<id>`, and `review-governance-sigindex-<id>`, plus governance-content family `governance-signature-<id>`, `governance-sigblob-<id>`, and `governance-sigindex-<id>`, `admission/decisions/accept-governance-<id>.record`, and the trust transition that pins it |
+| 9-C36 | `include/inferedge/trust_service.hpp`, `src/trust_service.cpp`, `tests/trust_service_test.cpp`, `docs/phase-9-c36-trust-bundle.md`, `CMakeLists.txt`, generation-1 trust, configuration, empty revocation set, first authority registry and envelope, `admission/root/manifest-<id>.record`, and the native lineage-origin family in section 4. `publish_native_initialization` receives `native_bootstrap_signer` and publishes the genesis family, then the native lineage-origin family, then native `current`, then active status |
+| 9-C37 | `include/inferedge/trust_rollback.hpp`, `src/trust_rollback.cpp`, `docs/phase-9-c37-rollback.md`, `tests/rollback_test.cpp`, `CMakeLists.txt`. `publish_rollback` is defined in `src/trust_rollback.cpp`. `tests/rollback_test.cpp` calls that function and is not a friend |
+| 9-C38 | `tests/trust_transition_test.cpp`, `CMakeLists.txt`. Tests call `publish_ordinary_transition`. This phase defines no writer |
+| 9-C39 | `include/inferedge/trust_governance.hpp`, `src/trust_governance.cpp`, `tests/trust_governance_test.cpp`, `admission/governance/governance-<id>.record`, governance-review family `review-governance-note-<id>`, `review-governance-signature-<id>`, `review-governance-sigblob-<id>`, and `review-governance-sigindex-<id>`, plus governance-content family `governance-signature-<id>`, `governance-sigblob-<id>`, and `governance-sigindex-<id>`, `admission/decisions/accept-governance-<id>.record`, and the trust transition that pins it. `publish_governance_pin` is defined in `src/trust_governance.cpp` |
 | 9-C40 | `include/inferedge/generative_session.hpp`, `src/generative_session.cpp`, `tests/generative_session_test.cpp`. This phase verifies the section 11 lineage branch. On Branch B it opens exactly `payload.record` and `package.record` under the verified migration id. It does not publish lineage files |
 | 9-C41 | `src/generative_session.cpp`, `tests/generative_session_test.cpp` |
 | 9-C42 | `docs/phase-9-c42-shadow.md` |
-| 9-C43 | `docs/phase-9-c43-activation.md`. Zero or one `admission/activation/activation-<id>.record` when an equal invariance record is already current |
+| 9-C43 | `include/inferedge/trust_activation.hpp`, `src/trust_activation.cpp`, `tests/trust_activation_publication_test.cpp`, `docs/phase-9-c43-activation.md`. `publish_activation` is defined in `src/trust_activation.cpp`. Zero or one `admission/activation/activation-<id>.record` when an equal invariance record is already current |
 | 9-C44 | `include/inferedge/generative_session.hpp`, `src/generative_session.cpp`, `tests/generative_session_test.cpp` |
 
 `CMakeLists.txt` edits only add the named sources to the existing `inferedge_tests` target, or, for 9-C7, to that same target. Phases 9-C40, 9-C41, and 9-C44 do not edit `CMakeLists.txt`. `src/generate_main.cpp`, `src/generate_cli.cpp`, `src/generative_overhead_ie_worker.cpp`, and `models/llm/README.md` are in no allowlist.
 
-Phase 9-C6 is a source-and-test foundation. It introduces the evidence store and leaves `AuthenticatedCapability::authenticate` fail-closed: it returns unavailable and stores no capability. Phase 9-C7 is a source-and-test verifier integration. At these phases `src/evidence_store.cpp` and `src/ed25519_verify.cpp` are compiled only into `inferedge_tests`. They are not linked into `inferedge`, `inferedge_core`, or the benchmark, scheduler, concurrent, or generative executables. These phases do not enable authenticated recovery, cleanup, or deletion in a production executable. A later phase may do that only when its own section 2 row names that production target and both sources. This erratum does not create that phase. Phase 9-C7 implements Ed25519 verification in `src/ed25519_verify.cpp`, which owns the one strong verifier function, and may edit `src/evidence_store.cpp` so `authenticate` calls that function directly. The function returns a verification decision, not a capability, and it cannot assign the internal stamp. The decision carries the authorization digest, signature-family id, terminal trust id, effective date, registry-entry id, signer-key id, key-valid-from, key-valid-until, role, revocation result, verification date, operation, canonical authorization path, and target id. A bare acceptance, or a decision missing any of those fields, is malformed and stores no capability. `src/evidence_store.cpp` compares every returned identity with its own opened and read inputs, the verified authorization, the authenticated trust state, and the caller arguments. A mismatch stores no capability. Only then may it assign the internal stamp. Capability construction, private state, evidence-root and admission-root capture, and destructive recovery, cleanup, and deletion remain in that file. There is no weak symbol, callback, registration, macro, dynamic load, symbol interposition, test verifier definition, alternate verifier object, public verifier subclass, or external capability factory. `inferedge_tests` links `src/ed25519_verify.cpp` exactly once together with `src/evidence_store.cpp`. Omitting that definition fails the link as an unresolved symbol. A second strong definition fails the link as a duplicate symbol. There is no runtime result for a missing verifier definition; that absence is a negative link test. A rejected signature is a runtime rejected decision. A missing or unreadable signed input is a runtime unavailable decision. A build that omits the official verifier object and substitutes another object is outside this controlled target and is forbidden by the CMake rule. Phase 9-C7 may edit `tests/evidence_store_test.cpp` to replace expectations that currently require `kUnavailable` where a real accepted decision must succeed, and to add signed-fixture coverage for accepted deletion authorization, accepted stale-lock authorization, malformed signature, wrong signature family, wrong signer, wrong role, revoked signer, a not-yet-valid key, an expired key, wrong verification date, `test_only=yes`, altered authorization bytes, altered canonical path, altered target, trust-current replacement, evidence-root replacement, admission-root replacement, cleanup retry, quarantine unexpected-content preservation, successful quarantine deletion, and successful reservation cleanup. Tests for a rejected decision and for an unavailable signed input remain. Tests do not define the verifier, assign the stamp, construct private state, use a callback, use a test friend, use an authority macro, or install global authority. Phase 9-C7 may edit only the `authenticate` declaration, adding `std::string_view trust_root` immediately before `evidence_root`. `CapabilityResult::release_capability` and every other public evidence-store declaration stay unchanged. Before the stamp, sections 9, 10, 13, and 15 apply in full to the deletion-authorization and stale-lock families. Every requirement in those sections applies, including requirements not restated in this paragraph. The following checks are included and do not reduce those sections: the exact authorization bytes are the signed preimage; the record kind and signature family are the section 9 family; `test_only=no`; the signature record, index, and exact 64-byte blob are the section 10 objects and match their blob identities; the key blob identity and exact 32-byte public key match the one registry entry; the section 13 backward walk and forward verification end in byte equality of `current` and the terminal successor; the trust id and effective date come from that authenticated state; the entry role is `trust_admin`; `valid_from <= effective_date <= valid_until`; `revoked=no`; the verification date equals that effective date; and the operation, canonical authorization path, target identity, section 3 path and no-follow checks, and full-file digest and self-checksum rules all hold. Caller strings are comparisons, not proof. The bound terminal trust id and effective date must equal the caller's `terminal_trust_state_id` and `terminal_effective_date`. The signer-key id, key-valid-from, and key-valid-until must equal the caller's `signer_key_id`, `key_valid_from`, and `key_valid_until`. There is no caller role or revocation string. The requested operation, canonical authorization path, and target identity are bound only when they match the verified authorization. `trust_root/current` is opened by the section 3 component-wise no-follow walk, without a directory scan. The same descriptor is retained and the original byte sequence is retained. Immediately before the stamp that descriptor is `fstat`ed: device, inode, regular-file type, and size must be unchanged. It is then rewound and reread in full. The reread must return the complete retained sequence. A short read, a read error, or any byte difference stores no capability. The complete reread must also equal the authenticated terminal successor. The capability does not store trust-root device, inode, or kind, and later destructive operations do not reopen the trust root. It does store the evidence-root and admission-root device, inode, and directory kind taken from the descriptors opened for those roots. Those identities are rechecked before mutation. The live evidence-lock descriptor used for mutation must match the bound evidence-root identity. An admission-root replacement is detected before mutation. Failure stores no capability. Sections 20 through 22 and descriptor-relative `O_NOFOLLOW` opens remain in force. Phase 9-C7 edits `CMakeLists.txt` only to add `src/ed25519_verify.cpp` and `tests/ed25519_verify_test.cpp` to `inferedge_tests`.
+Phase 9-C6 is a source-and-test foundation. It introduces the evidence store and leaves `AuthenticatedCapability::authenticate` fail-closed: it returns unavailable and stores no capability. Phase 9-C7 is a source-and-test verifier integration. At these phases `src/evidence_store.cpp` and `src/ed25519_verify.cpp` are compiled only into `inferedge_tests`. They are not linked into `inferedge`, `inferedge_core`, or the benchmark, scheduler, concurrent, or generative executables. These phases do not enable authenticated recovery, cleanup, or deletion in a production executable. A later phase may do that only when its own section 2 row names that production target and both sources. This erratum does not create that phase. Phase 9-C7 implements Ed25519 verification in `src/ed25519_verify.cpp`, which owns the one strong verifier function, and may edit `src/evidence_store.cpp` so `authenticate` calls that function directly. The function returns a verification decision, not a capability, and it cannot assign the internal stamp. The decision carries the authorization digest, signature-family id, terminal trust id, effective date, registry-entry id, signer-key id, key-valid-from, key-valid-until, role, revocation result, verification date, operation, canonical authorization path, and target id. A bare acceptance, or a decision missing any of those fields, is malformed and stores no capability. `src/evidence_store.cpp` compares every returned identity with its own opened and read inputs, the verified authorization, the authenticated trust state, and the caller arguments. A mismatch stores no capability. Only then may it assign the internal stamp. Capability construction, private state, evidence-root and admission-root capture, and destructive recovery, cleanup, and deletion remain in that file. There is no weak symbol, callback, registration, macro, dynamic load, symbol interposition, test verifier definition, alternate verifier object, public verifier subclass, or external capability factory. `inferedge_tests` links `src/ed25519_verify.cpp` exactly once together with `src/evidence_store.cpp`. Omitting that definition fails the link as an unresolved symbol. A second strong definition fails the link as a duplicate symbol. There is no runtime result for a missing verifier definition; that absence is a negative link test. A rejected signature is a runtime rejected decision. A missing or unreadable signed input is a runtime unavailable decision. A build that omits the official verifier object and substitutes another object is outside this controlled target and is forbidden by the CMake rule. Phase 9-C7 may edit `tests/evidence_store_test.cpp` to replace expectations that currently require `kUnavailable` where a real accepted decision must succeed, and to add signed-fixture coverage for accepted deletion authorization, accepted stale-lock authorization, malformed signature, wrong signature family, wrong signer, wrong role, revoked signer, a not-yet-valid key, an expired key, wrong verification date, `test_only=yes`, altered authorization bytes, altered canonical path, altered target, trust-current replacement, evidence-root replacement, admission-root replacement, cleanup retry, quarantine unexpected-content preservation, successful quarantine deletion, and successful reservation cleanup. Tests for a rejected decision and for an unavailable signed input remain. Tests do not define the verifier, assign the stamp, construct private state, use a callback, use a test friend, use an authority macro, or install global authority. Phase 9-C7 may edit only the `authenticate` declaration, adding `std::string_view trust_root` immediately before `evidence_root`. `CapabilityResult::release_capability` and every other public evidence-store declaration stay unchanged. Before the stamp, sections 9, 10, 13, and 15 apply in full to the deletion-authorization and stale-lock families. Every requirement in those sections applies, including requirements not restated in this paragraph. The following checks are included and do not reduce those sections: the exact authorization bytes are the signed preimage; the record kind and signature family are the section 9 family; `test_only=no`; the signature record, index, and exact 64-byte blob are the section 10 objects and match their blob identities; the key blob identity and exact 32-byte public key match the one registry entry; the section 13 backward walk and forward verification end in byte equality of `current` and the terminal successor; the trust id and effective date come from that authenticated state; the entry role is `trust_admin`; `valid_from <= effective_date <= valid_until`; `revoked=no`; the verification date equals that effective date; and the operation, canonical authorization path, target identity, section 3 path and no-follow checks, and full-file digest and self-checksum rules all hold. Caller strings are comparisons, not proof. The bound terminal trust id and effective date must equal the caller's `terminal_trust_state_id` and `terminal_effective_date`. The signer-key id, key-valid-from, and key-valid-until must equal the caller's `signer_key_id`, `key_valid_from`, and `key_valid_until`. There is no caller role or revocation string. The requested operation, canonical authorization path, and target identity are bound only when they match the verified authorization. `trust_root/current` is opened by the section 3 component-wise no-follow walk, without a directory scan. The same descriptor is retained and the original byte sequence is retained. Immediately before the stamp that descriptor is `fstat`ed: device, inode, regular-file type, and size must be unchanged. It is then rewound and reread in full. The reread must return the complete retained sequence. A short read, a read error, or any byte difference stores no capability. The complete reread must also equal the authenticated terminal successor. The capability does not store trust-root device, inode, or kind, and later destructive operations do not reopen the trust root. It does store the evidence-root and admission-root device, inode, and directory kind taken from the descriptors opened for those roots. Those identities are rechecked before mutation. The live evidence-lock descriptor used for mutation must match the bound evidence-root identity. An admission-root replacement is detected before mutation. Failure stores no capability. Sections 20 through 22 and descriptor-relative `O_NOFOLLOW` opens remain in force. Phase 9-C7 edits `CMakeLists.txt` only to add `src/ed25519_verify.cpp` and `tests/ed25519_verify_test.cpp` to `inferedge_tests`. Erratum E2 compiles `src/trust_transition.cpp`, `src/trust_migration.cpp`, `src/trust_service.cpp`, `src/trust_rollback.cpp`, `src/trust_governance.cpp`, and `src/trust_activation.cpp` exactly once into `inferedge_tests`. `INFEREDGE_TRUST_PUBLICATION_TEST_SEAM` is a private definition of that target only. Those sources are not linked into `inferedge`, `inferedge_core`, or a benchmark, scheduler, concurrent, or generative executable or library. No production target writes trust state under this erratum. This erratum adds no phase 9-C45.
 
 Head sets are ordered. H1 is the accepted provenance decision and precedes acquisition. H2 adds the accepted golden decision and precedes license content. H3 adds the accepted license decision. Registry content cites H3. H4 adds the accepted registry decision. Policy content cites H4. H5 adds the accepted policy decision. A content record cites a head set that already exists. Every head-set file uses `admission/heads/<head-set-id>.record` and `admission/heads/<head-set-id>.members`.
 
 ## 3. Root, path, and open rules
 
-The trust service root, the admission root, and the evidence root are three caller-supplied directories. A contract path that begins with `benchmarks/generative_phase9c/` is resolved only under `evidence_root`. A contract path that begins with `admission/` is resolved only under `admission_root`. A contract path that begins with `trust_root/` is resolved only under the caller-supplied trust root; in the path list below, `trust_root/` is that directory. The loader and the importer do not search a working directory, a home directory, or a repository root. They do not list a directory to choose a file. They do not choose a file by name order or modification time. A file this contract does not name has no authority.
+The trust service root, the admission root, and the evidence root are three caller-supplied directories. A contract path that begins with `benchmarks/generative_phase9c/` is resolved only under `evidence_root`. A contract path that begins with `admission/` is resolved only under `admission_root`. A contract path that begins with `trust_root/` is resolved only under the caller-supplied trust root; in the path list below, `trust_root/` is that directory. The loader and the importer do not search a working directory, a home directory, or a repository root. They do not list a directory to choose a file. They do not choose a file by name order or modification time. A file this contract does not name has no authority. Publication writers classify the opened trust-root directory before any publication write. Darwin classification reads `f_fstypename` and accepts only `apfs`. Linux classification compares `static_cast<uint32_t>(f_type)` with `0xEF53` and `0x01021994`. Values `0x794c7630`, `0x6969`, `0xFF534D42`, and `0x65735546` are unsupported. Every other `f_type` is unsupported. A failed `fstatfs`, or an empty Darwin name, is indeterminate. The host image name is not an input. `flock` returning `EINVAL` after successful classification is `kKernelLockInvariant`. `struct statfs` is not named by a publication header.
 
 A relative path uses `/`, has no empty, `.`, or `..` segment, and does not start with `/`. The implementation opens with `O_NOFOLLOW`, rejects a symlink leaf, and rejects a symlink ancestor. The resolved path stays inside its declared root. Lexical path checks run before the open.
 
@@ -89,6 +89,15 @@ The trust loader and the importer may open only these trust-root paths. Ordinary
 | `trust_root/current.partial` | compare-and-swap temporary for `current` only |
 | `trust_root/migration_high_water.partial` | rename temporary for high water |
 | `trust_root/service_status.partial` | rename temporary for service status |
+| `trust_root/publication-root.record` | durable device, inode, lexical path, and host binding of this trust root |
+| `trust_root/status-authorizations` | directory of immutable per-operation status authorizations; not scanned for authority |
+| `trust_root/status-authorizations/<status-operation-id>.record` | immutable authorization of one status operation |
+| `trust_root/import-destination.record` | destination import identity; not a byte of the source successor |
+| `trust_root/export-authorizations` | directory of immutable export authorizations; not scanned for authority |
+| `trust_root/export-authorizations/<export-operation-id>.record` | export authorization record |
+| `trust_root/export-authorizations/<export-operation-id>.signature.bin` | export authorization raw signature |
+| `trust_root/export-authorizations/<export-operation-id>.signature.index` | export authorization signature index |
+| `trust_root/export-authorizations/<export-operation-id>.verification.record` | export authorization verification record |
 | `trust_root/genesis/transition.record` | genesis transition |
 | `trust_root/genesis/signature.bin` | genesis raw signature |
 | `trust_root/genesis/signature.index` | genesis signature index |
@@ -120,13 +129,13 @@ The trust loader and the importer may open only these trust-root paths. Ordinary
 | `trust_root/lineage-origin.verification.partial` | rename temporary for the lineage-origin verification record only |
 | `trust_root/import-staging/<migration-id>/<trust-relative-path>` | import write-phase temporary whose suffix is one final trust path in this table other than the bootstrap key and other than the eight lineage-origin paths |
 
-`<transition-id>`, `<migration-id>`, `<abort-id>`, `<receipt-id>`, and `<nonce-id>` are `project-id` values. `current.partial`, `service_status.partial`, `migration_high_water.partial`, and `import-staging/` files are not trust authority. While answering a request, `load_admission` opens the four lineage-origin finals and then applies section 11. Branch A and Branch C open no migration-bundle file. Branch B opens `import.transaction` and then exactly `migrations/<migration-id>/payload.record` and `migrations/<migration-id>/package.record`. It does not open the four lineage partials, `import-staging/`, `files.record`, `signature.bin`, `signature.index`, `verification.record`, the four bundle-copy lineage files, abort records, receipt records, or any other migration-bundle file. An open failure is not absence. A name that is not in this table, including a case-folded lineage name, is not opened and is not authority. Sections 11, 13, 14, and 41 open only paths from this table.
+`<transition-id>`, `<migration-id>`, `<abort-id>`, `<receipt-id>`, `<nonce-id>`, `<status-operation-id>`, and `<export-operation-id>` are `project-id` values. `current.partial`, `service_status.partial`, `migration_high_water.partial`, and `import-staging/` files are not trust authority. While answering a request, `load_admission` opens the four lineage-origin finals and then applies section 11. Branch A and Branch C open no migration-bundle file. Branch B opens `import.transaction` and then exactly `migrations/<migration-id>/payload.record` and `migrations/<migration-id>/package.record`. It does not open the four lineage partials, `import-staging/`, `files.record`, `signature.bin`, `signature.index`, `verification.record`, the four bundle-copy lineage files, abort records, receipt records, or any other migration-bundle file. An open failure is not absence. A name that is not in this table, including a case-folded lineage name, is not opened and is not authority. Sections 11, 13, 14, and 41 open only paths from this table.
 
 Admission opens use only the path grammars later sections name. During the section 41 write phase, and not before it, import may also create `admission_root/import-staging/<migration-id>/<admission-relative-path>` where the suffix is one admission path named by the authenticated closure. That staging tree is not authority. `load_admission` does not open it. Import does not create evidence files.
 
 ## 4. Operational trust-service records
 
-`service_status` keys: `schema_version`, `record_kind`, `status`, `record_sha256`. Path: `trust_root/service_status`. Cardinality is one. `status` is `empty`, `active`, `export_frozen`, or `retired`. Producer is 9-C36. Consumer is the loader and section 41. Signature is `none`. It is local operational state, not production admission authority, and it is not part of a trust-file digest. A missing file or an unknown status rejects the load.
+`service_status` keys: `schema_version`, `record_kind`, `status`, `record_sha256`. Path: `trust_root/service_status`. Cardinality is one. `status` is `empty`, `active`, `export_frozen`, or `retired`. Producer is 9-C36 for the initial empty record and for native active status. Producer is 9-C34 for imported active status, for export freeze, and for retirement. Consumer is the loader and section 41. Signature is `none`. It is local operational state, not production admission authority, and it is not part of a trust-file digest. A missing file or an unknown status rejects the load.
 
 `migration_high_water` keys: `schema_version`, `record_kind`, `high_water`, `record_sha256`. Path: `trust_root/migration_high_water`. Cardinality is one. `high_water` is a `uint64`. Producer and consumer are 9-C34. Signature is `none`. It is local operational state. An empty service uses `high_water=0`.
 
@@ -219,11 +228,21 @@ The matrix has one row for every `_sha256` field in this contract. `record_sha25
 | `bootstrap_key_sha256` | `trust_state`, `trust_transition` | 32 service-held key bytes | raw | those 32 bytes | `bootstrap_key_size` | `bootstrap_key_handle` | no |
 | `telemetry_governance_file_sha256` | `trust_state`, `operator_configuration`, `migration_payload` | governance file | full | complete file | `telemetry_governance_file_size` | `telemetry_governance_id` | yes with `none` and mode `disabled` |
 | `predecessor_file_sha256` | `trust_state` | previous trust file | full | complete file | `predecessor_file_size` | previous trust id | yes at generation 1 |
+| `binding_record_sha256` | `trust_state`, `trust_transition`, `status_authorization` | binding record named by `binding_record_kind` | full | finished binding record, including its self-checksum line and final LF; not a filesystem path | `binding_record_size` | `trust_id`, `transition_id`, or `status_operation_id` for the containing record | no |
+| `portable_plan_sha256` | `status_authorization`, `import_destination_binding`, `export_authorization` | portable publication plan | full | finished portable plan record, including its self-checksum line and final LF; not a filesystem path | `portable_plan_size` | `status_operation_id`, `migration_id`, or `export_operation_id` | no |
+| `writer_bound_sha256` | `status_authorization` | writer-bound identity | full | finished writer-bound record, including its self-checksum line and final LF; not a filesystem path | `writer_bound_size` | `status_operation_id` | no |
+| `publication_authorization_file_sha256` | `transition_operation_binding`, `status_operation_binding` | publication authorization file | full | complete authorization file | `publication_authorization_file_size` | `publication_authorization_id` | yes with `none` only for `native_initialization` on a transition binding and for `native_initialization` or `imported_initialization` on a status binding; no for every other kind |
+| `publication_authorization_preimage_sha256` | `transition_operation_binding`, `status_operation_binding` | signed authorization preimage | full | exact bytes presented to Ed25519 | `publication_authorization_file_size` | `publication_authorization_id` | yes with `none` on the same kinds as `publication_authorization_file_sha256`; no otherwise |
+| `signer_publication_key_sha256` | `transition_operation_binding`, `status_operation_binding`, `export_authorization` | 32 raw key bytes, or absence | raw | those 32 bytes when the size is 32; no bytes when the size is 0 | `signer_publication_key_size` | `signer_key_id` | yes with `none` and size 0 only for native and imported status bindings; no when the size is 32 |
+| `source_binding_record_sha256` | `import_destination_binding`, `portable_publication_plan` | source transition-operation-binding record | full | finished source binding record | `source_binding_record_size` | source trust id | no on `import_destination_binding`; exact zero on a portable plan whose kind is not `imported_initialization` |
+| `source_successor_file_sha256` | `import_destination_binding` | source successor file | full | complete copied successor | `source_successor_file_size` | `source_successor_trust_id` | no |
+| `source_transition_file_sha256` | `import_destination_binding` | source transition file | full | complete source transition | `source_transition_file_size` | `source_transition_id` | no |
+| `source_current_file_sha256` | `status_operation_binding`, `export_authorization` | current trust file | full | complete `current` | `source_current_file_size` | `source_current_id` | no |
+| `requested_status_prefix_sha256` | `status_operation_binding` | new service_status prefix | self | bytes before the new `record_sha256` line | `requested_status_prefix_size` | `status_operation_id` | no |
 | `admission_root_manifest_file_sha256` | `trust_state`, `migration_payload` | admission-root manifest | full | complete manifest | `admission_root_manifest_file_size` | `admission_manifest_id` | no |
 | `successor_trust_file_sha256` | `trust_transition` | successor trust file | full | complete file | `successor_trust_file_size` | `successor_trust_id` | no |
 | `predecessor_transition_file_sha256` | `trust_transition` | predecessor transition file | full | complete predecessor transition | `predecessor_transition_file_size` | predecessor transition id | yes when predecessor id is `none` |
 | `predecessor_successor_trust_file_sha256` | `trust_transition` | predecessor successor trust state | full | complete predecessor trust state | `predecessor_successor_trust_file_size` | predecessor successor trust id | yes when predecessor id is `none` |
-| `terminal_transition_file_sha256` | `trust_state` | terminal transition file | full | complete terminal transition | `terminal_transition_file_size` | `terminal_transition_id` | no |
 | `key_index_sha256` | `signature_verification`, authority entry line | key index file | full | complete index file | `key_index_size` | `key_index_id` | yes for `bootstrap_handle` |
 | `pin_file_sha256` | `operator_configuration` | release pin | full | complete pin | `pin_file_size` | `pin_id` | yes with `none` and `no_model` |
 | `activation_decision_file_sha256` | `operator_configuration` | activation decision | full | complete decision | `activation_decision_file_size` | activation decision id | yes with `none` and `activation_mode=inactive` |
@@ -282,12 +301,12 @@ The matrix has one row for every `_sha256` field in this contract. `record_sha25
 | `payload_list_file_sha256` | `evidence_manifest` | payload list | full | complete list | `payload_list_file_size` | list id | no |
 | `digest_sha256` | `payload_list` | object named by the line path | raw | that file's raw bytes | line `byte_size` | line object id | no |
 | `migration_entry_file_sha256` | `migration_file_list` | listed migration file | full or raw | exact listed bytes | line `byte_size` | line relative path | no |
-| `payload_file_sha256` | `migration_package`, `import_transaction` | migration payload | full | complete `payload.record` | `payload_file_size` | payload id | no |
+| `payload_file_sha256` | `migration_package`, `import_transaction`, `import_destination_binding` | migration payload | full | complete `payload.record` | `payload_file_size` | payload id | no |
 | `payload_signature_index_file_sha256` | `migration_package` | migration signature index | full | complete `signature.index` | `payload_signature_index_file_size` | signature index path | no |
 | `accepted_run_manifest_file_sha256` | `quarantine_metadata` | run manifest | full | complete manifest | `accepted_run_manifest_file_size` | run id | yes with path `none` |
 | `log_raw_sha256` | `run_manifest` | telemetry log | raw | exact log bytes | `log_size` | log blob id | yes when no log exists |
 | `trust_file_sha256` | `migration_payload`, `import_receipt`, `import_transaction` | trust file that becomes `current` | full | complete trust file | `trust_file_size` | trust id | no |
-| `migration_package_file_sha256` | `migration_abort`, `import_receipt`, `import_transaction` | migration package wrapper | full | complete `package.record` | `migration_package_file_size` | migration id | no |
+| `migration_package_file_sha256` | `migration_abort`, `import_receipt`, `import_transaction`, `export_authorization` | migration package wrapper | full | complete `package.record` | `migration_package_file_size` | migration id | no |
 | `prior_status_file_sha256` | `import_transaction` | pre-import `service_status` | full | those exact bytes | `prior_status_file_size` | none | no |
 | `prior_high_water_file_sha256` | `import_transaction` | pre-import `migration_high_water` | full | those exact bytes | `prior_high_water_file_size` | none | no |
 | `lineage_root_trust_file_sha256` | `lineage_origin` | generation-1 trust state | full | that trust file | `lineage_root_trust_file_size` | `root_trust_id` | no |
@@ -344,7 +363,7 @@ Current revocation: a key with `revoked=yes` in the current authenticated regist
 
 `publisher_key` is not a registry role. Class A and Class B checksum signatures are verified with the 32-byte publisher key named by the authentication record only after a `source_binding` note, signed by a registry-checked `provenance_reviewer`, covers that authentication file through the binding record's `authentication_file_size` and `authentication_file_sha256`. The publisher key has no registry validity interval. `genesis-v1` and the native lineage-origin record are the signatures that use the local bootstrap key directly. The first authority registry also uses that key under the rule below. An imported lineage-origin record does not use the bootstrap key.
 
-Signed targets are exactly 22 families. Nineteen use storage class `evidence_signature`. One uses storage class `trust_transition_signature`. One uses storage class `migration_bundle_signature`. One uses storage class `lineage_origin_signature`. Trust-state content is not a signed family. A trust state is authenticated only as the successor bytes named by an already verified transition. The migration package wrapper is not a signed family.
+Signed targets are exactly 23 families. Nineteen use storage class `evidence_signature`. One uses storage class `trust_transition_signature`. One uses storage class `migration_bundle_signature`. One uses storage class `lineage_origin_signature`. One uses storage class `trust_status_signature`. Trust-state content is not a signed family. A trust state is authenticated only as the successor bytes named by an already verified transition. The migration package wrapper is not a signed family.
 
 | Family | Storage | Target id | Signature id | Blob id | Index id | Required role | Context date |
 |---|---|---|---|---|---|---|---|
@@ -370,10 +389,11 @@ Signed targets are exactly 22 families. Nineteen use storage class `evidence_sig
 | Migration payload | migration bundle | `payload-<migration-id>` | `migration-signature-<migration-id>` | fixed `signature.bin` | fixed `signature.index` | `trust_admin` | terminal `effective_date` at export, rechecked at import against the imported terminal `effective_date` |
 | Trust transition | trust | the transition record | `transition-signature-<transition-id>` | fixed `signature.bin` | fixed `signature.index` | bootstrap for `genesis-v1`, otherwise `trust_admin` | genesis has no registry interval; later transitions use signed `transition_date` |
 | Lineage origin | trust lineage | fixed `destination-lineage-v1` | `lineage-origin-signature` | fixed `lineage-origin.signature.bin` | fixed `lineage-origin.signature.index` | bootstrap for `native`; `trust_admin` for `imported` | native uses the genesis `transition_date`; imported uses the imported terminal `effective_date` |
+| Export authorization | trust status | `export-authorization-<export-operation-id>` | `export-authorization-signature-<export-operation-id>` | `<export-operation-id>.signature.bin` | `<export-operation-id>.signature.index` | `trust_admin` | source terminal `effective_date` |
 
 The first authority registry uses the fixed bootstrap key that verified `genesis-v1`. Its context date is the genesis `transition_date`, and that date is metadata only. Registry `valid_from`, `valid_until`, and `revoked` do not apply to the bootstrap key. A later authority registry is installed only by a later trust transition. The installer verifies that new transition's Ed25519 signature first, trusts `transition_date` only after that verification, and uses that new `transition_date` as the registry-signature verification context. The registry signer is an unrevoked `authority_admin` from the authenticated predecessor registry. The check requires `valid_from <= new transition_date <= valid_until`. The new `transition_date` is not earlier than the predecessor transition's `transition_date`. The predecessor transition's date is not the installing verification date.
 
-Evidence-signature family count is 19. Trust-transition signature family count is 1. Migration-bundle signature family count is 1. Lineage-origin signature family count is 1. Total signed-target family count is 22. The raw signature is 64 bytes. `signature_size` equals `raw_size` equals 64. `signature_sha256` equals the index `raw_sha256`. Omission, duplication, or reuse of one id on two paths fails.
+Evidence-signature family count is 19. Trust-transition signature family count is 1. Migration-bundle signature family count is 1. Lineage-origin signature family count is 1. Trust-status signature family count is 1. Total signed-target family count is 23. The raw signature is 64 bytes. `signature_size` equals `raw_size` equals 64. `signature_sha256` equals the index `raw_sha256`. Omission, duplication, or reuse of one id on two paths fails.
 
 ## 10. Signature storage
 
@@ -381,7 +401,7 @@ Evidence storage, and only evidence storage, uses `benchmarks/generative_phase9c
 
 Trust-transition storage is not in those directories. Genesis files are only `trust_root/genesis/transition.record`, `genesis/signature.bin`, `genesis/signature.index`, and `genesis/verification.record`. Later files are only `trust_root/transitions/<transition-id>/transition.record`, `signature.bin`, `signature.index`, and `verification.record`. The genesis transition id is the fixed project-id `genesis-v1`.
 
-Lineage-origin storage is not in the evidence directories and not in a transition directory. Its only finals are `trust_root/lineage-origin.record`, `trust_root/lineage-origin.signature.bin`, `trust_root/lineage-origin.signature.index`, and `trust_root/lineage-origin.verification.record`. Its only partials are `trust_root/lineage-origin.record.partial`, `trust_root/lineage-origin.signature.partial`, `trust_root/lineage-origin.index.partial`, and `trust_root/lineage-origin.verification.partial`. There is no second name, no history directory, and no caller-chosen path segment. The Ed25519 preimage is the exact `lineage-origin.record` bytes, including `record_sha256`. The signature, index, and verification record are outside that preimage. The index is a `blob_index` with `blob_class=signature_bytes`, `raw_size=64`, and `storage_path=lineage-origin.signature.bin`. The verification record is a `signature_verification` with `signed_object_kind=structured_file`, `signed_object_id=destination-lineage-v1`, `signed_object_path=none`, `signature_id=lineage-origin-signature`, and `verification_result=verified`. Native verification uses `signer_key_source=bootstrap_handle` and the genesis `transition_date`, which is metadata only and is not a registry interval. Imported verification uses `signer_key_source=blob` and the `trust_admin` key that already verified the migration payload. That key is selected from the payload verification record, not from the lineage-origin record. The signature is checked against that key as it was authorized at `effective_date`. A later revocation does not rewrite the family, does not change `origin_kind`, and does not by itself move the destination to the other lineage. Model-admission signatures still follow the current-revocation rule. Publication writes each partial, `fsync`s that partial, renames it onto an absent final with `O_NOFOLLOW`, and `fsync`s the trust root before the next file. The order is record, signature, index, verification. All four files are mode `0444`. A load does not create or rename them. Withdrawal, rollback, export, retirement, staging cleanup, and a later trust transition do not open them for writing.
+Lineage-origin storage is not in the evidence directories and not in a transition directory. Its only finals are `trust_root/lineage-origin.record`, `trust_root/lineage-origin.signature.bin`, `trust_root/lineage-origin.signature.index`, and `trust_root/lineage-origin.verification.record`. Its only partials are `trust_root/lineage-origin.record.partial`, `trust_root/lineage-origin.signature.partial`, `trust_root/lineage-origin.index.partial`, and `trust_root/lineage-origin.verification.partial`. There is no second name, no history directory, and no caller-chosen path segment. The Ed25519 preimage is the exact `lineage-origin.record` bytes, including `record_sha256`. The signature, index, and verification record are outside that preimage. The index is a `blob_index` with `blob_class=signature_bytes`, `raw_size=64`, and `storage_path=lineage-origin.signature.bin`. The verification record is a `signature_verification` with `signed_object_kind=structured_file`, `signed_object_id=destination-lineage-v1`, `signed_object_path=none`, `signature_id=lineage-origin-signature`, and `verification_result=verified`. Native verification uses `signer_key_source=bootstrap_handle` and the genesis `transition_date`, which is metadata only and is not a registry interval. Imported verification uses `signer_key_source=blob` and the `trust_admin` key that already verified the migration payload. That key is selected from the payload verification record, not from the lineage-origin record. The signature is checked against that key as it was authorized at `effective_date`. A later revocation does not rewrite the family, does not change `origin_kind`, and does not by itself move the destination to the other lineage. Model-admission signatures still follow the current-revocation rule. Publication writes each partial, `fsync`s that partial, renames it onto an absent final with `O_NOFOLLOW`, and `fsync`s the trust root before the next file. The order is record, signature, index, verification. All four files are mode `0444`. A load does not create or rename them. Withdrawal, rollback, export, retirement, staging cleanup, and a later trust transition do not open them for writing. Export-authorization storage is the four paths in section 3 under `trust_root/export-authorizations/`. Status-authorization storage is `trust_root/status-authorizations/<status-operation-id>.record`. Neither storage is an evidence directory. The 19 evidence grammars are unchanged. Export files and status-authorization files are mode `0444`, regular, link count 1, and are not symlinks.
 
 Migration-bundle storage is not in the evidence directories and not in the transition directories. Its only files are the ten paths in section 39.
 
@@ -443,7 +463,7 @@ The origin branch stays bound to the descriptors opened for the lineage family. 
 
 For every load that is not the empty-destination exception, the three branches are exhaustive and mutually exclusive. The loader selects one before admission and does not evaluate `native_service_loadable` and imported `service_loadable` for the same load. A native chain and an imported chain are not spliced. Branch A accepts a walk only when it contains the native origin's root tuple. Branch B accepts a walk only when it contains the imported origin's imported tuple. Deleting `import.transaction` does not select Branch A while an imported origin remains. Deleting the origin family does not select Branch A.
 
-Native initialization belongs to phase 9-C36 and is not a model load and not `import_migration`. The operation is `initialize_native_generation(trust_root, admission_root, evidence_root, native_bootstrap_signer)`, declared in `include/inferedge/trust_service.hpp`. `native_bootstrap_signer` is an opaque signing capability supplied by the caller. It exposes no private-key bytes and no private-key path. Its only signing operation accepts the exact message bytes and returns exactly 64 bytes or a failure. Those 64 bytes are an Ed25519 signature by the private key that corresponds to the 32-byte public key at `trust_root/key/bootstrap-key-v1`. The message is the exact canonical `lineage-origin.record` bytes, including `record_sha256`. No domain-separation prefix is added, matching section 9. The capability is not an on-disk trust root. After the origin family is durable, a load or a later transition does not call it. Loss of the handle does not invalidate a stored family.
+Native initialization belongs to phase 9-C36 and is not a model load and not `import_migration`. The operation is `publish_native_initialization`, declared in `include/inferedge/trust_service.hpp` and defined in `src/trust_service.cpp`. `native_bootstrap_signer` is an opaque signing capability supplied by the caller. It exposes no private-key bytes and no private-key path. Its only signing operation accepts the exact message bytes and returns exactly 64 bytes or a failure. Those 64 bytes are an Ed25519 signature by the private key that corresponds to the 32-byte public key at `trust_root/key/bootstrap-key-v1`. The two messages are the exact canonical genesis `transition.record` bytes and the exact canonical `lineage-origin.record` bytes, each including its `record_sha256`. No domain-separation prefix is added, matching section 9. The capability is not an on-disk trust root. After the origin family is durable, a load or a later transition does not call it. Loss of the handle does not invalidate a stored family.
 
 A first start requires exact `empty` status, absent `current`, absent `import.transaction`, absent nonce, `migration_high_water` absent or the exact `high_water=0` record, all four lineage finals absent, all four lineage partials absent, a valid section 11 bootstrap and generation-1 trust state, and a usable signer. It constructs the native record, checks `record_sha256`, passes those exact bytes to the signer, and verifies the 64 returned bytes with `bootstrap-key-v1`. It then builds the index and verification record and reverifies the four objects in memory. Only then does it publish. If the handle is missing, the public verification fails, the length is not 64, or the signer fails, the result is `lineage_signer_unavailable` and no file is created. The genesis signature is not reused. The 32-byte public key is not used as a signing seed. No local key is invented.
 
@@ -505,7 +525,7 @@ An immutable signed transition does not name a future successor. No transition f
 
 ## 12. Immutable trust transitions
 
-`trust_transition` keys: `schema_version`, `record_kind`, `transition_id`, `trust_generation`, `transition_date`, `predecessor_transition_id`, `predecessor_transition_path`, `predecessor_transition_file_size`, `predecessor_transition_file_sha256`, `predecessor_successor_trust_id`, `predecessor_successor_trust_file_size`, `predecessor_successor_trust_file_sha256`, `successor_trust_id`, `successor_trust_path`, `successor_trust_file_size`, `successor_trust_file_sha256`, `bootstrap_key_sha256`, `signer_key_id`, `registry_id`, `authority_registry_file_size`, `authority_registry_file_sha256`, `signature_id`, `signature_blob_id`, `signature_index_id`, `signature_file_size`, `signature_file_sha256`, `record_sha256`.
+`trust_transition` keys: `schema_version`, `record_kind`, `transition_id`, `trust_generation`, `transition_date`, `predecessor_transition_id`, `predecessor_transition_path`, `predecessor_transition_file_size`, `predecessor_transition_file_sha256`, `predecessor_successor_trust_id`, `predecessor_successor_trust_file_size`, `predecessor_successor_trust_file_sha256`, `successor_trust_id`, `successor_trust_path`, `successor_trust_file_size`, `successor_trust_file_sha256`, `bootstrap_key_sha256`, `signer_key_id`, `registry_id`, `authority_registry_file_size`, `authority_registry_file_sha256`, `signature_id`, `signature_blob_id`, `signature_index_id`, `signature_file_size`, `signature_file_sha256`, `publication_kind`, `binding_record_kind`, `binding_record_size`, `binding_record_sha256`, `record_sha256`.
 
 A generation greater than 1 requires `trust_generation` equal to the predecessor generation plus 1. `transition_date` is greater than or equal to the predecessor transition's `transition_date`. The predecessor path, size, and digest must equal the preceding transition file. The predecessor successor id, size, and digest must equal the trust state that preceding transition published. The signer role is `trust_admin` in that predecessor successor's registry, the entry is unrevoked, and the signed `transition_date` is inside that entry's interval. The new successor bytes must match the signed path, size, and digest. That successor's `effective_date` equals this `transition_date`, and it names this transition as its terminal transition. Historical transition bytes are not rewritten.
 
@@ -530,23 +550,1154 @@ Untrusted locators grant no authority. The loader does not scan `trust_root` and
 
 ## 14. Trust publication
 
-`trust_state` keys: `schema_version`, `record_kind`, `trust_id`, `trust_generation`, `effective_date`, `terminal_transition_id`, `terminal_transition_path`, `terminal_transition_file_size`, `terminal_transition_file_sha256`, `revocation_generation`, `revocation_id`, `revocation_file_size`, `revocation_file_sha256`, `config_id`, `configuration_file_size`, `configuration_file_sha256`, `registry_id`, `authority_registry_file_size`, `authority_registry_file_sha256`, `authority_envelope_id`, `authority_envelope_file_size`, `authority_envelope_file_sha256`, `bootstrap_key_handle`, `bootstrap_key_size`, `bootstrap_key_sha256`, `admission_manifest_id`, `admission_root_manifest_file_size`, `admission_root_manifest_file_sha256`, `host_id`, `telemetry_mode`, `telemetry_governance_id`, `telemetry_governance_file_size`, `telemetry_governance_file_sha256`, `predecessor_trust_id`, `predecessor_file_size`, `predecessor_file_sha256`, `record_sha256`.
+`trust_state` keys, in this order: `schema_version`, `record_kind`, `trust_id`, `trust_generation`, `effective_date`, `terminal_transition_id`, `terminal_transition_path`, `revocation_generation`, `revocation_id`, `revocation_file_size`, `revocation_file_sha256`, `config_id`, `configuration_file_size`, `configuration_file_sha256`, `registry_id`, `authority_registry_file_size`, `authority_registry_file_sha256`, `authority_envelope_id`, `authority_envelope_file_size`, `authority_envelope_file_sha256`, `bootstrap_key_handle`, `bootstrap_key_size`, `bootstrap_key_sha256`, `admission_manifest_id`, `admission_root_manifest_file_size`, `admission_root_manifest_file_sha256`, `host_id`, `publication_kind`, `publication_authorization_id`, `publication_authorization_path`, `publication_authorization_file_size`, `publication_authorization_file_sha256`, `publication_authorization_preimage_sha256`, `signer_key_id`, `signer_publication_key_size`, `signer_publication_key_sha256`, `signature_family_id`, `lineage_kind`, `binding_record_kind`, `binding_record_size`, `binding_record_sha256`, `telemetry_mode`, `telemetry_governance_id`, `telemetry_governance_file_size`, `telemetry_governance_file_sha256`, `predecessor_trust_id`, `predecessor_file_size`, `predecessor_file_sha256`, `record_sha256`.
 
-`bootstrap_key_size` is 32. Generation 1 uses `predecessor_trust_id=none`, predecessor size 0, and the zero `predecessor_file_sha256`. The successor path is `admission/trust/trust-<trust_id>.record` under `admission_root`. After section 13, `trust_root/current` is byte-for-byte identical to that file. Trust-state bytes are not a signed object. `effective_date` equals the terminal transition's signed `transition_date`.
+`record_kind` is `trust_state`. `schema_version` is `1`. `bootstrap_key_size` is 32. Generation 1 uses predecessor id `none`, predecessor size 0, and the zero predecessor digest. The successor path is `admission/trust/trust-<trust_id>.record` under `admission_root`. After section 13, `trust_root/current` is byte-for-byte identical to that file. Trust-state bytes are not a signed object. `effective_date` equals the terminal transition's signed `transition_date`. `binding_record_kind` is `transition_operation_binding`. `binding_record_sha256` is the full-file SHA-256 of that binding record. A trust state that contains `terminal_transition_file_size` or `terminal_transition_file_sha256` is rejected.
 
-Publication of generation N+1, with N at least 1 and N+1 at most 64:
+A `trust_state` rejects every key in this prohibited list: `terminal_transition_file_size`, `terminal_transition_file_sha256`, `expected_status`, `requested_status`, `export_operation_id`, `receipt_id`, `status_operation_id`, `device`, `inode`, `canonical_path`, `writer_bound_sha256`, `root_device`, `root_inode`, `canonical_root_path`, `destination_nonce_id`, `package_id`. Publication kinds `imported_initialization`, `export_freeze`, and `retirement` are prohibited as `trust_state.publication_kind`.
 
-1. Complete section 13. The authenticated terminal transition and its successor stay immutable.
-2. Create a new transition whose predecessor fields name that transition file and that successor trust state, and whose `transition_date` is not earlier than the predecessor `transition_date`.
-3. Sign it with an unrevoked `trust_admin` key authorized by that successor's registry. Verify the signature before trusting the new `transition_date`.
-4. Create the new successor. Its `terminal_transition_id` names the new transition. Its `effective_date` equals the new `transition_date`. Its `predecessor_trust_id` names the previous successor.
-5. Write the four new files only under `trust_root/transitions/<new-transition-id>/`. Do not open predecessor files for writing.
-6. Compare-and-swap `current` only while its bytes still equal the old successor digest and the authenticated generation is still N. Write the successor bytes only to `trust_root/current.partial`, `fsync` that file, `fsync` the trust-root directory, and rename `current.partial` onto `current`. The temporary path is the section 3 path and is not authority.
-7. A failed swap deletes only `trust_root/current.partial`, the new transition directory, and the unreferenced new successor. Every predecessor file stays unchanged. A crash before rename keeps the old `current`. Files not named by the authenticated chain are not opened and are not authoritative.
+The transition-operation-binding record is not a file. `record_kind` is `transition_operation_binding`. Its keys, in this order, are: `schema_version`, `record_kind`, `publication_kind`, `publication_authorization_id`, `publication_authorization_path`, `publication_authorization_file_size`, `publication_authorization_file_sha256`, `publication_authorization_preimage_sha256`, `signer_key_id`, `signer_publication_key_size`, `signer_publication_key_sha256`, `signature_family_id`, `trust_id`, `trust_generation`, `effective_date`, `terminal_transition_id`, `terminal_transition_path`, `predecessor_trust_id`, `predecessor_file_size`, `predecessor_file_sha256`, `host_id`, `lineage_kind`, `revocation_generation`, `revocation_id`, `revocation_file_size`, `revocation_file_sha256`, `config_id`, `configuration_file_size`, `configuration_file_sha256`, `registry_id`, `authority_registry_file_size`, `authority_registry_file_sha256`, `authority_envelope_id`, `authority_envelope_file_size`, `authority_envelope_file_sha256`, `bootstrap_key_handle`, `bootstrap_key_size`, `bootstrap_key_sha256`, `admission_manifest_id`, `admission_root_manifest_file_size`, `admission_root_manifest_file_sha256`, `record_sha256`. It excludes `binding_record_sha256`, `binding_record_size`, the successor full-file digest, the transition full-file digest, `portable_plan_size`, `portable_plan_sha256`, `writer_bound_size`, `writer_bound_sha256`, `device`, `inode`, and `canonical_path`. `binding_record_size` is the byte length of the finished binding record. `binding_record_sha256` is SHA-256 of every byte of that finished record, including its self-checksum line and final LF. The successor and the transition serialize this same key list from the same values and therefore the same bytes. The transition stores that digest and does not store a second formula.
 
-Rollback is a new forward transition. It does not rewrite a predecessor, it does not select an older link as `current`, and it does not modify the lineage-origin family.
+Transition-operation-binding field rules:
 
-A destination with `import_completed` true may publish generation N+1, and later N+2, under this section. N is the `trust_generation` of the imported trust state. The new successor does not need to equal the transaction's `trust_file_sha256`. The predecessor must be the authenticated `current`. The transaction is not rewritten, deleted, or consulted as a digest veto. Section 11 then sets `service_loadable` for N+1 or N+2 when status is canonical `active` and the section 13 walk contains the imported trust state. Section 14, not import resume, is the only writer of that new `current`. Import resume must not write `current` after `import_completed`. Withdrawal of a subject, when it changes the terminal trust state, is also one of these forward transitions. A later generation cannot decrease `revocation_generation` or clear a tombstone.
+| Field | withdrawal | ordinary | revocation | rollback | native_initialization | governance_pin | activation |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `publication_kind` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `publication_authorization_id` | required concrete value | required concrete value | required concrete value | required concrete value | exact sentinel | required concrete value | required concrete value |
+| `publication_authorization_path` | required concrete value | required concrete value | required concrete value | required concrete value | exact sentinel | required concrete value | required concrete value |
+| `publication_authorization_file_size` | required concrete value | required concrete value | required concrete value | required concrete value | exact sentinel | required concrete value | required concrete value |
+| `publication_authorization_file_sha256` | required concrete value | required concrete value | required concrete value | required concrete value | exact sentinel | required concrete value | required concrete value |
+| `publication_authorization_preimage_sha256` | required concrete value | required concrete value | required concrete value | required concrete value | exact sentinel | required concrete value | required concrete value |
+| `signer_key_id` | required concrete value | required concrete value | required concrete value | required concrete value | exact sentinel | required concrete value | required concrete value |
+| `signer_publication_key_size` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `signer_publication_key_sha256` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `signature_family_id` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `lineage_kind` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `predecessor_trust_id` | required concrete value | required concrete value | required concrete value | required concrete value | exact sentinel | required concrete value | required concrete value |
+| `predecessor_file_size` | required concrete value | required concrete value | required concrete value | required concrete value | exact sentinel | required concrete value | required concrete value |
+| `predecessor_file_sha256` | required concrete value | required concrete value | required concrete value | required concrete value | exact sentinel | required concrete value | required concrete value |
+| `trust_id` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `effective_date` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `terminal_transition_id` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `terminal_transition_path` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `host_id` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `revocation_generation` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `revocation_id` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `revocation_file_size` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `revocation_file_sha256` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `config_id` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `configuration_file_size` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `configuration_file_sha256` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `registry_id` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `authority_registry_file_size` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `authority_registry_file_sha256` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `authority_envelope_id` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `authority_envelope_file_size` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `authority_envelope_file_sha256` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `bootstrap_key_handle` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `bootstrap_key_size` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `bootstrap_key_sha256` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `admission_manifest_id` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `admission_root_manifest_file_size` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `admission_root_manifest_file_sha256` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `trust_generation` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+
+Constraint for each cell above, in the same field order and the same kind order:
+
+`publication_kind`: `withdrawal` = token `withdrawal`; `ordinary` = token `ordinary`; `revocation` = token `revocation`; `rollback` = token `rollback`; `native_initialization` = token `native_initialization`; `governance_pin` = token `governance_pin`; `activation` = token `activation`.
+`publication_authorization_id`: `withdrawal` = existing signed object bytes; zero digest prohibited; `ordinary` = existing signed object bytes; zero digest prohibited; `revocation` = existing signed object bytes; zero digest prohibited; `rollback` = existing signed object bytes; zero digest prohibited; `native_initialization` = id `none`, path `none`, size `0`, file digest 64 ASCII `0` characters, preimage digest 64 ASCII `0` characters; `governance_pin` = existing signed object bytes; zero digest prohibited; `activation` = existing signed object bytes; zero digest prohibited.
+`publication_authorization_path`: `withdrawal` = existing signed object bytes; zero digest prohibited; `ordinary` = existing signed object bytes; zero digest prohibited; `revocation` = existing signed object bytes; zero digest prohibited; `rollback` = existing signed object bytes; zero digest prohibited; `native_initialization` = id `none`, path `none`, size `0`, file digest 64 ASCII `0` characters, preimage digest 64 ASCII `0` characters; `governance_pin` = existing signed object bytes; zero digest prohibited; `activation` = existing signed object bytes; zero digest prohibited.
+`publication_authorization_file_size`: `withdrawal` = existing signed object bytes; zero digest prohibited; `ordinary` = existing signed object bytes; zero digest prohibited; `revocation` = existing signed object bytes; zero digest prohibited; `rollback` = existing signed object bytes; zero digest prohibited; `native_initialization` = id `none`, path `none`, size `0`, file digest 64 ASCII `0` characters, preimage digest 64 ASCII `0` characters; `governance_pin` = existing signed object bytes; zero digest prohibited; `activation` = existing signed object bytes; zero digest prohibited.
+`publication_authorization_file_sha256`: `withdrawal` = existing signed object bytes; zero digest prohibited; `ordinary` = existing signed object bytes; zero digest prohibited; `revocation` = existing signed object bytes; zero digest prohibited; `rollback` = existing signed object bytes; zero digest prohibited; `native_initialization` = id `none`, path `none`, size `0`, file digest 64 ASCII `0` characters, preimage digest 64 ASCII `0` characters; `governance_pin` = existing signed object bytes; zero digest prohibited; `activation` = existing signed object bytes; zero digest prohibited.
+`publication_authorization_preimage_sha256`: `withdrawal` = existing signed object bytes; zero digest prohibited; `ordinary` = existing signed object bytes; zero digest prohibited; `revocation` = existing signed object bytes; zero digest prohibited; `rollback` = existing signed object bytes; zero digest prohibited; `native_initialization` = id `none`, path `none`, size `0`, file digest 64 ASCII `0` characters, preimage digest 64 ASCII `0` characters; `governance_pin` = existing signed object bytes; zero digest prohibited; `activation` = existing signed object bytes; zero digest prohibited.
+`signer_key_id`: `withdrawal` = one project-id; `none` prohibited; `ordinary` = one project-id; `none` prohibited; `revocation` = one project-id; `none` prohibited; `rollback` = one project-id; `none` prohibited; `native_initialization` = signer_key_id `none`; `governance_pin` = one project-id; `none` prohibited; `activation` = one project-id; `none` prohibited.
+`signer_publication_key_size`: `withdrawal` = integer `32`; `ordinary` = integer `32`; `revocation` = integer `32`; `rollback` = integer `32`; `native_initialization` = integer `32`; `governance_pin` = integer `32`; `activation` = integer `32`.
+`signer_publication_key_sha256`: `withdrawal` = raw SHA-256 of the 32-byte public key; zero digest prohibited; `ordinary` = raw SHA-256 of the 32-byte public key; zero digest prohibited; `revocation` = raw SHA-256 of the 32-byte public key; zero digest prohibited; `rollback` = raw SHA-256 of the 32-byte public key; zero digest prohibited; `native_initialization` = raw SHA-256 of the 32-byte public key; zero digest prohibited; `governance_pin` = raw SHA-256 of the 32-byte public key; zero digest prohibited; `activation` = raw SHA-256 of the 32-byte public key; zero digest prohibited.
+`signature_family_id`: `withdrawal` = token `trust_transition`; `ordinary` = token `trust_transition`; `revocation` = token `trust_transition`; `rollback` = token `trust_transition`; `native_initialization` = token `trust_transition`; `governance_pin` = token `trust_transition`; `activation` = token `trust_transition`.
+`lineage_kind`: `withdrawal` = token equal to the predecessor trust state's `lineage_kind`; `ordinary` = token equal to the predecessor trust state's `lineage_kind`; `revocation` = token equal to the predecessor trust state's `lineage_kind`; `rollback` = token equal to the predecessor trust state's `lineage_kind`; `native_initialization` = token `native`; `governance_pin` = token equal to the predecessor trust state's `lineage_kind`; `activation` = token equal to the predecessor trust state's `lineage_kind`.
+`predecessor_trust_id`: `withdrawal` = the predecessor successor id, size, and full-file digest; `ordinary` = the predecessor successor id, size, and full-file digest; `revocation` = the predecessor successor id, size, and full-file digest; `rollback` = the predecessor successor id, size, and full-file digest; `native_initialization` = predecessor id `none`, size `0`, digest 64 ASCII `0` characters; `governance_pin` = the predecessor successor id, size, and full-file digest; `activation` = the predecessor successor id, size, and full-file digest.
+`predecessor_file_size`: `withdrawal` = the predecessor successor id, size, and full-file digest; `ordinary` = the predecessor successor id, size, and full-file digest; `revocation` = the predecessor successor id, size, and full-file digest; `rollback` = the predecessor successor id, size, and full-file digest; `native_initialization` = predecessor id `none`, size `0`, digest 64 ASCII `0` characters; `governance_pin` = the predecessor successor id, size, and full-file digest; `activation` = the predecessor successor id, size, and full-file digest.
+`predecessor_file_sha256`: `withdrawal` = the predecessor successor id, size, and full-file digest; `ordinary` = the predecessor successor id, size, and full-file digest; `revocation` = the predecessor successor id, size, and full-file digest; `rollback` = the predecessor successor id, size, and full-file digest; `native_initialization` = predecessor id `none`, size `0`, digest 64 ASCII `0` characters; `governance_pin` = the predecessor successor id, size, and full-file digest; `activation` = the predecessor successor id, size, and full-file digest.
+`trust_id`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`effective_date`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`terminal_transition_id`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`terminal_transition_path`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`host_id`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`revocation_generation`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`revocation_id`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`revocation_file_size`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`revocation_file_sha256`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`config_id`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`configuration_file_size`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`configuration_file_sha256`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`registry_id`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`authority_registry_file_size`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`authority_registry_file_sha256`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`authority_envelope_id`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`authority_envelope_file_size`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`authority_envelope_file_sha256`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`bootstrap_key_handle`: `withdrawal` = token `bootstrap-key-v1`; `ordinary` = token `bootstrap-key-v1`; `revocation` = token `bootstrap-key-v1`; `rollback` = token `bootstrap-key-v1`; `native_initialization` = token `bootstrap-key-v1`; `governance_pin` = token `bootstrap-key-v1`; `activation` = token `bootstrap-key-v1`.
+`bootstrap_key_size`: `withdrawal` = integer `32`; `ordinary` = integer `32`; `revocation` = integer `32`; `rollback` = integer `32`; `native_initialization` = integer `32`; `governance_pin` = integer `32`; `activation` = integer `32`.
+`bootstrap_key_sha256`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`admission_manifest_id`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`admission_root_manifest_file_size`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`admission_root_manifest_file_sha256`: `withdrawal` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `ordinary` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `revocation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `rollback` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `native_initialization` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `governance_pin` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited; `activation` = the generation-1 or successor value required by sections 11 and 15; zero digest prohibited.
+`trust_generation`: `withdrawal` = predecessor generation plus 1; `ordinary` = predecessor generation plus 1; `revocation` = predecessor generation plus 1; `rollback` = predecessor generation plus 1; `native_initialization` = integer `1`; `governance_pin` = predecessor generation plus 1; `activation` = predecessor generation plus 1.
+
+Every `trust_state` field that is also a binding key uses the same cell. `telemetry_mode`, `telemetry_governance_id`, `telemetry_governance_file_size`, and `telemetry_governance_file_sha256` are trust-state keys and are not binding keys. Their values remain the sentences in this section that begin `Before phase 9-C39` and `A transition to disabled telemetry`, and the section 46 rollback sentence. Tombstones, pin identity, runtime mode, and admission mode are not binding keys. Section 33, section 34, and section 46 govern them.
+
+The status-operation-binding record is not a file. `record_kind` is `status_operation_binding`. Its keys, in this order, are: `schema_version`, `record_kind`, `status_operation_id`, `publication_kind`, `expected_status`, `requested_status`, `expected_status_file_size`, `expected_status_file_sha256`, `requested_status_prefix_size`, `requested_status_prefix_sha256`, `source_current_id`, `source_current_file_size`, `source_current_file_sha256`, `publication_authorization_id`, `publication_authorization_path`, `publication_authorization_file_size`, `publication_authorization_file_sha256`, `publication_authorization_preimage_sha256`, `signer_key_id`, `signer_publication_key_size`, `signer_publication_key_sha256`, `signature_family_id`, `host_id`, `portable_plan_sha256`, `record_sha256`. It excludes `device`, `inode`, `canonical_path`, `writer_bound_sha256`, successor bytes, and transition full-file digests. Kinds `withdrawal`, `ordinary`, `revocation`, `rollback`, `governance_pin`, and `activation` are prohibited from serializing this record.
+
+Status-operation-binding field rules:
+
+| Field | native_initialization | imported_initialization | export_freeze | retirement |
+| --- | --- | --- | --- | --- |
+| `publication_kind` | required concrete value | required concrete value | required concrete value | required concrete value |
+| `expected_status` | required concrete value | required concrete value | required concrete value | required concrete value |
+| `requested_status` | required concrete value | required concrete value | required concrete value | required concrete value |
+| `publication_authorization_id` | exact sentinel | exact sentinel | required concrete value | required concrete value |
+| `publication_authorization_path` | exact sentinel | exact sentinel | required concrete value | required concrete value |
+| `publication_authorization_file_size` | exact sentinel | exact sentinel | required concrete value | required concrete value |
+| `publication_authorization_file_sha256` | exact sentinel | exact sentinel | required concrete value | required concrete value |
+| `publication_authorization_preimage_sha256` | exact sentinel | exact sentinel | required concrete value | required concrete value |
+| `signer_key_id` | exact sentinel | exact sentinel | required concrete value | required concrete value |
+| `signer_publication_key_size` | exact sentinel | exact sentinel | required concrete value | required concrete value |
+| `signer_publication_key_sha256` | exact sentinel | exact sentinel | required concrete value | required concrete value |
+| `signature_family_id` | exact sentinel | exact sentinel | required concrete value | required concrete value |
+| `status_operation_id` | required concrete value | required concrete value | required concrete value | required concrete value |
+| `source_current_id` | required concrete value | required concrete value | required concrete value | required concrete value |
+| `source_current_file_size` | required concrete value | required concrete value | required concrete value | required concrete value |
+| `source_current_file_sha256` | required concrete value | required concrete value | required concrete value | required concrete value |
+| `expected_status_file_size` | required concrete value | required concrete value | required concrete value | required concrete value |
+| `expected_status_file_sha256` | required concrete value | required concrete value | required concrete value | required concrete value |
+| `requested_status_prefix_size` | required concrete value | required concrete value | required concrete value | required concrete value |
+| `requested_status_prefix_sha256` | required concrete value | required concrete value | required concrete value | required concrete value |
+| `host_id` | required concrete value | required concrete value | required concrete value | required concrete value |
+| `portable_plan_sha256` | required concrete value | required concrete value | required concrete value | required concrete value |
+
+Constraint for each cell above, in the same field order and the same kind order:
+
+`publication_kind`: `native_initialization` = token `native_initialization`; `imported_initialization` = token `imported_initialization`; `export_freeze` = token `export_freeze`; `retirement` = token `retirement`.
+`expected_status`: `native_initialization` = token `empty`; `imported_initialization` = token `empty`; `export_freeze` = token `active`; `retirement` = token `export_frozen`.
+`requested_status`: `native_initialization` = token `active`; `imported_initialization` = token `active`; `export_freeze` = token `export_frozen`; `retirement` = token `retired`.
+`publication_authorization_id`: `native_initialization` = id `none`, path `none`, size `0`, file digest 64 ASCII `0` characters, preimage digest 64 ASCII `0` characters; `imported_initialization` = id `none`, path `none`, size `0`, file digest 64 ASCII `0` characters, preimage digest 64 ASCII `0` characters; `export_freeze` = the export authorization record; zero digest prohibited; `retirement` = the destination receipt record; zero digest prohibited.
+`publication_authorization_path`: `native_initialization` = id `none`, path `none`, size `0`, file digest 64 ASCII `0` characters, preimage digest 64 ASCII `0` characters; `imported_initialization` = id `none`, path `none`, size `0`, file digest 64 ASCII `0` characters, preimage digest 64 ASCII `0` characters; `export_freeze` = the export authorization record; zero digest prohibited; `retirement` = the destination receipt record; zero digest prohibited.
+`publication_authorization_file_size`: `native_initialization` = id `none`, path `none`, size `0`, file digest 64 ASCII `0` characters, preimage digest 64 ASCII `0` characters; `imported_initialization` = id `none`, path `none`, size `0`, file digest 64 ASCII `0` characters, preimage digest 64 ASCII `0` characters; `export_freeze` = the export authorization record; zero digest prohibited; `retirement` = the destination receipt record; zero digest prohibited.
+`publication_authorization_file_sha256`: `native_initialization` = id `none`, path `none`, size `0`, file digest 64 ASCII `0` characters, preimage digest 64 ASCII `0` characters; `imported_initialization` = id `none`, path `none`, size `0`, file digest 64 ASCII `0` characters, preimage digest 64 ASCII `0` characters; `export_freeze` = the export authorization record; zero digest prohibited; `retirement` = the destination receipt record; zero digest prohibited.
+`publication_authorization_preimage_sha256`: `native_initialization` = id `none`, path `none`, size `0`, file digest 64 ASCII `0` characters, preimage digest 64 ASCII `0` characters; `imported_initialization` = id `none`, path `none`, size `0`, file digest 64 ASCII `0` characters, preimage digest 64 ASCII `0` characters; `export_freeze` = the export authorization record; zero digest prohibited; `retirement` = the destination receipt record; zero digest prohibited.
+`signer_key_id`: `native_initialization` = signer_key_id `none`, key size `0`, key digest 64 ASCII `0` characters, signature_family_id `none`; `imported_initialization` = signer_key_id `none`, key size `0`, key digest 64 ASCII `0` characters, signature_family_id `none`; `export_freeze` = trust_admin project-id, key size `32`, concrete key digest, signature_family_id `export_authorization`; `retirement` = trust_admin project-id, key size `32`, concrete key digest, signature_family_id `import_receipt`.
+`signer_publication_key_size`: `native_initialization` = signer_key_id `none`, key size `0`, key digest 64 ASCII `0` characters, signature_family_id `none`; `imported_initialization` = signer_key_id `none`, key size `0`, key digest 64 ASCII `0` characters, signature_family_id `none`; `export_freeze` = trust_admin project-id, key size `32`, concrete key digest, signature_family_id `export_authorization`; `retirement` = trust_admin project-id, key size `32`, concrete key digest, signature_family_id `import_receipt`.
+`signer_publication_key_sha256`: `native_initialization` = signer_key_id `none`, key size `0`, key digest 64 ASCII `0` characters, signature_family_id `none`; `imported_initialization` = signer_key_id `none`, key size `0`, key digest 64 ASCII `0` characters, signature_family_id `none`; `export_freeze` = trust_admin project-id, key size `32`, concrete key digest, signature_family_id `export_authorization`; `retirement` = trust_admin project-id, key size `32`, concrete key digest, signature_family_id `import_receipt`.
+`signature_family_id`: `native_initialization` = signer_key_id `none`, key size `0`, key digest 64 ASCII `0` characters, signature_family_id `none`; `imported_initialization` = signer_key_id `none`, key size `0`, key digest 64 ASCII `0` characters, signature_family_id `none`; `export_freeze` = trust_admin project-id, key size `32`, concrete key digest, signature_family_id `export_authorization`; `retirement` = trust_admin project-id, key size `32`, concrete key digest, signature_family_id `import_receipt`.
+`status_operation_id`: `native_initialization` = one project-id; `none` prohibited; `imported_initialization` = one project-id; `none` prohibited; `export_freeze` = one project-id; `none` prohibited; `retirement` = one project-id; `none` prohibited.
+`source_current_id`: `native_initialization` = the trust id named by current; `imported_initialization` = the trust id named by current; `export_freeze` = the trust id named by current; `retirement` = the trust id named by current.
+`source_current_file_size`: `native_initialization` = byte size of current; `imported_initialization` = byte size of current; `export_freeze` = byte size of current; `retirement` = byte size of current.
+`source_current_file_sha256`: `native_initialization` = full-file SHA-256 of current; zero digest prohibited; `imported_initialization` = full-file SHA-256 of current; zero digest prohibited; `export_freeze` = full-file SHA-256 of current; zero digest prohibited; `retirement` = full-file SHA-256 of current; zero digest prohibited.
+`expected_status_file_size`: `native_initialization` = byte size of the expected service_status file; `imported_initialization` = byte size of the expected service_status file; `export_freeze` = byte size of the expected service_status file; `retirement` = byte size of the expected service_status file.
+`expected_status_file_sha256`: `native_initialization` = full-file SHA-256 of that file; zero digest prohibited; `imported_initialization` = full-file SHA-256 of that file; zero digest prohibited; `export_freeze` = full-file SHA-256 of that file; zero digest prohibited; `retirement` = full-file SHA-256 of that file; zero digest prohibited.
+`requested_status_prefix_size`: `native_initialization` = byte size of the new service_status prefix; `imported_initialization` = byte size of the new service_status prefix; `export_freeze` = byte size of the new service_status prefix; `retirement` = byte size of the new service_status prefix.
+`requested_status_prefix_sha256`: `native_initialization` = section 6 self-checksum of that prefix; zero digest prohibited; `imported_initialization` = section 6 self-checksum of that prefix; zero digest prohibited; `export_freeze` = section 6 self-checksum of that prefix; zero digest prohibited; `retirement` = section 6 self-checksum of that prefix; zero digest prohibited.
+`host_id`: `native_initialization` = the host project-id of the root being published; `imported_initialization` = the host project-id of the root being published; `export_freeze` = the host project-id of the root being published; `retirement` = the host project-id of the root being published.
+`portable_plan_sha256`: `native_initialization` = full-file digest of the portable plan record; zero digest prohibited; `imported_initialization` = full-file digest of the portable plan record; zero digest prohibited; `export_freeze` = full-file digest of the portable plan record; zero digest prohibited; `retirement` = full-file digest of the portable plan record; zero digest prohibited.
+
+The portable-publication-plan record is not a file. `record_kind` is `portable_publication_plan`. Its keys, in this order, are: `schema_version`, `record_kind`, `publication_kind`, `status_operation_id`, `export_operation_id`, `trust_id`, `transition_id`, `host_id`, `requested_root_path`, `new_binding_record_size`, `new_binding_record_sha256`, `source_binding_record_size`, `source_binding_record_sha256`, `successor_file_size`, `successor_file_sha256`, `expected_status`, `requested_status`, `record_sha256`. It contains no `device`, no `inode`, and no writer-bound digest. The friend seals these bytes before the writer opens the root. The writer does not modify the sealed bytes.
+
+Portable-plan field rules:
+
+| Field | withdrawal | ordinary | revocation | rollback | native_initialization | imported_initialization | export_freeze | retirement | governance_pin | activation |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `publication_kind` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `status_operation_id` | exact sentinel | exact sentinel | exact sentinel | exact sentinel | required concrete value | required concrete value | required concrete value | required concrete value | exact sentinel | exact sentinel |
+| `export_operation_id` | exact sentinel | exact sentinel | exact sentinel | exact sentinel | exact sentinel | exact sentinel | required concrete value | exact sentinel | exact sentinel | exact sentinel |
+| `trust_id` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `transition_id` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | exact sentinel | exact sentinel | required concrete value | required concrete value |
+| `host_id` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `requested_root_path` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value |
+| `new_binding_record_sha256` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | exact sentinel | exact sentinel | exact sentinel | required concrete value | required concrete value |
+| `source_binding_record_sha256` | exact sentinel | exact sentinel | exact sentinel | exact sentinel | exact sentinel | required concrete value | exact sentinel | exact sentinel | exact sentinel | exact sentinel |
+| `successor_file_sha256` | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | required concrete value | exact sentinel | exact sentinel | required concrete value | required concrete value |
+| `expected_status` | exact sentinel | exact sentinel | exact sentinel | exact sentinel | required concrete value | required concrete value | required concrete value | required concrete value | exact sentinel | exact sentinel |
+| `requested_status` | exact sentinel | exact sentinel | exact sentinel | exact sentinel | required concrete value | required concrete value | required concrete value | required concrete value | exact sentinel | exact sentinel |
+
+Constraint for each cell above, in the same field order and the same kind order:
+
+`publication_kind`: `withdrawal` = token `withdrawal`; `ordinary` = token `ordinary`; `revocation` = token `revocation`; `rollback` = token `rollback`; `native_initialization` = token `native_initialization`; `imported_initialization` = token `imported_initialization`; `export_freeze` = token `export_freeze`; `retirement` = token `retirement`; `governance_pin` = token `governance_pin`; `activation` = token `activation`.
+`status_operation_id`: `withdrawal` = token `none`; `ordinary` = token `none`; `revocation` = token `none`; `rollback` = token `none`; `native_initialization` = one project-id; `none` prohibited; `imported_initialization` = one project-id; `none` prohibited; `export_freeze` = one project-id; `none` prohibited; `retirement` = one project-id; `none` prohibited; `governance_pin` = token `none`; `activation` = token `none`.
+`export_operation_id`: `withdrawal` = token `none`; `ordinary` = token `none`; `revocation` = token `none`; `rollback` = token `none`; `native_initialization` = token `none`; `imported_initialization` = token `none`; `export_freeze` = one project-id; `none` prohibited; `retirement` = token `none`; `governance_pin` = token `none`; `activation` = token `none`.
+`trust_id`: `withdrawal` = the successor trust id, or the source current trust id for export and retirement; `ordinary` = the successor trust id, or the source current trust id for export and retirement; `revocation` = the successor trust id, or the source current trust id for export and retirement; `rollback` = the successor trust id, or the source current trust id for export and retirement; `native_initialization` = the successor trust id, or the source current trust id for export and retirement; `imported_initialization` = the successor trust id, or the source current trust id for export and retirement; `export_freeze` = the successor trust id, or the source current trust id for export and retirement; `retirement` = the successor trust id, or the source current trust id for export and retirement; `governance_pin` = the successor trust id, or the source current trust id for export and retirement; `activation` = the successor trust id, or the source current trust id for export and retirement.
+`transition_id`: `withdrawal` = the new transition id; `ordinary` = the new transition id; `revocation` = the new transition id; `rollback` = the new transition id; `native_initialization` = the new transition id; `imported_initialization` = the source transition id already stored in the copied successor; `export_freeze` = token `none`; `retirement` = token `none`; `governance_pin` = the new transition id; `activation` = the new transition id.
+`host_id`: `withdrawal` = destination host for imported_initialization; otherwise the host of the root being published; `ordinary` = destination host for imported_initialization; otherwise the host of the root being published; `revocation` = destination host for imported_initialization; otherwise the host of the root being published; `rollback` = destination host for imported_initialization; otherwise the host of the root being published; `native_initialization` = destination host for imported_initialization; otherwise the host of the root being published; `imported_initialization` = destination host for imported_initialization; otherwise the host of the root being published; `export_freeze` = destination host for imported_initialization; otherwise the host of the root being published; `retirement` = destination host for imported_initialization; otherwise the host of the root being published; `governance_pin` = destination host for imported_initialization; otherwise the host of the root being published; `activation` = destination host for imported_initialization; otherwise the host of the root being published.
+`requested_root_path`: `withdrawal` = absolute lexical path, length 1 to 1024, beginning with `/`, no NUL, no LF, no `//`, and no `.` or `..` segment; `ordinary` = absolute lexical path, length 1 to 1024, beginning with `/`, no NUL, no LF, no `//`, and no `.` or `..` segment; `revocation` = absolute lexical path, length 1 to 1024, beginning with `/`, no NUL, no LF, no `//`, and no `.` or `..` segment; `rollback` = absolute lexical path, length 1 to 1024, beginning with `/`, no NUL, no LF, no `//`, and no `.` or `..` segment; `native_initialization` = absolute lexical path, length 1 to 1024, beginning with `/`, no NUL, no LF, no `//`, and no `.` or `..` segment; `imported_initialization` = absolute lexical path, length 1 to 1024, beginning with `/`, no NUL, no LF, no `//`, and no `.` or `..` segment; `export_freeze` = absolute lexical path, length 1 to 1024, beginning with `/`, no NUL, no LF, no `//`, and no `.` or `..` segment; `retirement` = absolute lexical path, length 1 to 1024, beginning with `/`, no NUL, no LF, no `//`, and no `.` or `..` segment; `governance_pin` = absolute lexical path, length 1 to 1024, beginning with `/`, no NUL, no LF, no `//`, and no `.` or `..` segment; `activation` = absolute lexical path, length 1 to 1024, beginning with `/`, no NUL, no LF, no `//`, and no `.` or `..` segment.
+`new_binding_record_sha256`: `withdrawal` = digest of the new transition_operation_binding; zero digest prohibited; `ordinary` = digest of the new transition_operation_binding; zero digest prohibited; `revocation` = digest of the new transition_operation_binding; zero digest prohibited; `rollback` = digest of the new transition_operation_binding; zero digest prohibited; `native_initialization` = digest of the new transition_operation_binding; zero digest prohibited; `imported_initialization` = size `0` and digest 64 ASCII `0` characters; `export_freeze` = size `0` and digest 64 ASCII `0` characters; `retirement` = size `0` and digest 64 ASCII `0` characters; `governance_pin` = digest of the new transition_operation_binding; zero digest prohibited; `activation` = digest of the new transition_operation_binding; zero digest prohibited.
+`source_binding_record_sha256`: `withdrawal` = size `0` and digest 64 ASCII `0` characters; `ordinary` = size `0` and digest 64 ASCII `0` characters; `revocation` = size `0` and digest 64 ASCII `0` characters; `rollback` = size `0` and digest 64 ASCII `0` characters; `native_initialization` = size `0` and digest 64 ASCII `0` characters; `imported_initialization` = the source successor binding_record_sha256; zero digest prohibited; `export_freeze` = size `0` and digest 64 ASCII `0` characters; `retirement` = size `0` and digest 64 ASCII `0` characters; `governance_pin` = size `0` and digest 64 ASCII `0` characters; `activation` = size `0` and digest 64 ASCII `0` characters.
+`successor_file_sha256`: `withdrawal` = size and full-file digest of the new successor bytes; zero digest prohibited; `ordinary` = size and full-file digest of the new successor bytes; zero digest prohibited; `revocation` = size and full-file digest of the new successor bytes; zero digest prohibited; `rollback` = size and full-file digest of the new successor bytes; zero digest prohibited; `native_initialization` = size and full-file digest of the new successor bytes; zero digest prohibited; `imported_initialization` = size and full-file digest of the copied source successor; zero digest prohibited; `export_freeze` = size `0` and digest 64 ASCII `0` characters; `retirement` = size `0` and digest 64 ASCII `0` characters; `governance_pin` = size and full-file digest of the new successor bytes; zero digest prohibited; `activation` = size and full-file digest of the new successor bytes; zero digest prohibited.
+`expected_status`: `withdrawal` = token `none`; `ordinary` = token `none`; `revocation` = token `none`; `rollback` = token `none`; `native_initialization` = token `empty`; `imported_initialization` = token `empty`; `export_freeze` = token `active`; `retirement` = token `export_frozen`; `governance_pin` = token `none`; `activation` = token `none`.
+`requested_status`: `withdrawal` = token `none`; `ordinary` = token `none`; `revocation` = token `none`; `rollback` = token `none`; `native_initialization` = token `active`; `imported_initialization` = token `active`; `export_freeze` = token `export_frozen`; `retirement` = token `retired`; `governance_pin` = token `none`; `activation` = token `none`.
+
+The writer-bound-identity record is not a file. `record_kind` is `writer_bound_identity`. Its keys, in this order, are: `schema_version`, `record_kind`, `portable_plan_sha256`, `device`, `inode`, `canonical_path`, `host_id`, `record_sha256`. `device` and `inode` are the `uint64` values of `st_dev` and `st_ino` from `fstat` of the opened trust-root directory. If either value is not representable as `uint64`, the result is `kRootRejected` and no publication file is written. `canonical_path` is the caller path after the lexical check, not a symlink-resolved path. `writer_bound_sha256` is SHA-256 of every byte of this finished record. The sealed plan does not store this record.
+
+`publication_root` keys, in this order: `schema_version`, `record_kind`, `device`, `inode`, `canonical_path`, `host_id`, `record_sha256`. Path: `trust_root/publication-root.record`. `record_kind` is `publication_root`. Cardinality is one for the life of the directory. Signature is `none`. It is local operational state and is not authority for a trust transition. Producer is 9-C33. The file is mode `0444`, created with `O_CREAT|O_EXCL|O_NOFOLLOW`, accepted only as a regular file with link count 1. It is not a symlink and not a hard link. It is immutable: the writer never rewrites it and never deletes it.
+
+`status_authorization` keys, in this order: `schema_version`, `record_kind`, `status_operation_id`, `publication_kind`, `binding_record_kind`, `binding_record_size`, `binding_record_sha256`, `expected_status`, `requested_status`, `portable_plan_size`, `portable_plan_sha256`, `writer_bound_size`, `writer_bound_sha256`, `record_sha256`. Path: `trust_root/status-authorizations/<status-operation-id>.record`. `record_kind` is `status_authorization`. `status-operation-id` is a project-id and is not `none` and not `unknown`. Cardinality is one file per status-operation-id. Distinct operations use distinct ids, so native or imported activation, export freeze, and retirement each keep their own file. Signature is `none`. Producer is 9-C36 for native activation and 9-C34 for imported activation, export freeze, and retirement. A completed earlier file does not occupy the later operation's path.
+
+`import_destination_binding` keys, in this order: `schema_version`, `record_kind`, `migration_id`, `destination_transaction_id`, `destination_nonce_id`, `package_id`, `migration_package_file_size`, `migration_package_file_sha256`, `payload_id`, `payload_file_size`, `payload_file_sha256`, `high_water`, `source_successor_trust_id`, `source_successor_file_size`, `source_successor_file_sha256`, `source_transition_id`, `source_transition_file_size`, `source_transition_file_sha256`, `source_binding_record_size`, `source_binding_record_sha256`, `destination_host_id`, `requested_trust_generation`, `requested_current_trust_id`, `status_operation_id`, `portable_plan_size`, `portable_plan_sha256`, `record_sha256`. Path: `trust_root/import-destination.record`. `record_kind` is `import_destination_binding`. Cardinality is one for the life of the destination. Signature is `none`. Producer is 9-C34. Mode `0444`, `O_CREAT|O_EXCL|O_NOFOLLOW`, regular file, link count 1. Every key is a required concrete value. Zero digests are prohibited. The record contains no `device` and no `inode`. It is not a byte inside the source successor and it is not a byte inside the source transition.
+
+`export_authorization` keys, in this order: `schema_version`, `record_kind`, `export_operation_id`, `status_operation_id`, `package_id`, `migration_package_file_size`, `migration_package_file_sha256`, `source_current_id`, `source_current_file_size`, `source_current_file_sha256`, `expected_status`, `requested_status`, `signer_key_id`, `signer_publication_key_size`, `signer_publication_key_sha256`, `signature_family_id`, `host_id`, `registry_id`, `authority_registry_file_size`, `authority_registry_file_sha256`, `effective_date`, `portable_plan_size`, `portable_plan_sha256`, `record_sha256`. Path: `trust_root/export-authorizations/<export-operation-id>.record`. `record_kind` is `export_authorization`. `export-operation-id` is a project-id and is not `none` and not `unknown`. Cardinality is one file per export-operation-id. `expected_status` is `active`. `requested_status` is `export_frozen`. `signature_family_id` is `export_authorization`. `signer_publication_key_size` is `32`. The signer key digest is concrete and the zero digest is prohibited. `effective_date` is the source terminal trust state's `effective_date`. The registry entry role is `trust_admin`, `revoked=no`, and `valid_from <= effective_date <= valid_until`. The Ed25519 preimage is the exact finished record bytes, including `record_sha256`. The signature blob, index, and verification record are outside that preimage. Paths, in the same directory, are `<export-operation-id>.signature.bin`, `<export-operation-id>.signature.index`, and `<export-operation-id>.verification.record`. Each is mode `0444`, created with `O_CREAT|O_EXCL|O_NOFOLLOW`, regular, link count 1, `fsync`, and parent `fsync` before the next file. The order is record, signature, index, verification. Producer is 9-C34. A second call that finds those four exact files for the same export-operation-id returns `kOk` with `bytes_written` false. A file at that id with different bytes returns `kConflict`, writes nothing, and deletes nothing. The record contains no `device` and no `inode`.
+
+
+`binding_record_kind` is the required concrete value `transition_operation_binding` on every successor in the seven transition kinds. `binding_record_size` is the required concrete byte length of the finished binding record and is not zero. `binding_record_sha256` is the required concrete full-file digest of that record and the zero digest is prohibited. Status publication kinds are prohibited in `trust_state.binding_record_kind`.
+
+### Root binding
+
+Stage A seals the portable plan. The friend checks the phase predicate, serializes the portable plan, and stores `portable_plan_sha256`. That object is immutable. It has no device and no inode.
+
+Stage B begins when the writer opens the trust-root directory with `O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`. It calls `fstat` and `fstatfs`, classifies the filesystem, and only then takes the process mutex and the nonblocking exclusive `flock`. No publication file is written before classification and the lock. If `publication-root.record` is absent, the writer creates it from this `fstat` and the lexical path, `fsync`s the file, and `fsync`s the directory. If it exists, `device`, `inode`, `canonical_path`, and `host_id` must equal this open. A mismatch returns `kConflict`, writes nothing else, and deletes nothing. The writer then serializes `writer_bound_identity` and computes `writer_bound_sha256`. It does not write those bytes into the sealed plan, the successor, the transition, the import-destination record, or the export-authorization record. A retry recomputes both digests. The portable digest must equal the sealed plan. The writer-bound digest must equal the digest implied by the current `publication-root.record` and that portable digest. Imported source bytes are not an input to `device` or `inode`.
+
+### P0-P8
+
+Genesis files are only `trust_root/genesis/transition.record`, `genesis/signature.bin`, `genesis/signature.index`, and `genesis/verification.record`. Later transition files are only `trust_root/transitions/<transition-id>/` with those four basenames. The successor file is only `admission/trust/trust-<trust_id>.record`. Each new file is created with `O_CREAT|O_EXCL|O_NOFOLLOW`, mode `0444`, link count 1, a full write, `fsync`, `fstat`, rewind, and reread. A short write is `kConflict` when a foreign byte is already durable and `kPrefixMismatch` when the byte string differs from this operation's exact prefix. Nothing is deleted. The writer does not scan a directory to choose a file.
+
+| State | Required observation |
+|---|---|
+| P0 | Successor absent. Transition directory absent. `current.partial` absent. `current` still names the predecessor, or `current` is absent when the predecessor current is absent. `publication-root.record` may already be present. |
+| P1 | Exact successor bytes. Recomputed transition-operation-binding digest matches those bytes. Transition directory absent. |
+| P2 | P1 plus the family directory mode `0700` and `ENOENT` for all four family names. An unexpected name in that directory is `kConflict`. |
+| P3 | P2 plus exact `transition.record`. `signature.bin` absent. |
+| P4 | P3 plus exact `signature.bin`. Index absent. |
+| P5 | P4 plus exact `signature.index`. Verification absent. |
+| P6 | Exact four-file family. Directory mode `0555`. `current.partial` absent. `current` still the predecessor, or absent for genesis and for native initialization before N8. |
+| P7 | P6 family plus exact `current.partial` containing the successor bytes. `current` still the predecessor, or absent when the plan says the predecessor current is absent. |
+| P8 | `current` byte-identical to the successor. Parent `fsync` has returned on this call. Final reread matches. `current.partial` absent. |
+
+Advances: P0 to P1 writes the successor only when `SuccessorDurability` is `kMustCreate`. P1 to P2 creates the directory at `0700`. P2 to P3 writes `transition.record`. P3 to P4 writes `signature.bin` only when that file is absent. P4 to P5 writes the index. P5 to P6 writes the verification record, changes the directory to `0555`, and `fsync`s it. P6 to P7 writes `current.partial`. P7 to P8 renames that partial onto `current`, `fsync`s the trust root, and rereads `current`. The signer is called only when the signature file and an exact signature partial are both absent. One call must return 64 bytes that verify under the plan's public key. A mismatch at any state returns `kPrefixMismatch` when the path belongs to this successor id and the binding differs, and `kConflict` when the file is a different object. The writer compares the recomputed portable digest and the recomputed writer-bound digest with the sealed plan and the publication-root record at every state.
+
+At P0 the fully checked plan may create the successor. At P1 and P2 the writer reads the successor and recomputes the transition-operation-binding digest from the successor fields. A request whose kind, authorization, signer key, public-key digest, signature family, host id, or lineage fields differ from those bytes returns `kPrefixMismatch` and writes nothing further.
+
+After P8, a present `current.partial` whose bytes equal the successor returns `kConflict`, writes nothing, and deletes nothing. A present `current.partial` whose bytes differ returns `kConflict`, writes nothing, and deletes nothing. `kOk` at P8 requires `current.partial` to be absent. Presence of `publication-root.record` does not move the state out of P0.
+
+Kind `imported_initialization` does not use P0. `SuccessorDurability` is `kAlreadyExact`. The writer opens the successor read-only and does not create it, truncate it, or sign it.
+
+### Imported-current states
+
+Imported initialization does not create or sign the imported successor or the imported transition. `publish_verified_transition` on kind `imported_initialization` uses only these states.
+
+| State | Required observation |
+|---|---|
+| I0 | The source successor is already durable at `admission/trust/trust-<id>.record` and its bytes equal the plan's successor bytes. The binding recomputed from those bytes equals the successor's `binding_record_sha256` and the plan's `source_binding_record_sha256`. The source transition's `successor_trust_file_sha256` equals that file. `import-destination.record` matches the plan. `current` absent. `current.partial` absent. Lineage family verifies. Status is the exact snapshotted `empty` record. Destination transaction, nonce, package, host, and root fields are not required to occur inside the successor. |
+| I1 | I0 plus exact `current.partial` containing those unchanged successor bytes. |
+| I2 | `current` byte-identical to the successor. Partial absent. Trust-root `fsync` returned on this call. Reread matches. Status still `empty`. |
+| I3 | I2 plus canonical `active` status and the plan-specific `status-authorizations/<status-operation-id>.record`. |
+
+I0 to I1 writes `current.partial` only. I1 to I2 renames it onto `current`, `fsync`s the trust root, and rereads. I2 to I3 calls `publish_verified_status` for canonical `active` under the plan's status-operation-id. A crash after the rename is I2 once this call's `fsync` and reread succeed. Case A, including an authorized descendant N+1 or N+2 of the same import identity, returns `kOk` with `bytes_written` false and does not enter I1. Case B0 is the only case that may advance I0 to I2. Case B1 does not rewrite `current` and may advance only from I2 to I3 while status is still the snapshotted `empty` record. Case C returns `kConflict` and writes nothing. A source binding that does not recompute, or a successor that differs from the plan, returns `kConflict` and writes nothing.
+
+A destination with `import_completed` true may publish generation N+1, and later N+2, under the P0-P8 rules. N is the `trust_generation` of the imported trust state. The new successor does not need to equal the transaction's `trust_file_sha256`. The predecessor must be the authenticated `current`. The transaction is not rewritten, deleted, or consulted as a digest veto. Section 11 then sets `service_loadable` for N+1 or N+2 when status is canonical `active` and the section 13 walk contains the imported trust state. Section 14, not import resume, is the only writer of that new `current`. Import resume must not write `current` after `import_completed`. Withdrawal of a subject, when it changes the terminal trust state, is also one of these forward transitions. A later generation cannot decrease `revocation_generation` or clear a tombstone.
+
+### Native order
+
+Kind `native_initialization` runs the P-machine for `genesis-v1` through P6 while `current` stays absent, then the section 11 states N0 through N8 for the lineage-origin family, then P6 to P8 for `current`, then `publish_verified_status` for canonical `active` at the plan's status-operation-id. The genesis `transition.record` bytes and the lineage-origin record bytes are the two signer messages. Each signer call occurs only while that signature file is absent. An imported lineage at this destination returns `kConflict` before a write. The status-operation-id used here is not reused for export freeze or retirement.
+
+### Status states
+
+`publish_verified_status` opens the root stored in the plan, classifies it, and takes the process mutex and directory `flock` for that call. It does not reuse a root retained by another call. The authorization path is exactly `trust_root/status-authorizations/<status-operation-id>.record` from the sealed plan. The writer opens that directory with `openat` and `O_DIRECTORY|O_NOFOLLOW` on the trust-root descriptor. If the directory is absent, `mkdirat` uses mode `0755`, then `openat`, `fchmod` `0755`, and an `fsync` of the trust root. A symlink is `kConflict`. Directory link count is not an authority input. The writer does not call `readdir` and does not select a sibling by name order or modification time. An unrelated sibling file is not opened.
+
+| State | Required observation |
+|---|---|
+| S0 | Live status equals the plan's expected bytes. The plan-specific authorization path is `ENOENT` from `openat` with `O_NOFOLLOW`. `service_status.partial` absent. |
+| S1 | That authorization file is exact for this portable plan and for the writer-bound digest recomputed on this call. Live status still the expected bytes. Partial absent. Link count is 1. |
+| S2 | S1 plus exact `service_status.partial` containing the requested bytes. |
+| S3 | Live status equals the requested bytes. Partial absent. Authorization file still exact. Parent `fsync` returned on this call. Reread matches. |
+| S3P | Live status equals the requested bytes and the authorization file is exact, while `service_status.partial` exists, for any byte string in that partial. |
+
+S0 to S1 creates the authorization file with `O_CREAT|O_EXCL|O_NOFOLLOW`, mode `0444`, link count 1, full write, `fsync`, and parent `fsync`. The written bytes are the section 4 status-authorization record. `writer_bound_sha256` is computed after the open and is not taken from the sealed plan. S1 to S2 writes the partial. S2 to S3 renames it onto `service_status`, `fsync`s the trust root, and rereads. `EEXIST` on the authorization path opens that file read-only. Matching portable fields, matching recomputed writer-bound digest, and expected live status are S1. Matching fields and requested live status with the partial absent are S3. Different bytes are `kConflict`. Export freeze is legal only from exact canonical `active` to exact canonical `export_frozen`. Retirement is legal only from exact canonical `export_frozen` to exact canonical `retired`. A bare status token is not a plan and is not accepted by `publish_verified_status`. A repeat at S3 whose portable plan and recomputed writer-bound digest match returns `kOk` with `bytes_written` false.
+
+S3P returns `kConflict`. It is not `kOk`. The partial stays in place. `service_status` stays in place. Every status-authorization file stays in place. The call writes nothing and deletes nothing. It does not start native initialization, imported initialization, export freeze, or retirement. `tests/trust_transition_publication_test.cpp` contains a case that creates `service_status.partial` after S3 and requires this result and these unchanged bytes.
+
+### Withdrawal
+
+`publish_withdrawal` returns `kAuthorizationRejected` before the plan constructor unless the subject kind and role pair is one of: `provenance` with `provenance_reviewer`, `license` with `license_reviewer`, `golden_fixture` with `golden_reviewer`, `registry_entry` with `registry_reviewer`, `policy_pin` with `policy_reviewer`, `telemetry_governance` with `telemetry_reviewer`, `activation_authorization` with `policy_reviewer`. The registry entry role equals that role. The key is unrevoked at `effective_date`. The note path is `admission/notes/withdraw-note-<subject-id>.record` and the section 9 withdrawal family verifies. Successor revocation generation equals the predecessor revocation generation plus 1. The successor tombstone list contains every predecessor tombstone. The lineage-origin family is unchanged. Only then does the function construct `VerifiedTransitionPlan` and call `publish_verified_transition`.
+
+### Rollback
+
+`publish_rollback` returns `kAuthorizationRejected` before the plan constructor unless successor generation equals predecessor generation plus 1, successor revocation generation is not lower, the successor tombstone list contains every predecessor tombstone, the successor registry identity equals the predecessor registry identity, a changed pin lists only subjects absent from the successor tombstones, telemetry is the predecessor triple or the disabled zero triple, and `admission_mode=no_model` uses pin id `none`, size 0, and the zero digest. Only then does it construct `VerifiedTransitionPlan` and call `publish_verified_transition`. `tests/rollback_test.cpp` is not a friend.
+
+### Governance pin
+
+`publish_governance_pin` returns `kAuthorizationRejected` before the plan constructor unless the governance content identity matches, the governance-review family verifies with role `telemetry_reviewer`, the accepted decision names the content digest and the review-note digest, the decision id is a member of `head_set_members`, the decision id is absent from the predecessor tombstones, and the successor telemetry triple equals the request triple. Only then does it construct `VerifiedTransitionPlan` with kind `governance_pin` and call `publish_verified_transition`.
+
+### Activation
+
+`publish_activation` returns `kAuthorizationRejected` before the plan constructor unless `requested_runtime_mode` is `activation`, `requested_activation_mode` is `active`, the activation-review family verifies with role `policy_reviewer`, the accepted decision id is in `head_set_members` and absent from the predecessor tombstones, and the policy decision, candidate, dataset, invariance, and model id in the request equal the successor fields. Only then does it construct `VerifiedTransitionPlan` with kind `activation` and call `publish_verified_transition`. This is the section 34 compare-and-swap.
+
+### Export freeze
+
+`publish_export_freeze` returns `kAuthorizationRejected` before the status-plan constructor unless the source current matches, the live status bytes are the canonical `active` record, the export-authorization family verifies under `trust_admin` at `effective_date`, the public-key digest matches the registry entry, and the package identity matches the authorization record. Only then does the function construct `VerifiedStatusPlan` and call `publish_verified_status` for the plan's own status-operation-id.
+
+### Retirement
+
+`publish_retirement` returns `kAuthorizationRejected` before the status-plan constructor unless the source status is the exact canonical `export_frozen` record, the receipt file on the destination trust root is `migrations/<receipt-id>.receipt.record`, the destination admission root contains `admission/signature-records/receipt-signature-<receipt-id>.record` and `admission/signature-indexes/receipt-sigindex-<receipt-id>.index`, the destination evidence root contains `benchmarks/generative_phase9c/signatures/receipt-sigblob-<receipt-id>.bin`, those four objects verify under `trust_admin`, and the receipt binds the stated migration package and trust file. Retirement from `active`, `empty`, or `retired` is rejected. The status write uses the retirement status-operation-id and does not open the activation or export-freeze authorization files. A later call that finds S3 for the same operation identity returns `kOk` with `bytes_written` false.
+
+### Ordinary transitions
+
+`publish_ordinary_transition` accepts only kind `ordinary` or kind `revocation`. It returns `kAuthorizationRejected` before the plan constructor when the signer role is not `trust_admin`, the signature does not verify, the generation is not the predecessor generation plus 1, the revocation generation decreases, or a predecessor tombstone is absent from the successor. It then calls `publish_verified_transition`. Phase 9-C38 does not define another writer.
+
+### Result policy
+
+| Token | Policy |
+|---|---|
+| `kOk` | The operation is at its authenticated completion. The first call that reaches completion returns `kOk` and may have written. An exact later call with the same portable plan, the same recomputed writer-bound digest, matching files, and no `current.partial` returns `kOk` with `bytes_written` false and writes nothing. S3P is not `kOk`. A different identity on the same bytes is not `kOk`. |
+| `kBusyMutex` | Mutex is busy. No write. Same request may retry. No poison. No restart. |
+| `kBusyKernelLock` | `flock` returned `EWOULDBLOCK` or `EAGAIN`. No write. Retry is allowed. No poison. |
+| `kReentered` | Owner is this thread. Detected before `try_lock`. No write. This thread does not retry until the owner clears. No poison. |
+| `kRootRejected` | Path is rejected or is not the plan path. No write. A corrected path may be submitted. No poison. |
+| `kFilesystemUnsupported` | Classification is unsupported. No write. The same root is not retried. A different supported root may be submitted. No poison. |
+| `kFilesystemIndeterminate` | `fstatfs` failed. No write. Retry is allowed. No poison. |
+| `kInterrupted` | `flock` acquisition returned `EINTR`. No write. Retry is allowed. No poison. |
+| `kAllocationFailed` | `std::bad_alloc` was caught. No write. Retry is allowed. No poison. |
+| `kKernelLockInvariant` | `flock` returned `EBADF`, `EINVAL`, or any errno other than `EAGAIN`, `EWOULDBLOCK`, `EINTR`, `ENOLCK`, and `EIO`. Poison before mutex release. No retry. Restart and reread. |
+| `kKernelLockResource` | `flock` returned `ENOLCK`. No write. Retry is allowed. No poison. |
+| `kKernelLockIo` | `flock` returned `EIO` during acquisition. No write. Retry is allowed. No poison. |
+| `kConflict` | A foreign file, an illegal partial, or S3P occupies a path. No further write. No deletion. No retry of a write. Reread. No poison. |
+| `kAuthorizationRejected` | The phase predicate failed before the plan constructor, or the constructor was not reached. No publication byte from this call. A corrected request may be submitted. No poison. |
+| `kPrefixMismatch` | This operation's path has a durable prefix for a different identity. No further write. No deletion. Reread. No poison. |
+| `kReleaseFailedBeforeDurable` | `LOCK_UN` failed with an errno other than `EBADF` before completion reread. Poison. No retry. Restart and reread. |
+| `kOutcomeUncertain` | Completion reread succeeded and a later non-`EBADF` release failed. Poison. No retry. Restart and reread. Do not start a second successor. |
+| `kReleaseInvariant` | `LOCK_UN` returned `EBADF`. Poison before mutex release. No retry. Restart and reread. |
+| `kDescriptorInvariant` | `close` returned `EBADF` or `EINTR`. One attempt only. Poison before mutex release. No retry of the integer. Restart and reread. |
+| `kPoisoned` | The latch was already set. No write. No retry. Restart and reread. |
+
+`EBADF` is not a successful close and is not a successful unlock. `close` is attempted once. `LOCK_UN` is attempted once. An abandoned guard sets poison while holding the mutex, attempts `LOCK_UN` once if the lock was acquired, attempts `close` once, retains both errnos, clears the owner, and unlocks only after the poison store is visible. It does not throw. `finish` runs that release once. A second `finish` returns the stored outcome.
+
+Same-thread reentry is an acquire load of `std::atomic<std::thread::id>` before `try_lock`. The empty owner is a default-constructed `std::thread::id`. Poison is `std::atomic<bool>` stored with release while the mutex is held. Readers take no mutex and no `flock`. Publication functions do not call `fork`, `posix_spawn`, or `exec`.
+
+### Crash and recovery
+
+| Observation | Result | Write | Retry | Restart |
+|---|---|---|---|---|
+| Process death after any `fsync` and before the next rename | resume at the state whose files match | only the next defined advance | same operation | yes |
+| `publication-root.record` mismatches the open | `kConflict` | none | no | reread |
+| Authorization path occupied by different bytes | `kConflict` | none | no | reread |
+| S3P | `kConflict` | none | no | reread |
+| Exact S3 or exact P8 or exact I3 | `kOk` and `bytes_written` false | none | observation only | no |
+
+### Test seam and platform tests
+
+`PublicationHooks` uses `FilesystemClass`, `FlockHookResult`, and `CloseHookResult`. It does not use `struct statfs`. `set_publication_hooks_for_test` exists only when `INFEREDGE_TRUST_PUBLICATION_TEST_SEAM` is defined. It returns true only on the first call in the process, and only before any publication function has been entered. A later call returns false and leaves the hooks unchanged. The setter is called from the test's initial thread. It is not called concurrently. Hooks cannot construct a plan. Poison and release-failure tests run in a child process created by the test harness with `posix_spawn`. The child exits. The parent does not reuse the child's descriptors. A forced `close` error does not skip the one real `close` attempt. The child's descriptors end when the child exits.
+
+The Linux positive test `lstat`s `/dev/shm`, requires a real directory that is not a symlink, opens it, and requires tmpfs magic `0x01021994`. It copies the bytes of `/dev/shm/inferedge-trust-pub-XXXXXX` including the terminating NUL into `std::array<char, sizeof("/dev/shm/inferedge-trust-pub-XXXXXX")>` and passes `template_bytes.data()` to `mkdtemp`. A null return fails the test. The test writes only inside that returned child. Cleanup removes only that child. Cleanup failure fails the test and reports that path. The test does not recursively delete `/dev/shm`. If `/dev/shm` is absent, not a directory, a symlink, or not tmpfs, the test fails.
+
+The Darwin positive test uses the same mutable-array rule with the template `/private/tmp/inferedge-trust-pub-XXXXXX` and requires classification `apfs`. A null `mkdtemp` return fails the test. Cleanup failure fails the test and reports the retained path.
+
+### Declarations
+
+The following headers are the normative declarations. They are contract text in this section. This artifact does not create the files in the repository.
+
+`include/inferedge/trust_transition.hpp`
+
+```cpp
+#ifndef INFEREDGE_TRUST_TRANSITION_HPP
+#define INFEREDGE_TRUST_TRANSITION_HPP
+
+#include <array>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+namespace inferedge {
+
+struct ProjectId {
+  std::string value;
+};
+
+struct IdOrNone {
+  bool is_none = true;
+  ProjectId id;
+};
+
+struct CivilDate {
+  std::uint16_t year = 0;
+  std::uint8_t month = 0;
+  std::uint8_t day = 0;
+};
+
+struct Sha256Digest {
+  std::array<std::uint8_t, 32> bytes{};
+};
+
+enum class TrustPublicationResult : std::uint8_t {
+  kOk = 1,
+  kBusyMutex = 2,
+  kBusyKernelLock = 3,
+  kReentered = 4,
+  kRootRejected = 5,
+  kFilesystemUnsupported = 6,
+  kFilesystemIndeterminate = 7,
+  kInterrupted = 8,
+  kAllocationFailed = 9,
+  kKernelLockInvariant = 10,
+  kKernelLockResource = 11,
+  kKernelLockIo = 12,
+  kConflict = 13,
+  kAuthorizationRejected = 14,
+  kPrefixMismatch = 15,
+  kReleaseFailedBeforeDurable = 16,
+  kOutcomeUncertain = 17,
+  kReleaseInvariant = 18,
+  kDescriptorInvariant = 19,
+  kPoisoned = 20
+};
+
+enum class TrustPublicationKind : std::uint8_t {
+  kWithdrawal = 1,
+  kOrdinary = 2,
+  kRevocation = 3,
+  kRollback = 4,
+  kNativeInitialization = 5,
+  kImportedInitialization = 6,
+  kExportFreeze = 7,
+  kRetirement = 8,
+  kGovernancePin = 9,
+  kActivation = 10
+};
+
+enum class TrustPublicationStage : std::uint8_t {
+  kNone = 0,
+  kRootUnbound = 1,
+  kRootBound = 2,
+  kP0 = 3,
+  kP1 = 4,
+  kP2 = 5,
+  kP3 = 6,
+  kP4 = 7,
+  kP5 = 8,
+  kP6 = 9,
+  kP7 = 10,
+  kP8 = 11,
+  kN0 = 12,
+  kN1 = 13,
+  kN2 = 14,
+  kN3 = 15,
+  kN4 = 16,
+  kN5 = 17,
+  kN6 = 18,
+  kN7 = 19,
+  kN8 = 20,
+  kI0 = 21,
+  kI1 = 22,
+  kI2 = 23,
+  kI3 = 24,
+  kS0 = 25,
+  kS1 = 26,
+  kS2 = 27,
+  kS3 = 28
+};
+
+enum class SignatureFamily : std::uint8_t {
+  kTrustTransition = 1,
+  kLineageOrigin = 2,
+  kWithdrawal = 3,
+  kReceipt = 4,
+  kExportAuthorization = 5,
+  kGovernanceContent = 6,
+  kGovernanceReview = 7,
+  kActivationReview = 8
+};
+
+enum class LineageKind : std::uint8_t { kNone = 0, kNative = 1, kImported = 2 };
+
+enum class ServiceStatus : std::uint8_t {
+  kEmpty = 1,
+  kActive = 2,
+  kExportFrozen = 3,
+  kRetired = 4
+};
+
+enum class WithdrawalSubjectKind : std::uint8_t {
+  kProvenance = 1,
+  kLicense = 2,
+  kGoldenFixture = 3,
+  kRegistryEntry = 4,
+  kPolicyPin = 5,
+  kTelemetryGovernance = 6,
+  kActivationAuthorization = 7
+};
+
+enum class TrustRole : std::uint8_t {
+  kProvenanceReviewer = 1,
+  kLicenseReviewer = 2,
+  kGoldenReviewer = 3,
+  kRegistryReviewer = 4,
+  kPolicyReviewer = 5,
+  kTelemetryReviewer = 6,
+  kTrustAdmin = 7
+};
+
+enum class RuntimeMode : std::uint8_t {
+  kDisabled = 1,
+  kRecommendOnly = 2,
+  kShadow = 3,
+  kActivation = 4
+};
+
+enum class ActivationMode : std::uint8_t { kInactive = 1, kActive = 2 };
+
+enum class AdmissionMode : std::uint8_t { kNoModel = 1, kActive = 2 };
+
+enum class PredecessorCurrent : std::uint8_t { kAbsent = 1, kExactBytes = 2 };
+enum class SuccessorDurability : std::uint8_t { kMustCreate = 1, kAlreadyExact = 2 };
+
+enum class FilesystemClass : std::uint8_t {
+  kApfs = 1,
+  kExtFamily = 2,
+  kTmpfs = 3,
+  kUnsupported = 4,
+  kIndeterminate = 5
+};
+
+struct FileIdentity {
+  IdOrNone id;
+  std::string canonical_relative_path;
+  std::uint64_t size_bytes = 0;
+  Sha256Digest sha256{};
+};
+
+struct WriterBoundIdentity {
+  Sha256Digest portable_plan_sha256{};
+  std::uint64_t device = 0;
+  std::uint64_t inode = 0;
+  std::string canonical_path;
+  ProjectId host_id;
+  Sha256Digest writer_bound_sha256{};
+};
+
+struct PortablePublicationPlan {
+  TrustPublicationKind kind = TrustPublicationKind::kOrdinary;
+  IdOrNone status_operation_id;
+  IdOrNone export_operation_id;
+  ProjectId trust_id;
+  IdOrNone transition_id;
+  ProjectId host_id;
+  std::string requested_root_path;
+  std::string binding_record_kind;
+  Sha256Digest new_binding_record_sha256{};
+  std::uint64_t new_binding_record_size = 0;
+  Sha256Digest source_binding_record_sha256{};
+  std::uint64_t source_binding_record_size = 0;
+  std::uint64_t successor_file_size = 0;
+  Sha256Digest successor_file_sha256{};
+  std::optional<ServiceStatus> expected_status;
+  std::optional<ServiceStatus> requested_status;
+  Sha256Digest portable_plan_sha256{};
+};
+
+struct ReleaseDiagnostic {
+  bool lock_un_attempted = false;
+  int lock_un_errno = 0;
+  bool close_attempted = false;
+  int close_errno = 0;
+  bool poisoned = false;
+};
+
+struct TrustPublicationOutcome {
+  TrustPublicationResult result = TrustPublicationResult::kPoisoned;
+  TrustPublicationStage stage = TrustPublicationStage::kNone;
+  ReleaseDiagnostic release{};
+  Sha256Digest operation_identity{};
+  bool bytes_written = false;
+  bool durable_files_may_exist = false;
+};
+
+struct FlockHookResult {
+  int rc = -1;
+  int err_no = 0;
+};
+
+struct CloseHookResult {
+  int rc = -1;
+  int err_no = 0;
+};
+
+struct PublicationHooks {
+  FilesystemClass (*classify)(std::uint64_t device, std::uint64_t inode) = nullptr;
+  FlockHookResult (*flock_op)(int fd, int operation) = nullptr;
+  CloseHookResult (*close_fd)(int fd) = nullptr;
+};
+
+struct WithdrawalRequest {
+  std::string trust_root_path;
+  std::string admission_root_path;
+  std::string evidence_root_path;
+  ProjectId host_id;
+  WithdrawalSubjectKind subject_kind = WithdrawalSubjectKind::kProvenance;
+  ProjectId subject_id;
+  TrustRole signer_role = TrustRole::kProvenanceReviewer;
+  ProjectId signer_key_id;
+  CivilDate effective_date{};
+  std::array<std::uint8_t, 32> public_key{};
+  FileIdentity note;
+  std::string note_bytes;
+  std::array<std::uint8_t, 64> note_signature{};
+  FileIdentity note_signature_record;
+  FileIdentity note_signature_index;
+  FileIdentity note_verification;
+  FileIdentity predecessor;
+  std::uint32_t predecessor_generation = 0;
+  std::uint64_t predecessor_revocation_generation = 0;
+  std::vector<ProjectId> predecessor_tombstones;
+  FileIdentity successor;
+  std::uint32_t successor_generation = 0;
+  std::uint64_t successor_revocation_generation = 0;
+  std::vector<ProjectId> successor_tombstones;
+  FileIdentity transition;
+  FileIdentity lineage_record;
+  FileIdentity registry_entry;
+  std::string successor_bytes;
+  std::string transition_record_bytes;
+  std::array<std::uint8_t, 64> transition_signature{};
+  std::string signature_index_bytes;
+  std::string verification_record_bytes;
+  std::string predecessor_current_bytes;
+  std::string authorization_preimage_bytes;
+};
+
+struct OrdinaryTransitionRequest {
+  std::string trust_root_path;
+  std::string admission_root_path;
+  ProjectId host_id;
+  TrustPublicationKind kind = TrustPublicationKind::kOrdinary;
+  FileIdentity authorization;
+  std::string authorization_preimage_bytes;
+  ProjectId signer_key_id;
+  TrustRole signer_role = TrustRole::kTrustAdmin;
+  CivilDate effective_date{};
+  std::array<std::uint8_t, 32> public_key{};
+  FileIdentity predecessor;
+  std::uint32_t predecessor_generation = 0;
+  std::uint64_t predecessor_revocation_generation = 0;
+  std::vector<ProjectId> predecessor_tombstones;
+  FileIdentity predecessor_registry;
+  FileIdentity successor;
+  std::uint32_t successor_generation = 0;
+  std::uint64_t successor_revocation_generation = 0;
+  std::vector<ProjectId> successor_tombstones;
+  FileIdentity transition;
+  LineageKind lineage_kind = LineageKind::kNone;
+  std::string successor_bytes;
+  std::string transition_record_bytes;
+  std::array<std::uint8_t, 64> transition_signature{};
+  std::string signature_index_bytes;
+  std::string verification_record_bytes;
+  std::string predecessor_current_bytes;
+};
+
+struct ImportedInitializationRequest;
+struct ExportFreezeRequest;
+struct RetirementRequest;
+struct NativeInitializationRequest;
+struct RollbackRequest;
+struct GovernancePinRequest;
+struct ActivationPublicationRequest;
+
+class VerifiedTransitionPlan;
+class VerifiedStatusPlan;
+
+TrustPublicationOutcome publish_verified_transition(VerifiedTransitionPlan&& plan) noexcept;
+TrustPublicationOutcome publish_verified_status(VerifiedStatusPlan&& plan) noexcept;
+TrustPublicationOutcome publish_withdrawal(const WithdrawalRequest&) noexcept;
+TrustPublicationOutcome publish_ordinary_transition(const OrdinaryTransitionRequest&) noexcept;
+TrustPublicationOutcome publish_imported_initialization(const ImportedInitializationRequest&) noexcept;
+TrustPublicationOutcome publish_export_freeze(const ExportFreezeRequest&) noexcept;
+TrustPublicationOutcome publish_retirement(const RetirementRequest&) noexcept;
+TrustPublicationOutcome publish_native_initialization(const NativeInitializationRequest&) noexcept;
+TrustPublicationOutcome publish_rollback(const RollbackRequest&) noexcept;
+TrustPublicationOutcome publish_governance_pin(const GovernancePinRequest&) noexcept;
+TrustPublicationOutcome publish_activation(const ActivationPublicationRequest&) noexcept;
+
+std::optional<TrustPublicationKind> parse_trust_publication_kind(std::string_view) noexcept;
+std::string_view canonical_trust_publication_kind(TrustPublicationKind) noexcept;
+std::optional<SignatureFamily> parse_signature_family(std::string_view) noexcept;
+std::string_view canonical_signature_family(SignatureFamily) noexcept;
+std::optional<LineageKind> parse_lineage_kind(std::string_view) noexcept;
+std::string_view canonical_lineage_kind(LineageKind) noexcept;
+std::optional<ServiceStatus> parse_service_status(std::string_view) noexcept;
+std::string_view canonical_service_status(ServiceStatus) noexcept;
+std::optional<WithdrawalSubjectKind> parse_withdrawal_subject_kind(std::string_view) noexcept;
+std::string_view canonical_withdrawal_subject_kind(WithdrawalSubjectKind) noexcept;
+std::optional<TrustRole> parse_trust_role(std::string_view) noexcept;
+std::string_view canonical_trust_role(TrustRole) noexcept;
+std::optional<RuntimeMode> parse_runtime_mode(std::string_view) noexcept;
+std::string_view canonical_runtime_mode(RuntimeMode) noexcept;
+std::optional<ActivationMode> parse_activation_mode(std::string_view) noexcept;
+std::string_view canonical_activation_mode(ActivationMode) noexcept;
+std::optional<AdmissionMode> parse_admission_mode(std::string_view) noexcept;
+std::string_view canonical_admission_mode(AdmissionMode) noexcept;
+bool project_id_ok(std::string_view) noexcept;
+std::string canonical_sha256(const Sha256Digest&) noexcept;
+bool sha256_from_hex(std::string_view, Sha256Digest&) noexcept;
+
+class VerifiedTransitionPlan {
+ public:
+  VerifiedTransitionPlan() = delete;
+  VerifiedTransitionPlan(const VerifiedTransitionPlan&) = delete;
+  VerifiedTransitionPlan& operator=(const VerifiedTransitionPlan&) = delete;
+  VerifiedTransitionPlan& operator=(VerifiedTransitionPlan&&) = delete;
+
+ private:
+  struct Data {
+    PortablePublicationPlan portable;
+    std::string successor_bytes;
+    std::string transition_record_bytes;
+    std::array<std::uint8_t, 64> signature_blob{};
+    std::string signature_index_bytes;
+    std::string verification_record_bytes;
+    std::string authorization_preimage_bytes;
+    std::array<std::uint8_t, 32> public_key{};
+    std::string lineage_record_bytes;
+    std::array<std::uint8_t, 64> lineage_signature_blob{};
+    std::string lineage_index_bytes;
+    std::string lineage_verification_bytes;
+    PredecessorCurrent predecessor_current = PredecessorCurrent::kExactBytes;
+    std::string predecessor_current_bytes;
+    SuccessorDurability successor_durability = SuccessorDurability::kMustCreate;
+  };
+  Data data_;
+  explicit VerifiedTransitionPlan(Data data) noexcept : data_(std::move(data)) {}
+  VerifiedTransitionPlan(VerifiedTransitionPlan&&) noexcept = default;
+  ~VerifiedTransitionPlan() = default;
+
+  friend TrustPublicationOutcome publish_verified_transition(VerifiedTransitionPlan&&) noexcept;
+  friend TrustPublicationOutcome publish_withdrawal(const WithdrawalRequest&) noexcept;
+  friend TrustPublicationOutcome publish_ordinary_transition(const OrdinaryTransitionRequest&) noexcept;
+  friend TrustPublicationOutcome publish_imported_initialization(
+      const ImportedInitializationRequest&) noexcept;
+  friend TrustPublicationOutcome publish_native_initialization(
+      const NativeInitializationRequest&) noexcept;
+  friend TrustPublicationOutcome publish_rollback(const RollbackRequest&) noexcept;
+  friend TrustPublicationOutcome publish_governance_pin(const GovernancePinRequest&) noexcept;
+  friend TrustPublicationOutcome publish_activation(const ActivationPublicationRequest&) noexcept;
+};
+
+class VerifiedStatusPlan {
+ public:
+  VerifiedStatusPlan() = delete;
+  VerifiedStatusPlan(const VerifiedStatusPlan&) = delete;
+  VerifiedStatusPlan& operator=(const VerifiedStatusPlan&) = delete;
+  VerifiedStatusPlan& operator=(VerifiedStatusPlan&&) = delete;
+
+ private:
+  struct Data {
+    PortablePublicationPlan portable;
+    std::string expected_status_bytes;
+    std::string requested_status_bytes;
+    std::string status_path;
+    std::string status_partial_path;
+    std::string authorization_preimage_bytes;
+    std::string signature_record_bytes;
+    std::array<std::uint8_t, 64> signature_blob{};
+    std::string signature_index_bytes;
+    std::string verification_record_bytes;
+    std::array<std::uint8_t, 32> public_key{};
+    std::string current_bytes;
+    std::string portable_authorization_prefix;
+  };
+  Data data_;
+  explicit VerifiedStatusPlan(Data data) noexcept : data_(std::move(data)) {}
+  VerifiedStatusPlan(VerifiedStatusPlan&&) noexcept = default;
+  ~VerifiedStatusPlan() = default;
+
+  friend TrustPublicationOutcome publish_verified_status(VerifiedStatusPlan&&) noexcept;
+  friend TrustPublicationOutcome publish_export_freeze(const ExportFreezeRequest&) noexcept;
+  friend TrustPublicationOutcome publish_retirement(const RetirementRequest&) noexcept;
+  friend TrustPublicationOutcome publish_native_initialization(
+      const NativeInitializationRequest&) noexcept;
+  friend TrustPublicationOutcome publish_imported_initialization(
+      const ImportedInitializationRequest&) noexcept;
+};
+
+#if defined(INFEREDGE_TRUST_PUBLICATION_TEST_SEAM)
+bool set_publication_hooks_for_test(const PublicationHooks& hooks) noexcept;
+#endif
+
+
+static_assert(!std::is_default_constructible_v<VerifiedTransitionPlan>);
+static_assert(!std::is_copy_constructible_v<VerifiedTransitionPlan>);
+static_assert(!std::is_move_constructible_v<VerifiedTransitionPlan>);
+static_assert(!std::is_move_assignable_v<VerifiedTransitionPlan>);
+static_assert(!std::is_destructible_v<VerifiedTransitionPlan>);
+static_assert(!std::is_default_constructible_v<VerifiedStatusPlan>);
+static_assert(!std::is_copy_constructible_v<VerifiedStatusPlan>);
+static_assert(!std::is_move_constructible_v<VerifiedStatusPlan>);
+static_assert(!std::is_destructible_v<VerifiedStatusPlan>);
+
+}  // namespace inferedge
+
+#endif
+
+```
+
+`include/inferedge/trust_rollback.hpp`
+
+```cpp
+#ifndef INFEREDGE_TRUST_ROLLBACK_HPP
+#define INFEREDGE_TRUST_ROLLBACK_HPP
+
+#include "trust_transition.hpp"
+
+#include <array>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace inferedge {
+
+struct RollbackRequest {
+  std::string trust_root_path;
+  std::string admission_root_path;
+  ProjectId host_id;
+  FileIdentity authorization;
+  std::string authorization_preimage_bytes;
+  std::array<std::uint8_t, 64> transition_signature{};
+  std::array<std::uint8_t, 32> public_key{};
+  ProjectId signer_key_id;
+  TrustRole signer_role = TrustRole::kTrustAdmin;
+  CivilDate effective_date{};
+  FileIdentity predecessor;
+  std::uint32_t predecessor_generation = 0;
+  std::uint64_t predecessor_revocation_generation = 0;
+  std::vector<ProjectId> predecessor_tombstones;
+  FileIdentity successor;
+  std::uint32_t successor_generation = 0;
+  std::uint64_t successor_revocation_generation = 0;
+  std::vector<ProjectId> successor_tombstones;
+  FileIdentity transition;
+  FileIdentity predecessor_registry;
+  FileIdentity successor_registry;
+  FileIdentity predecessor_pin;
+  FileIdentity successor_pin;
+  std::vector<ProjectId> successor_pin_subjects;
+  RuntimeMode predecessor_runtime_mode = RuntimeMode::kDisabled;
+  RuntimeMode successor_runtime_mode = RuntimeMode::kDisabled;
+  AdmissionMode successor_admission_mode = AdmissionMode::kNoModel;
+  ProjectId predecessor_telemetry_governance_id;
+  ProjectId successor_telemetry_governance_id;
+  std::uint64_t successor_telemetry_size = 0;
+  Sha256Digest successor_telemetry_sha256{};
+  std::string successor_bytes;
+  std::string transition_record_bytes;
+  std::string signature_index_bytes;
+  std::string verification_record_bytes;
+  std::string predecessor_current_bytes;
+};
+
+}  // namespace inferedge
+
+#endif
+
+```
+
+`include/inferedge/trust_governance.hpp`
+
+```cpp
+#ifndef INFEREDGE_TRUST_GOVERNANCE_HPP
+#define INFEREDGE_TRUST_GOVERNANCE_HPP
+
+#include "trust_transition.hpp"
+
+#include <array>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace inferedge {
+
+struct GovernancePinRequest {
+  std::string trust_root_path;
+  std::string admission_root_path;
+  std::string evidence_root_path;
+  ProjectId host_id;
+  ProjectId governance_id;
+  FileIdentity governance_content;
+  FileIdentity review_note;
+  FileIdentity review_signature_record;
+  std::array<std::uint8_t, 64> review_signature_blob{};
+  FileIdentity review_signature_index;
+  FileIdentity review_verification;
+  FileIdentity accepted_decision;
+  FileIdentity head_set;
+  std::vector<ProjectId> head_set_members;
+  ProjectId telemetry_governance_id;
+  std::uint64_t telemetry_governance_file_size = 0;
+  Sha256Digest telemetry_governance_file_sha256{};
+  ProjectId signer_key_id;
+  TrustRole signer_role = TrustRole::kTelemetryReviewer;
+  CivilDate effective_date{};
+  std::array<std::uint8_t, 32> public_key{};
+  FileIdentity predecessor;
+  std::uint32_t predecessor_generation = 0;
+  std::uint64_t predecessor_revocation_generation = 0;
+  std::vector<ProjectId> predecessor_tombstones;
+  FileIdentity successor;
+  std::uint32_t successor_generation = 0;
+  FileIdentity transition;
+  std::array<std::uint8_t, 64> transition_signature{};
+  std::string successor_bytes;
+  std::string transition_record_bytes;
+  std::string signature_index_bytes;
+  std::string verification_record_bytes;
+  std::string predecessor_current_bytes;
+  std::string authorization_preimage_bytes;
+};
+
+}  // namespace inferedge
+
+#endif
+
+```
+
+`include/inferedge/trust_activation.hpp`
+
+```cpp
+#ifndef INFEREDGE_TRUST_ACTIVATION_HPP
+#define INFEREDGE_TRUST_ACTIVATION_HPP
+
+#include "trust_transition.hpp"
+
+#include <array>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace inferedge {
+
+struct ActivationPublicationRequest {
+  std::string trust_root_path;
+  std::string admission_root_path;
+  std::string evidence_root_path;
+  ProjectId host_id;
+  FileIdentity activation_authorization;
+  FileIdentity accepted_decision;
+  FileIdentity policy_decision;
+  FileIdentity candidate;
+  FileIdentity dataset_file;
+  FileIdentity invariance_file;
+  ProjectId model_id;
+  FileIdentity head_set;
+  std::vector<ProjectId> head_set_members;
+  RuntimeMode requested_runtime_mode = RuntimeMode::kActivation;
+  ActivationMode requested_activation_mode = ActivationMode::kActive;
+  FileIdentity review_note;
+  FileIdentity review_signature_record;
+  std::array<std::uint8_t, 64> review_signature_blob{};
+  FileIdentity review_signature_index;
+  FileIdentity review_verification;
+  ProjectId signer_key_id;
+  TrustRole signer_role = TrustRole::kPolicyReviewer;
+  CivilDate effective_date{};
+  std::array<std::uint8_t, 32> public_key{};
+  FileIdentity predecessor;
+  std::uint32_t predecessor_generation = 0;
+  std::uint64_t predecessor_revocation_generation = 0;
+  std::vector<ProjectId> predecessor_tombstones;
+  FileIdentity successor;
+  std::uint32_t successor_generation = 0;
+  FileIdentity transition;
+  std::array<std::uint8_t, 64> transition_signature{};
+  std::string successor_bytes;
+  std::string transition_record_bytes;
+  std::string signature_index_bytes;
+  std::string verification_record_bytes;
+  std::string predecessor_current_bytes;
+  std::string authorization_preimage_bytes;
+};
+
+}  // namespace inferedge
+
+#endif
+
+```
+
+`include/inferedge/trust_migration.hpp`
+
+```cpp
+#ifndef INFEREDGE_TRUST_MIGRATION_HPP
+#define INFEREDGE_TRUST_MIGRATION_HPP
+
+#include "trust_transition.hpp"
+
+#include <array>
+#include <cstdint>
+#include <string>
+
+namespace inferedge {
+
+struct ImportedInitializationRequest {
+  std::string destination_trust_root_path;
+  std::string destination_admission_root_path;
+  std::string destination_evidence_root_path;
+  ProjectId destination_host_id;
+  ProjectId migration_id;
+  ProjectId transaction_id;
+  ProjectId nonce_id;
+  FileIdentity package_file;
+  FileIdentity payload_file;
+  FileIdentity transaction_file;
+  FileIdentity imported_successor;
+  FileIdentity imported_transition;
+  FileIdentity lineage_record;
+  FileIdentity lineage_signature;
+  FileIdentity lineage_index;
+  FileIdentity lineage_verification;
+  std::uint64_t prior_high_water = 0;
+  std::uint64_t new_high_water = 0;
+  FileIdentity prior_high_water_file;
+  FileIdentity new_high_water_file;
+  FileIdentity prior_status_file;
+  std::string imported_successor_bytes;
+  std::string empty_status_bytes;
+  std::string active_status_bytes;
+  std::array<std::uint8_t, 32> live_bootstrap_key{};
+  Sha256Digest bootstrap_key_sha256{};
+  ProjectId status_operation_id;
+  FileIdentity source_binding;
+  std::string import_destination_record_bytes;
+};
+
+struct ExportFreezeRequest {
+  std::string source_trust_root_path;
+  std::string source_admission_root_path;
+  std::string source_evidence_root_path;
+  ProjectId source_host_id;
+  FileIdentity source_current;
+  std::string source_current_bytes;
+  std::string expected_active_status_bytes;
+  FileIdentity expected_status_file;
+  ProjectId export_operation_id;
+  std::string authorization_record_bytes;
+  FileIdentity authorization_record;
+  std::string authorization_preimage_bytes;
+  std::string signature_record_bytes;
+  FileIdentity signature_record;
+  std::array<std::uint8_t, 64> signature_blob{};
+  FileIdentity signature_blob_file;
+  std::string signature_index_bytes;
+  FileIdentity signature_index;
+  std::string verification_record_bytes;
+  FileIdentity verification_record;
+  ProjectId registry_entry_id;
+  ProjectId signer_key_id;
+  TrustRole signer_role = TrustRole::kTrustAdmin;
+  CivilDate effective_date{};
+  std::array<std::uint8_t, 32> public_key{};
+  Sha256Digest public_key_sha256{};
+  FileIdentity package_file;
+  std::string export_frozen_status_bytes;
+  ProjectId status_operation_id;
+};
+
+struct RetirementRequest {
+  std::string source_trust_root_path;
+  std::string source_admission_root_path;
+  std::string source_evidence_root_path;
+  ProjectId source_host_id;
+  std::string destination_trust_root_path;
+  std::string destination_admission_root_path;
+  std::string destination_evidence_root_path;
+  ProjectId destination_host_id;
+  FileIdentity source_current;
+  std::string source_current_bytes;
+  std::string expected_export_frozen_status_bytes;
+  FileIdentity expected_status_file;
+  ProjectId migration_id;
+  ProjectId transaction_id;
+  FileIdentity completed_export;
+  ProjectId receipt_id;
+  std::string receipt_record_bytes;
+  FileIdentity receipt_file;
+  std::string receipt_preimage_bytes;
+  std::string signature_record_bytes;
+  FileIdentity signature_record;
+  std::array<std::uint8_t, 64> signature_blob{};
+  FileIdentity signature_blob_file;
+  std::string signature_index_bytes;
+  FileIdentity signature_index;
+  std::string verification_record_bytes;
+  FileIdentity verification_record;
+  ProjectId signer_key_id;
+  TrustRole signer_role = TrustRole::kTrustAdmin;
+  CivilDate effective_date{};
+  std::array<std::uint8_t, 32> public_key{};
+  Sha256Digest public_key_sha256{};
+  std::string retired_status_bytes;
+  ProjectId status_operation_id;
+};
+
+}  // namespace inferedge
+
+#endif
+
+```
+
+`include/inferedge/trust_service.hpp`
+
+```cpp
+#ifndef INFEREDGE_TRUST_SERVICE_HPP
+#define INFEREDGE_TRUST_SERVICE_HPP
+
+#include "trust_transition.hpp"
+
+#include <array>
+#include <cstdint>
+#include <span>
+#include <string>
+
+namespace inferedge {
+
+class NativeBootstrapSigner {
+ public:
+  virtual ~NativeBootstrapSigner() = default;
+  virtual bool sign(std::span<const std::uint8_t> message,
+                    std::array<std::uint8_t, 64>& out) noexcept = 0;
+};
+
+struct NativeInitializationRequest {
+  std::string trust_root_path;
+  std::string admission_root_path;
+  std::string evidence_root_path;
+  ProjectId host_id;
+  NativeBootstrapSigner* signer = nullptr;
+  std::array<std::uint8_t, 32> bootstrap_public_key{};
+  Sha256Digest bootstrap_key_sha256{};
+  FileIdentity bootstrap_key_file;
+  FileIdentity generation1_successor;
+  std::uint32_t generation = 1;
+  CivilDate effective_date{};
+  FileIdentity genesis_transition;
+  std::string generation1_bytes;
+  std::string genesis_transition_bytes;
+  std::string genesis_index_bytes;
+  std::string genesis_verification_bytes;
+  std::array<std::uint8_t, 64> genesis_signature{};
+  FileIdentity configuration_file;
+  FileIdentity registry_file;
+  FileIdentity revocation_file;
+  FileIdentity manifest_file;
+  std::string lineage_record_bytes;
+  std::string lineage_index_bytes;
+  std::string lineage_verification_bytes;
+  std::array<std::uint8_t, 64> lineage_signature{};
+  std::string empty_status_bytes;
+  std::string active_status_bytes;
+  ProjectId status_operation_id;
+};
+
+}  // namespace inferedge
+
+#endif
+
+```
 
 `telemetry_governance` keys: `schema_version`, `record_kind`, `governance_id`, `collection_allowed`, `export_allowed`, `allow_ineligible`, `record_sha256`. `export_allowed` is `no`. Path: `admission/governance/governance-<id>.record`. The governance file is the `governance-signature-<governance-id>` target. The governance review note is a separate signed note. Producer is 9-C39. Consumer is 9-C40. A governance signature uses the terminal `effective_date` after the publishing transition is current, and the transition that pins it uses that transition's `transition_date`.
 
@@ -1351,6 +2502,6 @@ After an independent audit accepts this Part I, phase 9-C1 may create exactly `d
 
 ## 48. Roadmap through Phase 9-C44
 
-Section 2 is the roadmap. Correctness precedes performance. Invariance precedes dataset acceptance, training documentation, and activation. Governance precedes any log. Recommend-only precedes shadow. Shadow precedes activation. Withdrawal fixtures and rollback tests precede activation. Campaign 001 is not an input. Campaign 002 is not a phase.
+Section 2 is the roadmap. Erratum E2 section 14 is contract text only. This artifact does not authorize applying it, creating publication sources, staging, or release. Correctness precedes performance. Invariance precedes dataset acceptance, training documentation, and activation. Governance precedes any log. Recommend-only precedes shadow. Shadow precedes activation. Withdrawal fixtures and rollback tests precede activation. Campaign 001 is not an input. Campaign 002 is not a phase.
 
 
