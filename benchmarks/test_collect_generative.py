@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import gc
 import io
 import json
@@ -948,6 +949,20 @@ if behavior == "launch_fail":
 
 pid = os.getpid()
 worker_id = f"{impl[0:2]}-{pid}"
+non_shutdown_requests = 0
+ready_path = ""
+if "--ready-path" in sys.argv:
+    ready_path = sys.argv[sys.argv.index("--ready-path") + 1]
+if behavior == "stderr_exit_before_read":
+    os.close(0)
+    if ready_path:
+        with open(ready_path, "w", encoding="utf-8") as handle:
+            handle.write("ready")
+    time.sleep(0.5)
+    raise SystemExit(0)
+if ready_path:
+    with open(ready_path, "w", encoding="utf-8") as handle:
+        handle.write("ready")
 for raw in sys.stdin:
     line = raw.strip()
     if not line:
@@ -956,6 +971,122 @@ for raw in sys.stdin:
     op = req.get("op")
     if delay_s > 0 and (not delay_op or req.get("op") == delay_op):
         time.sleep(delay_s)
+    if behavior == "stderr_exit_4":
+        raise SystemExit(4)
+    cap = 1048576
+
+    def flood(count, step=65536):
+        left = count
+        while left:
+            take = min(step, left)
+            sys.stderr.buffer.write(b"e" * take)
+            left -= take
+        sys.stderr.buffer.flush()
+
+    def emit_identity():
+        emit({"ok": True, "implementation": impl, "worker_instance_id": worker_id, "pid": pid, "evidence_path_contract": "generative-overhead-r7-inventory-v1"})
+
+    if behavior == "stderr_exact_cap":
+        if op == "shutdown":
+            break
+        flood(cap)
+        emit_identity()
+        continue
+    if behavior == "stderr_one_over":
+        if op == "shutdown":
+            break
+        flood(cap + 1)
+        emit_identity()
+        continue
+    if behavior == "stderr_over_before_stdout":
+        if op == "shutdown":
+            break
+        flood(cap + 8)
+        emit_identity()
+        continue
+    if behavior == "stderr_many_small":
+        if op == "shutdown":
+            break
+        flood(cap + 8, 64)
+        emit_identity()
+        continue
+    if behavior == "stderr_one_large":
+        if op == "shutdown":
+            break
+        sys.stderr.buffer.write(b"e" * (cap + 8))
+        sys.stderr.buffer.flush()
+        emit_identity()
+        continue
+    if behavior == "stderr_second_request_overflow":
+        if op == "shutdown":
+            break
+        non_shutdown_requests += 1
+        if non_shutdown_requests == 1:
+            emit_identity()
+            continue
+        flood(cap + 8)
+        emit_identity()
+        continue
+    if behavior == "stderr_invalid_utf8_under_cap":
+        if op == "shutdown":
+            break
+        sys.stderr.buffer.write(b"\xff")
+        sys.stderr.buffer.flush()
+        emit_identity()
+        continue
+    if behavior == "stderr_empty":
+        if op == "shutdown":
+            break
+        emit_identity()
+        continue
+    if behavior == "stderr_two_parts":
+        if op == "shutdown":
+            break
+        flood(600000)
+        emit_identity()
+        continue
+    if behavior.startswith("stderr_close_"):
+        if op != "shutdown":
+            emit_identity()
+            continue
+        if behavior == "stderr_close_over":
+            flood(cap + 8)
+            raise SystemExit(0)
+        if behavior == "stderr_close_exact":
+            flood(cap)
+            raise SystemExit(0)
+        if behavior == "stderr_close_one":
+            flood(cap + 1)
+            raise SystemExit(0)
+        if behavior == "stderr_close_under":
+            flood(100)
+            raise SystemExit(0)
+        if behavior == "stderr_close_eof":
+            raise SystemExit(0)
+        if behavior in {"stderr_close_term", "stderr_close_kill"}:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            flood(cap + 8)
+            while True:
+                time.sleep(30)
+        if behavior == "stderr_close_descendant":
+            child = os.fork()
+            if child == 0:
+                flood(cap + 8)
+                raise SystemExit(0)
+            raise SystemExit(0)
+        if behavior == "stderr_close_escaped":
+            marker = sys.argv[sys.argv.index("--escaped-pid") + 1]
+            child = os.fork()
+            if child == 0:
+                os.setsid()
+                with open(marker, "w", encoding="utf-8") as handle:
+                    handle.write(str(os.getpid()))
+                while True:
+                    time.sleep(30)
+            deadline = time.time() + 2
+            while not os.path.exists(marker) and time.time() < deadline:
+                time.sleep(0.01)
+            raise SystemExit(0)
     if behavior == "timeout":
         time.sleep(5)
     if behavior == "just_above":
@@ -1693,22 +1824,23 @@ class WorkerTimeoutPolicyTests(unittest.TestCase):
                 shutdown_kill_s=0.05,
             )
             worker.request({"op": "identity"})
+            assert worker.process is not None
+            owned = worker.process
             with mock.patch.object(collect, "_signal_owned", side_effect=lambda *_args, **_kwargs: None):
                 with mock.patch.object(collect, "_process_group_exists", return_value=True):
                     with self.assertRaises(CollectorError) as caught:
                         worker.close()
                     self.assertEqual(caught.exception.message, "worker shutdown timeout")
-            if worker.process is not None:
-                try:
-                    os.killpg(worker.process.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
-                try:
-                    worker.process.wait(timeout=1)
-                except Exception:
-                    pass
-                collect._close_process_pipes(worker.process)
-                worker.process = None
+            self.assertIsNone(worker.process)
+            self.assertTrue(worker.pipes_closed)
+            try:
+                os.kill(owned.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            try:
+                owned.wait(timeout=1)
+            except Exception:
+                pass
 
     def test_partial_stdout_then_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2239,25 +2371,26 @@ class WorkerShutdownOwnershipTests(unittest.TestCase):
                 self.assertIsNone(worker.process)
                 self.assertTrue(worker.pending_empty())
 
-    def test_shutdown_timeout_retains_handle(self) -> None:
+    def test_shutdown_timeout_closes_pipes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["FAKE_WORKER_IGNORE_TERM"] = "1"
             os.environ["FAKE_WORKER_IGNORE_SHUTDOWN"] = "1"
             worker = self._worker(Path(tmp), shutdown_grace_s=0.05, shutdown_term_s=0.05, shutdown_kill_s=0.05)
             identity = worker.request({"op": "identity"})
             self.assertTrue(identity["ok"])
+            assert worker.process is not None
+            owned = worker.process
             with mock.patch.object(collect, "_signal_owned", side_effect=lambda *_args, **_kwargs: None):
                 with mock.patch.object(collect, "_process_group_exists", return_value=True):
                     with self.assertRaises(CollectorError) as caught:
                         worker.close()
                     self.assertEqual(caught.exception.message, "worker shutdown timeout")
-            self.assertIsNotNone(worker.process)
+            self.assertIsNone(worker.process)
+            self.assertTrue(worker.pipes_closed)
             self.assertIsNotNone(worker.cleanup_error)
-            pid = worker.process.pid
-            os.kill(pid, signal.SIGKILL)
-            worker.process.wait(timeout=1)
-            collect._close_process_pipes(worker.process)
-            worker.process = None
+            self.assertEqual(worker.cleanup_error.message, "worker shutdown timeout")
+            os.kill(owned.pid, signal.SIGKILL)
+            owned.wait(timeout=1)
 
     def test_request_timeout_preserves_primary_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2426,6 +2559,697 @@ class WorkerResourceAndFdTests(unittest.TestCase):
                 recorded.extend(caught)
             resource = [item for item in recorded if issubclass(item.category, ResourceWarning)]
             self.assertEqual(resource, [])
+
+
+class StderrCapTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.pids: list[int] = []
+        self.escaped: list[int] = []
+        self._threads = [thread for thread in threading.enumerate() if thread.is_alive()]
+
+    def tearDown(self) -> None:
+        for pid in self.pids + self.escaped:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except (ChildProcessError, OSError):
+                pass
+        deadline = time.monotonic() + 1
+        for pid in self.pids + self.escaped:
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail(f"worker survived {pid}")
+        os.environ.pop("FAKE_WORKER_BEHAVIOR", None)
+        collect.WorkerSession.popen_impl = staticmethod(subprocess.Popen)
+        extra = [
+            thread
+            for thread in threading.enumerate()
+            if thread.is_alive() and thread not in self._threads and thread is not threading.current_thread()
+        ]
+        for thread in extra:
+            thread.join(1)
+        still = [thread for thread in extra if thread.is_alive()]
+        self.assertEqual(still, [])
+
+    def _session(self, root: Path, behavior: str, **kwargs: object) -> collect.WorkerSession:
+        harness = CollectHarness(root, behavior=behavior)
+        os.environ["FAKE_WORKER_BEHAVIOR"] = behavior
+        kwargs.setdefault("request_timeout_s", 2.0)
+        kwargs.setdefault("shutdown_grace_s", 0.4)
+        kwargs.setdefault("shutdown_term_s", 0.2)
+        kwargs.setdefault("shutdown_kill_s", 0.4)
+        argv = [str(harness.ie), "--worker-stdio", "--package", str(harness.package), "--ready-path", str(root / "worker-ready")]
+        escaped = root / "escaped.pid"
+        if behavior == "stderr_close_escaped":
+            argv.extend(["--escaped-pid", str(escaped)])
+        worker = collect.WorkerSession(harness.ie, argv, "inferedge", **kwargs)
+        if worker.process is not None:
+            self.pids.append(worker.process.pid)
+        return worker
+
+    def _assert_overflow(self, exc: CollectorError, worker: collect.WorkerSession) -> None:
+        self.assertEqual(exc.code, "record_schema_invalid")
+        self.assertEqual(exc.message, "oversized stderr")
+        self.assertGreater(worker.stderr_total, collect.MAX_WORKER_STDERR_BYTES)
+        self.assertEqual(len(worker.stderr_bytes), collect.MAX_WORKER_STDERR_BYTES)
+        self.assertTrue(worker.stderr_overflow)
+
+    def _assert_closed(self, worker: collect.WorkerSession, pid: int) -> None:
+        self.assertIsNone(worker.process)
+        self.assertTrue(worker.pipes_closed)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(pid, 0)
+
+    def _wait_ready(self, root: Path, budget_s: float = 2.0) -> None:
+        ready = root / "worker-ready"
+        deadline = time.monotonic() + budget_s
+        while time.monotonic() < deadline:
+            if ready.exists():
+                return
+            time.sleep(0.01)
+        self.fail("worker did not become ready")
+
+    def _request_overflow(self, behavior: str, **kwargs: object) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worker = self._session(root, behavior, **kwargs)
+            assert worker.process is not None
+            pid = worker.process.pid
+            try:
+                self._wait_ready(root)
+                with self.assertRaises(CollectorError) as caught:
+                    worker.request({"op": "identity"})
+                self._assert_overflow(caught.exception, worker)
+                self.assertTrue(worker.stderr_overflow_reported)
+                worker.close()
+                self._assert_closed(worker, pid)
+            finally:
+                if worker.process is not None:
+                    try:
+                        worker.close()
+                    except CollectorError:
+                        pass
+
+    def test_exact_cap_is_legal_and_shutdown_adds_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "stderr_exact_cap")
+            assert worker.process is not None
+            pid = worker.process.pid
+            document = worker.request({"op": "identity"})
+            self.assertTrue(document["ok"])
+            self.assertEqual(worker.stderr_total, 1048576)
+            self.assertEqual(len(worker.stderr_bytes), 1048576)
+            self.assertFalse(worker.stderr_overflow)
+            self.assertFalse(worker.stderr_overflow_reported)
+            worker.close()
+            self.assertEqual(worker.stderr_total, 1048576)
+            self.assertFalse(worker.stderr_overflow)
+            self.assertTrue(worker.stderr_at_eof)
+            self._assert_closed(worker, pid)
+            worker.close()
+
+    def test_one_byte_over_request(self) -> None:
+        self._request_overflow("stderr_one_over")
+
+    def test_eight_bytes_over_after_stdout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worker = self._session(root, "oversized_stderr", request_timeout_s=0.1)
+            assert worker.process is not None
+            pid = worker.process.pid
+            self._wait_ready(root)
+            saw: CollectorError | None = None
+            try:
+                worker.request({"op": "identity"})
+            except CollectorError as exc:
+                saw = exc
+            if saw is None:
+                with self.assertRaises(CollectorError) as caught:
+                    worker.close()
+                saw = caught.exception
+            else:
+                worker.close()
+            self._assert_overflow(saw, worker)
+            self._assert_closed(worker, pid)
+
+    def test_overflow_before_stdout(self) -> None:
+        self._request_overflow("stderr_over_before_stdout", request_timeout_s=0.1)
+
+    def test_many_short_writes(self) -> None:
+        self._request_overflow("stderr_many_small", request_timeout_s=0.5)
+
+    def test_one_large_write(self) -> None:
+        self._request_overflow("stderr_one_large", request_timeout_s=0.5)
+
+    def test_second_request_overflow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "stderr_second_request_overflow")
+            assert worker.process is not None
+            pid = worker.process.pid
+            first = worker.request({"op": "identity"})
+            self.assertTrue(first["ok"])
+            self.assertEqual(worker.stderr_total, 0)
+            self.assertFalse(worker.stderr_overflow)
+            with self.assertRaises(CollectorError) as caught:
+                worker.request({"op": "load"})
+            self._assert_overflow(caught.exception, worker)
+            worker.close()
+            self._assert_closed(worker, pid)
+
+    def test_cumulative_split_across_responses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "stderr_two_parts")
+            assert worker.process is not None
+            pid = worker.process.pid
+            first = worker.request({"op": "identity"})
+            self.assertTrue(first["ok"])
+            self.assertEqual(worker.stderr_total, 600000)
+            self.assertEqual(len(worker.stderr_bytes), 600000)
+            self.assertFalse(worker.stderr_overflow)
+            with self.assertRaises(CollectorError) as caught:
+                worker.request({"op": "load"})
+            self._assert_overflow(caught.exception, worker)
+            self.assertGreater(worker.stderr_total, 1048576)
+            worker.close()
+            self._assert_closed(worker, pid)
+
+    def test_under_cap_invalid_utf8_stderr_is_not_utf8_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "stderr_invalid_utf8_under_cap")
+            assert worker.process is not None
+            pid = worker.process.pid
+            document = worker.request({"op": "identity"})
+            self.assertTrue(document["ok"])
+            self.assertEqual(worker.stderr_total, 1)
+            self.assertEqual(bytes(worker.stderr_bytes), b"\xff")
+            self.assertFalse(worker.stderr_overflow)
+            worker.close()
+            self._assert_closed(worker, pid)
+
+    def test_empty_stderr_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "stderr_empty")
+            assert worker.process is not None
+            pid = worker.process.pid
+            document = worker.request({"op": "identity"})
+            self.assertTrue(document["ok"])
+            self.assertEqual(worker.stderr_total, 0)
+            worker.close()
+            self.assertTrue(worker.stderr_at_eof)
+            self.assertFalse(worker.stderr_overflow)
+            self._assert_closed(worker, pid)
+
+    def test_close_exact_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "stderr_close_exact")
+            assert worker.process is not None
+            pid = worker.process.pid
+            self.assertTrue(worker.request({"op": "identity"})["ok"])
+            worker.close()
+            self.assertEqual(worker.stderr_total, 1048576)
+            self.assertFalse(worker.stderr_overflow)
+            self.assertTrue(worker.stderr_at_eof)
+            self._assert_closed(worker, pid)
+
+    def test_close_one_byte_over(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "stderr_close_one")
+            assert worker.process is not None
+            pid = worker.process.pid
+            self.assertTrue(worker.request({"op": "identity"})["ok"])
+            with self.assertRaises(CollectorError) as caught:
+                worker.close()
+            self._assert_overflow(caught.exception, worker)
+            self.assertTrue(worker.stderr_overflow_reported)
+            self._assert_closed(worker, pid)
+
+    def test_close_overflow_after_shutdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "stderr_close_over")
+            assert worker.process is not None
+            pid = worker.process.pid
+            self.assertTrue(worker.request({"op": "identity"})["ok"])
+            with self.assertRaises(CollectorError) as caught:
+                worker.close()
+            self._assert_overflow(caught.exception, worker)
+            self._assert_closed(worker, pid)
+
+    def test_close_under_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "stderr_close_under")
+            assert worker.process is not None
+            pid = worker.process.pid
+            self.assertTrue(worker.request({"op": "identity"})["ok"])
+            worker.close()
+            self.assertEqual(worker.stderr_total, 100)
+            self.assertFalse(worker.stderr_overflow)
+            self.assertTrue(worker.stderr_at_eof)
+            self._assert_closed(worker, pid)
+
+    def test_close_eof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "stderr_close_eof")
+            assert worker.process is not None
+            pid = worker.process.pid
+            self.assertTrue(worker.request({"op": "identity"})["ok"])
+            worker.close()
+            self.assertEqual(worker.stderr_total, 0)
+            self.assertTrue(worker.stderr_at_eof)
+            self._assert_closed(worker, pid)
+            worker.close()
+
+    def test_close_ignores_sigterm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(
+                Path(tmp),
+                "stderr_close_term",
+                shutdown_grace_s=0.15,
+                shutdown_term_s=0.15,
+                shutdown_kill_s=0.4,
+            )
+            assert worker.process is not None
+            pid = worker.process.pid
+            self.assertTrue(worker.request({"op": "identity"})["ok"])
+            with self.assertRaises(CollectorError) as caught:
+                worker.close()
+            self._assert_overflow(caught.exception, worker)
+            self._assert_closed(worker, pid)
+
+    def test_close_requires_sigkill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(
+                Path(tmp),
+                "stderr_close_kill",
+                shutdown_grace_s=0.15,
+                shutdown_term_s=0.15,
+                shutdown_kill_s=0.4,
+            )
+            assert worker.process is not None
+            pid = worker.process.pid
+            self.assertTrue(worker.request({"op": "identity"})["ok"])
+            with self.assertRaises(CollectorError) as caught:
+                worker.close()
+            self._assert_overflow(caught.exception, worker)
+            self._assert_closed(worker, pid)
+
+    def test_in_group_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "stderr_close_descendant")
+            assert worker.process is not None
+            pid = worker.process.pid
+            self.assertTrue(worker.request({"op": "identity"})["ok"])
+            with self.assertRaises(CollectorError) as caught:
+                worker.close()
+            self._assert_overflow(caught.exception, worker)
+            self._assert_closed(worker, pid)
+
+    def test_escaped_holder_is_not_success_and_is_killed_by_the_test(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worker = self._session(root, "stderr_close_escaped", shutdown_kill_s=0.2, shutdown_grace_s=0.2)
+            assert worker.process is not None
+            pid = worker.process.pid
+            self.assertTrue(worker.request({"op": "identity"})["ok"])
+            with self.assertRaises(CollectorError) as caught:
+                worker.close()
+            self.assertEqual(caught.exception.code, "environment_command_failed")
+            self.assertEqual(caught.exception.message, "worker stderr still open")
+            self.assertFalse(worker.stderr_overflow)
+            self.assertTrue(worker.stderr_inherited_open)
+            self.assertIsNone(worker.process)
+            self.assertTrue(worker.pipes_closed)
+            marker = root / "escaped.pid"
+            self.assertTrue(marker.exists())
+            escaped = int(marker.read_text(encoding="utf-8"))
+            self.escaped.append(escaped)
+            os.kill(escaped, signal.SIGKILL)
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(escaped, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.01)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(escaped, 0)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_already_reported_close_does_not_raise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "stderr_one_over")
+            assert worker.process is not None
+            pid = worker.process.pid
+            with self.assertRaises(CollectorError):
+                worker.request({"op": "identity"})
+            self.assertTrue(worker.stderr_overflow_reported)
+            worker.close()
+            self._assert_closed(worker, pid)
+
+    def test_active_timeout_preserves_primary_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "timeout", request_timeout_s=0.15, shutdown_grace_s=0.1, shutdown_term_s=0.1, shutdown_kill_s=0.3)
+            assert worker.process is not None
+            pid = worker.process.pid
+            started = time.monotonic()
+            with self.assertRaises(CollectorError) as caught:
+                try:
+                    worker.request({"op": "identity"})
+                finally:
+                    worker.close()
+            self.assertLess(time.monotonic() - started, 2.0)
+            self.assertEqual(caught.exception.code, "environment_command_failed")
+            self.assertEqual(caught.exception.message, "worker request timeout")
+            self._assert_closed(worker, pid)
+
+    def test_campaign_finally_discards_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "stderr_close_over")
+            assert worker.process is not None
+            pid = worker.process.pid
+
+            def caller() -> dict[str, str]:
+                try:
+                    worker.request({"op": "identity"})
+                    return {"status": "complete"}
+                finally:
+                    worker.close()
+
+            with self.assertRaises(CollectorError) as caught:
+                caller()
+            self.assertEqual(caught.exception.code, "record_schema_invalid")
+            self.assertEqual(caught.exception.message, "oversized stderr")
+            self._assert_closed(worker, pid)
+
+    def test_launch_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = CollectHarness(Path(tmp))
+
+            def boom(*_args: object, **_kwargs: object) -> subprocess.Popen[bytes]:
+                raise OSError(errno.ENOENT, "missing")
+
+            collect.WorkerSession.popen_impl = staticmethod(boom)
+            with self.assertRaises(CollectorError) as caught:
+                collect.WorkerSession(harness.ie, [str(harness.ie), "--worker-stdio"], "inferedge")
+            self.assertEqual(caught.exception.code, "environment_command_failed")
+            self.assertTrue(caught.exception.message.startswith("worker launch failed:"))
+
+    def test_nonblocking_setup_failure_reaps_without_blocking_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            harness = CollectHarness(root, behavior="ok")
+            os.environ["FAKE_WORKER_BEHAVIOR"] = "ok"
+            seen: list[int] = []
+            real_popen = subprocess.Popen
+
+            def tracking(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+                process = real_popen(*args, **kwargs)
+                seen.append(process.pid)
+                self.pids.append(process.pid)
+                return process
+
+            collect.WorkerSession.popen_impl = staticmethod(tracking)
+            with mock.patch("os.set_blocking", side_effect=OSError(errno.EIO, "nb")):
+                with self.assertRaises(CollectorError) as caught:
+                    collect.WorkerSession(
+                        harness.ie,
+                        [str(harness.ie), "--worker-stdio", "--package", str(harness.package)],
+                        "inferedge",
+                        shutdown_grace_s=0.2,
+                        shutdown_term_s=0.2,
+                        shutdown_kill_s=0.4,
+                    )
+            self.assertEqual(caught.exception.code, "environment_command_failed")
+            self.assertTrue(caught.exception.message.startswith("worker stderr nonblocking failed:"))
+            self.assertEqual(len(seen), 1)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(seen[0], 0)
+
+    def test_malformed_stdout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "malformed", request_timeout_s=0.4)
+            assert worker.process is not None
+            pid = worker.process.pid
+            with self.assertRaises(CollectorError) as caught:
+                worker.request({"op": "identity"})
+            self.assertEqual(caught.exception.code, "record_schema_invalid")
+            self.assertEqual(caught.exception.message, "json decode failed")
+            worker.close()
+            self._assert_closed(worker, pid)
+
+    def test_broken_pipe_before_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worker = self._session(root, "stderr_exit_before_read", request_timeout_s=0.4)
+            assert worker.process is not None
+            pid = worker.process.pid
+            self._wait_ready(root)
+            try:
+                with self.assertRaises(CollectorError) as caught:
+                    worker.request({"op": "identity"})
+                self.assertEqual(caught.exception.code, "environment_command_failed")
+                self.assertEqual(caught.exception.message, "broken pipe")
+                worker.close()
+                self._assert_closed(worker, pid)
+            finally:
+                if worker.process is not None:
+                    try:
+                        worker.close()
+                    except CollectorError:
+                        pass
+
+    def test_signal_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "signal", request_timeout_s=0.4)
+            assert worker.process is not None
+            pid = worker.process.pid
+            with self.assertRaises(CollectorError) as caught:
+                worker.request({"op": "identity"})
+            self.assertEqual(caught.exception.code, "environment_command_failed")
+            self.assertEqual(caught.exception.message, "worker signal exit 15")
+            worker.close()
+            self._assert_closed(worker, pid)
+
+    def test_nonzero_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "stderr_exit_4", request_timeout_s=0.4)
+            assert worker.process is not None
+            pid = worker.process.pid
+            with self.assertRaises(CollectorError) as caught:
+                worker.request({"op": "identity"})
+            self.assertEqual(caught.exception.code, "environment_command_failed")
+            self.assertEqual(caught.exception.message, "worker nonzero exit 4")
+            worker.close()
+            self._assert_closed(worker, pid)
+
+    def test_injected_reap_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "stderr_empty", shutdown_grace_s=0.1, shutdown_term_s=0.1, shutdown_kill_s=0.2)
+            assert worker.process is not None
+            pid = worker.process.pid
+            self.assertTrue(worker.request({"op": "identity"})["ok"])
+            real = collect.reap_owned_process
+
+            def lying(*args: object, **kwargs: object) -> bool:
+                real(*args, **kwargs)  # type: ignore[arg-type]
+                return False
+
+            with mock.patch.object(collect, "reap_owned_process", side_effect=lying):
+                with self.assertRaises(CollectorError) as caught:
+                    worker.close()
+            self.assertEqual(caught.exception.code, "environment_command_failed")
+            self.assertEqual(caught.exception.message, "worker shutdown timeout")
+            self.assertIsNotNone(worker.cleanup_error)
+            self.assertEqual(worker.cleanup_error.message, "worker shutdown timeout")
+            self._assert_closed(worker, pid)
+
+    def test_injected_reap_failure_does_not_hide_overflow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "stderr_close_over")
+            assert worker.process is not None
+            pid = worker.process.pid
+            self.assertTrue(worker.request({"op": "identity"})["ok"])
+            real = collect.reap_owned_process
+
+            def lying(*args: object, **kwargs: object) -> bool:
+                real(*args, **kwargs)  # type: ignore[arg-type]
+                return False
+
+            with mock.patch.object(collect, "reap_owned_process", side_effect=lying):
+                with self.assertRaises(CollectorError) as caught:
+                    worker.close()
+            self._assert_overflow(caught.exception, worker)
+            self.assertIsNotNone(worker.cleanup_error)
+            self.assertEqual(worker.cleanup_error.message, "worker shutdown timeout")
+            self._assert_closed(worker, pid)
+
+    def test_stderr_read_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(Path(tmp), "stderr_empty")
+            assert worker.process is not None
+            pid = worker.process.pid
+            self.assertTrue(worker.request({"op": "identity"})["ok"])
+            assert worker.process is not None and worker.process.stderr is not None
+            stderr_fd = worker.process.stderr.fileno()
+            real_read = os.read
+
+            def wrapped(fd: int, size: int) -> bytes:
+                if fd == stderr_fd:
+                    raise OSError(errno.EIO, "injected")
+                return real_read(fd, size)
+
+            with mock.patch("os.read", side_effect=wrapped):
+                with self.assertRaises(CollectorError) as caught:
+                    worker.close()
+            self.assertEqual(caught.exception.code, "environment_command_failed")
+            self.assertEqual(caught.exception.message, f"worker stderr read failed: {errno.EIO}")
+            self._assert_closed(worker, pid)
+
+    def test_stderr_cap_is_deterministic_under_contention(self) -> None:
+        for _repetition in range(3):
+            self._contention_request_sequential()
+            self._contention_request_overlap(False)
+            self._contention_request_overlap(True)
+            self._contention_close_sequential()
+            self._contention_close_overlap(False)
+            self._contention_close_overlap(True)
+
+    def _one_request_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(
+                Path(tmp),
+                "oversized_stderr",
+                request_timeout_s=0.1,
+                shutdown_grace_s=0.4,
+                shutdown_term_s=0.15,
+                shutdown_kill_s=0.3,
+            )
+            assert worker.process is not None
+            pid = worker.process.pid
+            try:
+                self._wait_ready(Path(tmp))
+                saw: CollectorError | None = None
+                try:
+                    worker.request({"op": "identity"})
+                except CollectorError as exc:
+                    saw = exc
+                try:
+                    worker.close()
+                except CollectorError as exc:
+                    if saw is None:
+                        saw = exc
+                self.assertIsNotNone(saw)
+                assert saw is not None
+                self.assertEqual(saw.code, "record_schema_invalid")
+                self.assertEqual(saw.message, "oversized stderr")
+                self.assertIsNone(worker.process)
+                self.assertTrue(worker.pipes_closed)
+                self._assert_closed(worker, pid)
+            finally:
+                if worker.process is not None:
+                    worker.close()
+
+    def _one_close_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._session(
+                Path(tmp),
+                "stderr_close_over",
+                shutdown_grace_s=1.0,
+                shutdown_term_s=0.5,
+                shutdown_kill_s=0.5,
+            )
+            assert worker.process is not None
+            pid = worker.process.pid
+            try:
+                self.assertTrue(worker.request({"op": "identity"})["ok"])
+                with self.assertRaises(CollectorError) as caught:
+                    worker.close()
+                self.assertEqual(caught.exception.code, "record_schema_invalid", worker.stderr_total)
+                self.assertEqual(caught.exception.message, "oversized stderr")
+                self._assert_closed(worker, pid)
+            finally:
+                if worker.process is not None:
+                    worker.close()
+
+    def _run_bounded(self, workers: list[threading.Thread], burn: list[threading.Thread], stop: threading.Event) -> None:
+        started = time.monotonic()
+        for thread in burn:
+            thread.start()
+        for thread in workers:
+            thread.start()
+        deadline = started + 60
+        for thread in workers:
+            remaining = deadline - time.monotonic()
+            thread.join(max(0.0, remaining))
+        stop.set()
+        for thread in burn:
+            thread.join(1)
+        self.assertLess(time.monotonic() - started, 60)
+        self.assertTrue(all(not thread.is_alive() for thread in workers + burn))
+
+    def _contention_request_sequential(self) -> None:
+        started = time.monotonic()
+        for _ in range(20):
+            self._one_request_session()
+        self.assertLess(time.monotonic() - started, 60)
+
+    def _contention_close_sequential(self) -> None:
+        started = time.monotonic()
+        for _ in range(20):
+            self._one_close_session()
+        self.assertLess(time.monotonic() - started, 60)
+
+    def _contention_request_overlap(self, cpu: bool) -> None:
+        errors: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                self._one_request_session()
+            except BaseException as exc:
+                errors.append(exc)
+
+        stop = threading.Event()
+
+        def burn() -> None:
+            value = 0
+            while not stop.is_set():
+                value = (value + 1) % 1000003
+
+        workers = [threading.Thread(target=run) for _ in range(8)]
+        burners = [threading.Thread(target=burn) for _ in range(4)] if cpu else []
+        self._run_bounded(workers, burners, stop)
+        self.assertEqual(errors, [])
+
+    def _contention_close_overlap(self, cpu: bool) -> None:
+        errors: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                self._one_close_session()
+            except BaseException as exc:
+                errors.append(exc)
+
+        stop = threading.Event()
+
+        def burn() -> None:
+            value = 0
+            while not stop.is_set():
+                value = (value + 1) % 1000003
+
+        workers = [threading.Thread(target=run) for _ in range(8)]
+        burners = [threading.Thread(target=burn) for _ in range(4)] if cpu else []
+        self._run_bounded(workers, burners, stop)
+        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":

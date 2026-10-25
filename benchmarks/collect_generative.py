@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import errno
 import hashlib
 import json
 import math
@@ -143,6 +144,7 @@ WORKER_REQUEST_TIMEOUT_S = 300.0
 WORKER_SHUTDOWN_GRACE_S = 1.0
 WORKER_SHUTDOWN_TERM_S = 1.0
 WORKER_SHUTDOWN_KILL_S = 2.0
+REAP_SLICE_S = 0.05
 ENVIRONMENT_COMMAND_TIMEOUT_S = 30.0
 WORKER_OP_TIMEOUT_S = WORKER_REQUEST_TIMEOUT_S
 PAIR_ORDER_RULE = "even ie_then_ref, odd ref_then_ie"
@@ -1266,43 +1268,54 @@ def reap_owned_process(
     term_s: float,
     kill_s: float,
     write_shutdown: bool,
+    on_wait: Callable[[], None] | None = None,
+    close_pipes: bool = True,
 ) -> bool:
+    def wait_hook() -> None:
+        if on_wait is not None:
+            on_wait()
+
+    def settled() -> bool:
+        return process.poll() is not None and not _process_group_exists(process.pid)
+
+    def phase(budget_s: float) -> None:
+        deadline = time.monotonic() + budget_s
+        while True:
+            wait_hook()
+            if settled():
+                return
+            now = time.monotonic()
+            if now >= deadline:
+                return
+            remaining = min(REAP_SLICE_S, deadline - now)
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    pass
+            else:
+                time.sleep(min(0.01, remaining))
+
+    wait_hook()
     if write_shutdown and process.poll() is None and process.stdin is not None:
         try:
             process.stdin.write(b'{"op":"shutdown"}\n')
             process.stdin.flush()
         except (BrokenPipeError, OSError):
             pass
-    if process.poll() is None:
-        try:
-            process.wait(timeout=grace_s)
-        except subprocess.TimeoutExpired:
-            pass
-    _signal_owned(process, signal.SIGTERM)
-    if process.poll() is None:
-        try:
-            process.wait(timeout=term_s)
-        except subprocess.TimeoutExpired:
-            pass
+    phase(grace_s)
     if process.poll() is None or _process_group_exists(process.pid):
+        wait_hook()
+        _signal_owned(process, signal.SIGTERM)
+        phase(term_s)
+    if process.poll() is None or _process_group_exists(process.pid):
+        wait_hook()
         _signal_owned(process, signal.SIGKILL)
-        deadline = time.monotonic() + kill_s
-        while time.monotonic() < deadline:
-            if process.poll() is None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                try:
-                    process.wait(timeout=min(0.05, remaining))
-                except subprocess.TimeoutExpired:
-                    pass
-            if process.poll() is not None and not _process_group_exists(process.pid):
-                break
-            time.sleep(0.01)
-    if process.poll() is not None:
+        phase(kill_s)
+    reaped = process.poll() is not None and not _process_group_exists(process.pid)
+    if reaped and close_pipes:
         _close_process_pipes(process)
-        return True
-    return False
+    return reaped
 
 
 class WorkerSession:
@@ -1335,6 +1348,14 @@ class WorkerSession:
         self.stderr_bytes = bytearray()
         self.cleanup_error: CollectorError | None = None
         self.requests_sent = 0
+        self.stderr_total = 0
+        self.stderr_overflow = False
+        self.stderr_overflow_reported = False
+        self.stderr_nonblocking = False
+        self.stderr_at_eof = False
+        self.stderr_read_error: CollectorError | None = None
+        self.stderr_inherited_open = False
+        self.pipes_closed = False
         try:
             if not skip_executable_check:
                 require_launchable_worker(executable)
@@ -1350,6 +1371,14 @@ class WorkerSession:
                 raise CollectorError("environment_command_failed", f"worker launch failed: {exc}") from exc
             if self.process.stdin is None or self.process.stdout is None or self.process.stderr is None:
                 raise CollectorError("environment_command_failed", "worker pipes missing")
+            try:
+                os.set_blocking(self.process.stderr.fileno(), False)
+            except OSError as exc:
+                raise CollectorError(
+                    "environment_command_failed",
+                    f"worker stderr nonblocking failed: {exc}",
+                ) from exc
+            self.stderr_nonblocking = True
         except BaseException:
             self.close()
             raise
@@ -1358,6 +1387,8 @@ class WorkerSession:
         return self.process is None or self.process.poll() is not None
 
     def request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.stderr_overflow and not self.stderr_overflow_reported:
+            self._consume_stderr(classify=True)
         if self.process is None or self.process.stdin is None or self.process.stdout is None:
             raise CollectorError("environment_command_failed", "worker is not running")
         self.requests_sent += 1
@@ -1365,36 +1396,30 @@ class WorkerSession:
         try:
             self.process.stdin.write(line)
             self.process.stdin.flush()
-        except BrokenPipeError as exc:
+        except BrokenPipeError:
+            self._consume_stderr(classify=True)
             self._note_exit()
-            raise CollectorError("environment_command_failed", "broken pipe") from exc
+            raise CollectorError("environment_command_failed", "broken pipe")
         raw = self._read_one_line(self.request_timeout_s, "worker request timeout")
+        self._consume_stderr(classify=True)
         self._reject_extra_stdout()
-        self._drain_stderr(0.05)
         document = load_json_strict(raw, MAX_WORKER_LINE_BYTES)
         return document
 
     def _read_one_line(self, timeout_s: float, timeout_message: str) -> bytes:
         assert self.process is not None and self.process.stdout is not None
-        fd = self.process.stdout.fileno()
+        stdout_fd = self.process.stdout.fileno()
         buf = bytearray()
         deadline = time.monotonic() + timeout_s
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise CollectorError("environment_command_failed", timeout_message)
-            readable, _, _ = select.select([fd], [], [], remaining)
-            if not readable:
-                raise CollectorError("environment_command_failed", timeout_message)
-            chunk = os.read(fd, 4096)
-            if not chunk:
-                self._note_exit()
-                raise CollectorError("environment_command_failed", "unexpected EOF")
-            buf.extend(chunk)
-            if len(buf) > MAX_WORKER_LINE_BYTES:
-                raise CollectorError("record_schema_invalid", "oversized stdout")
+            self._consume_stderr(classify=True)
             if b"\n" in buf:
                 line, rest = buf.split(b"\n", 1)
+                self._consume_stderr(classify=True)
+                if self.stderr_overflow:
+                    if not self.stderr_overflow_reported:
+                        self.stderr_overflow_reported = True
+                    raise CollectorError("record_schema_invalid", "oversized stderr")
                 if rest:
                     raise CollectorError("record_schema_invalid", "extra response")
                 try:
@@ -1402,17 +1427,78 @@ class WorkerSession:
                 except UnicodeDecodeError as exc:
                     raise CollectorError("utf8_invalid", "invalid UTF-8") from exc
                 return bytes(line)
+            if time.monotonic() >= deadline:
+                self._consume_stderr(classify=True)
+                raise CollectorError("environment_command_failed", timeout_message)
+            watch = [stdout_fd]
+            stderr_fd: int | None = None
+            if (
+                not self.stderr_at_eof
+                and self.stderr_nonblocking
+                and self.process.stderr is not None
+            ):
+                try:
+                    stderr_fd = self.process.stderr.fileno()
+                except ValueError:
+                    stderr_fd = None
+            if stderr_fd is not None:
+                watch.append(stderr_fd)
+            remaining = deadline - time.monotonic()
+            if remaining < 0:
+                remaining = 0
+            try:
+                readable, _, _ = select.select(watch, [], [], remaining)
+            except InterruptedError:
+                continue
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                raise
+            if stderr_fd is not None and stderr_fd in readable:
+                self._consume_stderr(classify=True)
+            if stdout_fd in readable:
+                if self.stderr_overflow:
+                    if not self.stderr_overflow_reported:
+                        self.stderr_overflow_reported = True
+                    raise CollectorError("record_schema_invalid", "oversized stderr")
+                chunk = os.read(stdout_fd, 4096)
+                if not chunk:
+                    self._consume_stderr(classify=True)
+                    self._note_exit()
+                    raise CollectorError("environment_command_failed", "unexpected EOF")
+                buf.extend(chunk)
+                if len(buf) > MAX_WORKER_LINE_BYTES:
+                    self._consume_stderr(classify=True)
+                    if self.stderr_overflow:
+                        if not self.stderr_overflow_reported:
+                            self.stderr_overflow_reported = True
+                        raise CollectorError("record_schema_invalid", "oversized stderr")
+                    raise CollectorError("record_schema_invalid", "oversized stdout")
+                continue
+            if stderr_fd is None or stderr_fd not in readable:
+                self._consume_stderr(classify=True)
+                raise CollectorError("environment_command_failed", timeout_message)
 
     def _reject_extra_stdout(self) -> None:
+        if self.stderr_overflow:
+            if not self.stderr_overflow_reported:
+                self.stderr_overflow_reported = True
+            raise CollectorError("record_schema_invalid", "oversized stderr")
         assert self.process is not None and self.process.stdout is not None
         fd = self.process.stdout.fileno()
         readable, _, _ = select.select([fd], [], [], 0)
         if readable:
             extra = os.read(fd, 1)
             if extra:
+                self._consume_stderr(classify=True)
+                if self.stderr_overflow:
+                    if not self.stderr_overflow_reported:
+                        self.stderr_overflow_reported = True
+                    raise CollectorError("record_schema_invalid", "oversized stderr")
                 raise CollectorError("record_schema_invalid", "extra response")
 
     def _note_exit(self) -> None:
+        self._consume_stderr(classify=True)
         if self.process is None:
             return
         code = self.process.poll()
@@ -1423,55 +1509,154 @@ class WorkerSession:
         if code != 0:
             raise CollectorError("environment_command_failed", f"worker nonzero exit {code}")
 
-    def _drain_stderr(self, wait_s: float = 0.0) -> None:
+    def _stderr_fd(self) -> int | None:
         if self.process is None or self.process.stderr is None:
-            return
+            return None
         try:
-            fd = self.process.stderr.fileno()
+            return self.process.stderr.fileno()
         except ValueError:
+            return None
+
+    def _consume_stderr(self, *, classify: bool) -> None:
+        if not self.stderr_nonblocking or self.stderr_at_eof or self.process is None:
             return
-        try:
-            first_wait = wait_s
-            while True:
-                readable, _, _ = select.select([fd], [], [], first_wait)
-                first_wait = 0.0
-                if not readable:
-                    break
+        fd = self._stderr_fd()
+        if fd is None:
+            return
+        while True:
+            try:
                 chunk = os.read(fd, 4096)
-                if not chunk:
-                    break
-                self.stderr_bytes.extend(chunk)
-                if len(self.stderr_bytes) > MAX_WORKER_STDERR_BYTES:
+            except BlockingIOError:
+                return
+            except InterruptedError:
+                continue
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    return
+                if exc.errno == errno.EINTR:
+                    continue
+                if self.stderr_read_error is None:
+                    self.stderr_read_error = CollectorError(
+                        "environment_command_failed",
+                        f"worker stderr read failed: {exc.errno}",
+                    )
+                if classify and not self.stderr_overflow:
+                    raise self.stderr_read_error
+                return
+            if not chunk:
+                self.stderr_at_eof = True
+                return
+            self.stderr_total += len(chunk)
+            room = MAX_WORKER_STDERR_BYTES - len(self.stderr_bytes)
+            if room > 0:
+                self.stderr_bytes.extend(chunk[:room])
+            if self.stderr_total > MAX_WORKER_STDERR_BYTES:
+                self.stderr_overflow = True
+                if classify and not self.stderr_overflow_reported:
+                    self.stderr_overflow_reported = True
                     raise CollectorError("record_schema_invalid", "oversized stderr")
-        except OSError:
-            pass
+
+    def _authoritative_drain(self, reaped: bool) -> None:
+        self._consume_stderr(classify=False)
+        if self.stderr_at_eof or not reaped:
+            return
+        fd = self._stderr_fd()
+        if fd is None:
+            return
+        deadline = time.monotonic() + self.shutdown_kill_s
+        while not self.stderr_at_eof:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                _readable, _, _ = select.select([fd], [], [], remaining)
+            except InterruptedError:
+                continue
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                if self.stderr_read_error is None:
+                    self.stderr_read_error = CollectorError(
+                        "environment_command_failed",
+                        f"worker stderr read failed: {exc.errno}",
+                    )
+                return
+            self._consume_stderr(classify=False)
+        if not self.stderr_at_eof:
+            self.stderr_inherited_open = True
+
+    def _classify_close(self, reaped: bool, active: bool) -> None:
+        if self.stderr_overflow and not self.stderr_overflow_reported:
+            if not reaped and self.cleanup_error is None:
+                self.cleanup_error = CollectorError("environment_command_failed", "worker shutdown timeout")
+            if not active:
+                self.stderr_overflow_reported = True
+                raise CollectorError("record_schema_invalid", "oversized stderr")
+            return
+        if self.stderr_overflow_reported:
+            if not reaped and self.cleanup_error is None:
+                self.cleanup_error = CollectorError("environment_command_failed", "worker shutdown timeout")
+            return
+        if active:
+            if self.cleanup_error is None:
+                if self.stderr_read_error is not None:
+                    self.cleanup_error = self.stderr_read_error
+                elif self.stderr_inherited_open:
+                    self.cleanup_error = CollectorError(
+                        "environment_command_failed",
+                        "worker stderr still open",
+                    )
+                elif not reaped:
+                    self.cleanup_error = CollectorError(
+                        "environment_command_failed",
+                        "worker shutdown timeout",
+                    )
+            return
+        if self.stderr_read_error is not None:
+            raise self.stderr_read_error
+        if self.stderr_inherited_open:
+            raise CollectorError("environment_command_failed", "worker stderr still open")
+        if not reaped:
+            self.cleanup_error = CollectorError("environment_command_failed", "worker shutdown timeout")
+            raise self.cleanup_error
+
+    def _close_owned_pipes(self) -> None:
+        if self.pipes_closed:
+            return
+        if self.process is not None:
+            _close_process_pipes(self.process)
+        self.pipes_closed = True
+        self.process = None
 
     def close(self) -> None:
-        process = self.process
-        if process is None:
+        if self.process is None:
             return
+        active = sys.exc_info()[1] is not None
         try:
-            try:
-                self._drain_stderr()
-            except CollectorError:
-                pass
+            if not self.stderr_nonblocking:
+                reap_owned_process(
+                    self.process,
+                    grace_s=self.shutdown_grace_s,
+                    term_s=self.shutdown_term_s,
+                    kill_s=self.shutdown_kill_s,
+                    write_shutdown=True,
+                    on_wait=None,
+                    close_pipes=False,
+                )
+                return
             reaped = reap_owned_process(
-                process,
+                self.process,
                 grace_s=self.shutdown_grace_s,
                 term_s=self.shutdown_term_s,
                 kill_s=self.shutdown_kill_s,
                 write_shutdown=True,
+                on_wait=lambda: self._consume_stderr(classify=False),
+                close_pipes=False,
             )
-            if reaped:
-                self.process = None
-                return
-            self.cleanup_error = CollectorError("environment_command_failed", "worker shutdown timeout")
-            if sys.exc_info()[1] is None:
-                raise self.cleanup_error
+            self._authoritative_drain(reaped)
+            self._classify_close(reaped, active)
         finally:
-            if self.process is not None and self.process.poll() is not None:
-                _close_process_pipes(self.process)
-                self.process = None
+            self._close_owned_pipes()
 
 
 class CampaignRuntime:
