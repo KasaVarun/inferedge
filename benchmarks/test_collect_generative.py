@@ -953,6 +953,32 @@ non_shutdown_requests = 0
 ready_path = ""
 if "--ready-path" in sys.argv:
     ready_path = sys.argv[sys.argv.index("--ready-path") + 1]
+overflow_marker = ""
+if "--overflow-marker" in sys.argv:
+    overflow_marker = sys.argv[sys.argv.index("--overflow-marker") + 1]
+
+
+def write_all(fd, payload):
+    view = memoryview(payload)
+    while len(view):
+        written = os.write(fd, view)
+        if written <= 0:
+            raise SystemExit(1)
+        view = view[written:]
+
+
+def publish_overflow_marker(path):
+    destination = Path(path)
+    temporary = destination.parent / f"{destination.name}.partial"
+    descriptor = os.open(str(temporary), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    try:
+        write_all(descriptor, b"full\n")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+        os.replace(temporary, destination)
+
+
 if behavior == "stderr_exit_before_read":
     os.close(0)
     if ready_path:
@@ -1050,7 +1076,10 @@ for raw in sys.stdin:
             emit_identity()
             continue
         if behavior == "stderr_close_over":
-            flood(cap + 8)
+            write_all(sys.stderr.fileno(), b"e" * (cap + 8))
+            if not overflow_marker:
+                raise SystemExit(1)
+            publish_overflow_marker(overflow_marker)
             raise SystemExit(0)
         if behavior == "stderr_close_exact":
             flood(cap)
@@ -2562,6 +2591,11 @@ class WorkerResourceAndFdTests(unittest.TestCase):
 
 
 class StderrCapTests(unittest.TestCase):
+    # Test-only coordination bound. Production defaults remain 1s, 1s, and 2s.
+    # The bound is a maximum: close returns as soon as the worker exits.
+    CLOSE_OVERFLOW_GRACE_S = 30.0
+    CLOSE_OVERFLOW_MARKER_WAIT_S = 25.0
+
     def setUp(self) -> None:
         self.pids: list[int] = []
         self.escaped: list[int] = []
@@ -2602,6 +2636,7 @@ class StderrCapTests(unittest.TestCase):
     def _session(self, root: Path, behavior: str, **kwargs: object) -> collect.WorkerSession:
         harness = CollectHarness(root, behavior=behavior)
         os.environ["FAKE_WORKER_BEHAVIOR"] = behavior
+        overflow_marker = kwargs.pop("overflow_marker", None)
         kwargs.setdefault("request_timeout_s", 2.0)
         kwargs.setdefault("shutdown_grace_s", 0.4)
         kwargs.setdefault("shutdown_term_s", 0.2)
@@ -2610,6 +2645,8 @@ class StderrCapTests(unittest.TestCase):
         escaped = root / "escaped.pid"
         if behavior == "stderr_close_escaped":
             argv.extend(["--escaped-pid", str(escaped)])
+        if isinstance(overflow_marker, Path):
+            argv.extend(["--overflow-marker", str(overflow_marker)])
         worker = collect.WorkerSession(harness.ie, argv, "inferedge", **kwargs)
         if worker.process is not None:
             self.pids.append(worker.process.pid)
@@ -2794,15 +2831,9 @@ class StderrCapTests(unittest.TestCase):
             self._assert_closed(worker, pid)
 
     def test_close_overflow_after_shutdown(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            worker = self._session(Path(tmp), "stderr_close_over")
-            assert worker.process is not None
-            pid = worker.process.pid
-            self.assertTrue(worker.request({"op": "identity"})["ok"])
-            with self.assertRaises(CollectorError) as caught:
-                worker.close()
-            self._assert_overflow(caught.exception, worker)
-            self._assert_closed(worker, pid)
+        exc = self._close_overflow_after_full_write()
+        self.assertEqual(exc.code, "record_schema_invalid")
+        self.assertEqual(exc.message, "oversized stderr")
 
     def test_close_under_cap(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3159,27 +3190,69 @@ class StderrCapTests(unittest.TestCase):
                 if worker.process is not None:
                     worker.close()
 
-    def _one_close_session(self) -> None:
+    def _close_overflow_after_full_write(self) -> CollectorError:
         with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "overflow-complete"
             worker = self._session(
-                Path(tmp),
+                root,
                 "stderr_close_over",
-                shutdown_grace_s=1.0,
+                overflow_marker=marker,
+                shutdown_grace_s=self.CLOSE_OVERFLOW_GRACE_S,
                 shutdown_term_s=0.5,
                 shutdown_kill_s=0.5,
             )
             assert worker.process is not None
             pid = worker.process.pid
+            thread: threading.Thread | None = None
             try:
+                self._wait_ready(root)
+                self.assertFalse(marker.exists())
                 self.assertTrue(worker.request({"op": "identity"})["ok"])
-                with self.assertRaises(CollectorError) as caught:
-                    worker.close()
-                self.assertEqual(caught.exception.code, "record_schema_invalid", worker.stderr_total)
-                self.assertEqual(caught.exception.message, "oversized stderr")
+                self.assertFalse(marker.exists())
+                outcome: dict[str, BaseException] = {}
+
+                def run_close() -> None:
+                    try:
+                        worker.close()
+                    except BaseException as exc:
+                        outcome["exc"] = exc
+
+                thread = threading.Thread(target=run_close, name=f"close-overflow-{pid}")
+                thread.start()
+                deadline = time.monotonic() + self.CLOSE_OVERFLOW_MARKER_WAIT_S
+                while time.monotonic() < deadline and not marker.is_file():
+                    time.sleep(0.01)
+                if not marker.is_file():
+                    self.fail(
+                        "close-overflow fixture precondition failed: "
+                        "full oversized payload was not confirmed"
+                    )
+                self.assertEqual(marker.read_bytes(), b"full\n")
+                thread.join(self.CLOSE_OVERFLOW_GRACE_S + 2.0)
+                self.assertFalse(thread.is_alive(), "close thread remained after the full-write marker")
+                exc = outcome.get("exc")
+                self.assertIsInstance(exc, CollectorError)
+                assert isinstance(exc, CollectorError)
+                self._assert_overflow(exc, worker)
                 self._assert_closed(worker, pid)
+                marker.unlink()
+                self.assertFalse(marker.exists())
+                partial = root / "overflow-complete.partial"
+                self.assertFalse(partial.exists())
+                return exc
             finally:
+                if thread is not None and thread.is_alive():
+                    thread.join(self.CLOSE_OVERFLOW_GRACE_S + 2.0)
                 if worker.process is not None:
-                    worker.close()
+                    try:
+                        worker.close()
+                    except CollectorError:
+                        pass
+
+    def _one_close_session(self) -> str:
+        exc = self._close_overflow_after_full_write()
+        return f"{exc.code}: {exc.message}"
 
     def _run_bounded(self, workers: list[threading.Thread], burn: list[threading.Thread], stop: threading.Event) -> None:
         started = time.monotonic()
@@ -3205,8 +3278,8 @@ class StderrCapTests(unittest.TestCase):
 
     def _contention_close_sequential(self) -> None:
         started = time.monotonic()
-        for _ in range(20):
-            self._one_close_session()
+        results = [self._one_close_session() for _ in range(20)]
+        self.assertEqual(results, ["record_schema_invalid: oversized stderr"] * 20)
         self.assertLess(time.monotonic() - started, 60)
 
     def _contention_request_overlap(self, cpu: bool) -> None:
@@ -3232,12 +3305,18 @@ class StderrCapTests(unittest.TestCase):
 
     def _contention_close_overlap(self, cpu: bool) -> None:
         errors: list[BaseException] = []
+        results: list[str] = []
+        lock = threading.Lock()
 
         def run() -> None:
             try:
-                self._one_close_session()
+                result = self._one_close_session()
             except BaseException as exc:
-                errors.append(exc)
+                with lock:
+                    errors.append(exc)
+            else:
+                with lock:
+                    results.append(result)
 
         stop = threading.Event()
 
@@ -3250,6 +3329,7 @@ class StderrCapTests(unittest.TestCase):
         burners = [threading.Thread(target=burn) for _ in range(4)] if cpu else []
         self._run_bounded(workers, burners, stop)
         self.assertEqual(errors, [])
+        self.assertEqual(results, ["record_schema_invalid: oversized stderr"] * 8)
 
 
 if __name__ == "__main__":
