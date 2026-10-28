@@ -18,16 +18,15 @@ namespace inferedge {
 // directory, a home directory, a repository root, or a parent directory, and it does not
 // choose a file by directory order or modification time.
 //
-// Phase 9-C7 boundary: parsing a canonical record never produces authority. This header
-// exposes no verifier base class, no friend factory, no registration hook, and no
-// compile-time switch that a consumer can define. AuthenticatedCapability::authenticate
-// is unconditionally fail-closed in this phase. It returns kUnavailable and stores no
-// capability. A later phase can mint authority only by editing this translation unit so
-// that a real verifier decision and the internal stamp stay in the same file. Supplying
-// a header, object file, or build flag cannot do that. Destructive recovery, reservation
-// cleanup, and quarantine deletion require a capability whose bindings match the request
-// and the device, inode, and directory kind captured from opened descriptors. A mismatch
-// returns before mutation. There is no process-wide grant.
+// Parsing a canonical record never produces authority. This header exposes no verifier
+// base class, no friend factory, no registration hook, and no compile-time switch that
+// a consumer can define. AuthenticatedCapability::authenticate mints a capability only
+// inside src/evidence_store.cpp, after that file accepts a decision from the one strong
+// Ed25519 verifier and assigns the internal stamp. Supplying a header, object file, or
+// build flag cannot do that. Destructive recovery, reservation cleanup, and quarantine
+// deletion require a capability whose bindings match the request and the device, inode,
+// and directory kind captured from opened descriptors. A mismatch returns before
+// mutation. There is no process-wide grant.
 //
 // Section 22 quarantine inventory, and nothing else, may appear in quarantine/<run-id>/:
 // quarantine.record for every reason code; recipe-echo.bin only when the reason is
@@ -253,14 +252,14 @@ public:
     std::string_view revocation_decision() const noexcept;
     std::string_view signature_verification_result() const noexcept;
 
-    // Unconditionally unavailable in Phase 9-C6. Caller text is not verification.
+    // Caller text is compared with authenticated records. It is not verification.
     static CapabilityResult
     authenticate(std::string_view operation, std::string_view authorization_bytes,
                  std::string_view canonical_authorization_path, std::string_view target_id,
-                 std::string_view evidence_root, std::string_view admission_root,
-                 std::string_view terminal_trust_state_id, std::string_view terminal_effective_date,
-                 std::string_view signer_key_id, std::string_view key_valid_from,
-                 std::string_view key_valid_until);
+                 std::string_view trust_root, std::string_view evidence_root,
+                 std::string_view admission_root, std::string_view terminal_trust_state_id,
+                 std::string_view terminal_effective_date, std::string_view signer_key_id,
+                 std::string_view key_valid_from, std::string_view key_valid_until);
 
 private:
     struct State;

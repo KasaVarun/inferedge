@@ -6,6 +6,8 @@
 
 #include "inferedge/evidence_store.hpp"
 
+#include "inferedge/ed25519_verify.hpp"
+
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -15,6 +17,8 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <memory>
+#include <set>
+#include <span>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <thread>
@@ -194,7 +198,9 @@ EvidenceError require_id_bin(std::string_view filename) {
     return from_admission(validate_filename(filename));
 }
 
-EvidenceError classify_file(const struct stat& status) {
+enum class FilePolicy { kLegacy, kTrustFamily };
+
+EvidenceError classify_file(const struct stat& status, FilePolicy policy = FilePolicy::kLegacy) {
     if (S_ISLNK(status.st_mode)) {
         return EvidenceError::kSymlink;
     }
@@ -203,6 +209,9 @@ EvidenceError classify_file(const struct stat& status) {
     }
     if (!S_ISREG(status.st_mode)) {
         return EvidenceError::kSpecial;
+    }
+    if (policy == FilePolicy::kTrustFamily && (status.st_mode & 0777) != 0444) {
+        return EvidenceError::kForbidden;
     }
     if (status.st_nlink != 1) {
         return EvidenceError::kLink;
@@ -614,6 +623,9 @@ EvidenceError read_limited(int fd, std::uint64_t size, std::uint64_t limit, std:
         const ssize_t count =
             pread(fd, data.data() + got, data.size() - got, static_cast<off_t>(got));
         if (count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
             return EvidenceError::kIo;
         }
         if (count == 0) {
@@ -3403,6 +3415,2677 @@ EvidenceError list_names(int directory, std::vector<std::string>& names) {
     }
 }
 
+EvidenceError unavailable_input(EvidenceError status) {
+    if (status == EvidenceError::kAbsent || status == EvidenceError::kIo) {
+        return EvidenceError::kUnavailable;
+    }
+    return status;
+}
+
+EvidenceError open_readonly(int root_fd, std::string_view relative, Fd& out, struct stat& status,
+                            FilePolicy policy = FilePolicy::kLegacy) {
+    if (const EvidenceError checked = validate_evidence_relative_path(relative);
+        checked != EvidenceError::kOk) {
+        return checked;
+    }
+    const std::vector<std::string_view> parts = split_segments(relative);
+    Fd current(dup(root_fd));
+    if (!current) {
+        return EvidenceError::kIo;
+    }
+    for (std::size_t index = 0; index + 1 < parts.size(); ++index) {
+        const std::string name(parts[index]);
+        struct stat before{};
+        if (fstatat(current.get(), name.c_str(), &before, AT_SYMLINK_NOFOLLOW) != 0) {
+            return from_errno(errno);
+        }
+        if (S_ISLNK(before.st_mode)) {
+            return EvidenceError::kSymlink;
+        }
+        if (!S_ISDIR(before.st_mode)) {
+            return EvidenceError::kType;
+        }
+        const int next =
+            openat(current.get(), name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (next < 0) {
+            return from_errno(errno);
+        }
+        struct stat opened{};
+        if (fstat(next, &opened) != 0) {
+            close(next);
+            return EvidenceError::kIo;
+        }
+        if (S_ISLNK(opened.st_mode) || !S_ISDIR(opened.st_mode) || opened.st_dev != before.st_dev ||
+            opened.st_ino != before.st_ino) {
+            close(next);
+            return S_ISLNK(opened.st_mode) ? EvidenceError::kSymlink : EvidenceError::kRace;
+        }
+        current = Fd(next);
+    }
+    const std::string leaf(parts.back());
+    const int fd = openat(current.get(), leaf.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        return from_errno(errno);
+    }
+    if (fstat(fd, &status) != 0) {
+        close(fd);
+        return EvidenceError::kIo;
+    }
+    if (const EvidenceError kind = classify_file(status, policy); kind != EvidenceError::kOk) {
+        close(fd);
+        return kind;
+    }
+    out = Fd(fd);
+    return EvidenceError::kOk;
+}
+
+EvidenceError read_opened(int fd, std::uint64_t size, std::uint64_t limit, std::string& out) {
+    return read_limited(fd, size, limit, out);
+}
+
+EvidenceError read_tree_file(int root_fd, std::string_view relative, std::uint64_t limit,
+                             std::string& out, FilePolicy policy = FilePolicy::kLegacy) {
+    Fd file;
+    struct stat status{};
+    if (const EvidenceError opened = open_readonly(root_fd, relative, file, status, policy);
+        opened != EvidenceError::kOk) {
+        return unavailable_input(opened);
+    }
+    return unavailable_input(
+        read_opened(file.get(), static_cast<std::uint64_t>(status.st_size), limit, out));
+}
+
+using ClosedRecord = std::vector<std::pair<std::string, std::string>>;
+
+EvidenceError parse_closed(std::string_view bytes, std::span<const std::string_view> keys,
+                           ClosedRecord& out) {
+    std::vector<std::string> lines;
+    if (const EvidenceError status = split_canonical(bytes, lines); status != EvidenceError::kOk) {
+        return status;
+    }
+    if (lines.size() != keys.size()) {
+        return EvidenceError::kSchema;
+    }
+    out.clear();
+    std::size_t index = 0;
+    for (std::string_view key : keys) {
+        std::string value;
+        if (const EvidenceError status = require_field(lines, index, key, value);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        out.emplace_back(std::string(key), std::move(value));
+        ++index;
+    }
+    return EvidenceError::kOk;
+}
+
+const std::string* record_field(const ClosedRecord& record, std::string_view key) {
+    for (const auto& item : record) {
+        if (item.first == key) {
+            return &item.second;
+        }
+    }
+    return nullptr;
+}
+
+EvidenceError field_is(const ClosedRecord& record, std::string_view key,
+                       std::string_view expected) {
+    const std::string* value = record_field(record, key);
+    if (value == nullptr) {
+        return EvidenceError::kSchema;
+    }
+    return *value == expected ? EvidenceError::kOk : EvidenceError::kSchema;
+}
+
+EvidenceError field_binds(const ClosedRecord& record, std::string_view key,
+                          std::string_view expected, EvidenceError mismatch) {
+    const std::string* value = record_field(record, key);
+    if (value == nullptr) {
+        return EvidenceError::kSchema;
+    }
+    return *value == expected ? EvidenceError::kOk : mismatch;
+}
+
+EvidenceError field_text(const ClosedRecord& record, std::string_view key, std::string& out) {
+    const std::string* value = record_field(record, key);
+    if (value == nullptr) {
+        return EvidenceError::kSchema;
+    }
+    out = *value;
+    return EvidenceError::kOk;
+}
+
+EvidenceError field_u64(const ClosedRecord& record, std::string_view key, std::uint64_t& out) {
+    const std::string* value = record_field(record, key);
+    if (value == nullptr) {
+        return EvidenceError::kSchema;
+    }
+    return require_u64(*value, out);
+}
+
+bool date_in_interval(std::string_view day, std::string_view from, std::string_view until) {
+    return from <= day && day <= until;
+}
+
+constexpr std::string_view kTrustTransitionDomain =
+    "INFEREDGE-ED25519-V1 TRUST-TRANSITION-PAYLOAD 1\n";
+
+constexpr std::string_view kSignedPayloadKeys[] = {"schema_version",
+                                                   "record_kind",
+                                                   "transition_id",
+                                                   "trust_generation",
+                                                   "transition_date",
+                                                   "predecessor_transition_id",
+                                                   "predecessor_transition_path",
+                                                   "predecessor_transition_file_size",
+                                                   "predecessor_transition_file_sha256",
+                                                   "predecessor_successor_trust_id",
+                                                   "predecessor_successor_trust_file_size",
+                                                   "predecessor_successor_trust_file_sha256",
+                                                   "successor_trust_id",
+                                                   "successor_trust_path",
+                                                   "successor_trust_file_size",
+                                                   "successor_trust_file_sha256",
+                                                   "bootstrap_key_sha256",
+                                                   "signer_key_id",
+                                                   "registry_id",
+                                                   "authority_registry_file_size",
+                                                   "authority_registry_file_sha256",
+                                                   "publication_kind",
+                                                   "binding_record_kind",
+                                                   "binding_record_size",
+                                                   "binding_record_sha256"};
+
+constexpr std::string_view kPayloadSharedKeys[] = {"transition_id",
+                                                   "trust_generation",
+                                                   "transition_date",
+                                                   "predecessor_transition_id",
+                                                   "predecessor_transition_path",
+                                                   "predecessor_transition_file_size",
+                                                   "predecessor_transition_file_sha256",
+                                                   "predecessor_successor_trust_id",
+                                                   "predecessor_successor_trust_file_size",
+                                                   "predecessor_successor_trust_file_sha256",
+                                                   "successor_trust_id",
+                                                   "successor_trust_path",
+                                                   "successor_trust_file_size",
+                                                   "successor_trust_file_sha256",
+                                                   "bootstrap_key_sha256",
+                                                   "signer_key_id",
+                                                   "registry_id",
+                                                   "authority_registry_file_size",
+                                                   "authority_registry_file_sha256",
+                                                   "publication_kind",
+                                                   "binding_record_kind",
+                                                   "binding_record_size",
+                                                   "binding_record_sha256"};
+
+std::string trust_transition_message(std::string_view payload) {
+    std::string message;
+    message.reserve(kTrustTransitionDomain.size() + payload.size());
+    message.assign(kTrustTransitionDomain);
+    message.append(payload);
+    return message;
+}
+
+std::string self_prefix_digest(std::string_view bytes) {
+    const std::size_t checksum = bytes.rfind("\nrecord_sha256=");
+    if (checksum == std::string_view::npos) {
+        return {};
+    }
+    return digest_hex(bytes.substr(0, checksum + 1));
+}
+
+EvidenceError check_ed25519_preimage(std::string_view message, std::string_view signature,
+                                     std::string_view public_key) {
+    if (signature.empty() || public_key.empty()) {
+        return EvidenceError::kUnavailable;
+    }
+    if (signature.size() != 64 || public_key.size() != 32) {
+        return EvidenceError::kSchema;
+    }
+    VerificationRequest request;
+    request.message = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(message.data()), message.size());
+    request.signature = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(signature.data()), signature.size());
+    request.public_key = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(public_key.data()), public_key.size());
+    request.authorization_digest = "ed25519-preimage";
+    request.signature_family_id = "internal-signature";
+    request.terminal_trust_state_id = "internal-trust";
+    request.terminal_effective_date = "2020-01-01";
+    request.registry_entry_id = "internal-entry";
+    request.signer_key_id = "internal-key";
+    request.key_valid_from = "2020-01-01";
+    request.key_valid_until = "2100-12-31";
+    request.role = "trust_admin";
+    request.revocation_result = "unrevoked";
+    request.verification_date = "2020-01-01";
+    request.operation = "internal-check";
+    request.canonical_authorization_path = "internal/path";
+    request.target_id = "internal-target";
+    const VerificationDecision decision = verify_ed25519(request);
+    if (decision.status == VerificationStatus::kUnavailable) {
+        return EvidenceError::kUnavailable;
+    }
+    if (decision.status == VerificationStatus::kMalformed || !decision.accepted()) {
+        return decision.status == VerificationStatus::kRejected ? EvidenceError::kAuthorization
+                                                                : EvidenceError::kSchema;
+    }
+    return EvidenceError::kOk;
+}
+
+struct AuthorityEntry {
+    std::string entry_id;
+    std::string role;
+    std::string public_key_blob_id;
+    std::uint64_t public_key_size{0};
+    std::string public_key_sha256;
+    std::string key_index_id;
+    std::uint64_t key_index_size{0};
+    std::string key_index_sha256;
+    std::string valid_from;
+    std::string valid_until;
+    std::string revoked;
+    std::string public_key;
+};
+
+struct LoadedRegistry {
+    std::string registry_id;
+    std::string bytes;
+    std::string digest;
+    std::vector<AuthorityEntry> entries;
+};
+
+bool known_authority_role(std::string_view role) {
+    return role == "provenance_reviewer" || role == "golden_reviewer" ||
+           role == "license_reviewer" || role == "registry_reviewer" || role == "policy_reviewer" ||
+           role == "telemetry_reviewer" || role == "authority_admin" || role == "trust_admin";
+}
+
+EvidenceError parse_authority_entries(std::string_view bytes, std::string& list_id,
+                                      std::vector<AuthorityEntry>& entries) {
+    std::vector<std::string> lines;
+    if (const EvidenceError status = split_canonical(bytes, lines); status != EvidenceError::kOk) {
+        return status;
+    }
+    if (lines.size() < 4) {
+        return EvidenceError::kSchema;
+    }
+    if (const EvidenceError status = require_exact(lines, 0, "schema_version", "1");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_exact(lines, 1, "record_kind", "authority_entry_list");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_field(lines, 2, "list_id", list_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::string count_text;
+    if (const EvidenceError status = require_field(lines, 3, "entry_count", count_text);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t count = 0;
+    if (const EvidenceError status = require_u64(count_text, count); status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_id(list_id); status != EvidenceError::kOk) {
+        return status;
+    }
+    entries.clear();
+    std::set<std::string> ids;
+    std::set<std::string> digests;
+    for (std::size_t index = 4; index < lines.size(); ++index) {
+        std::vector<std::string> tokens;
+        std::size_t start = 0;
+        const std::string& line = lines[index];
+        if (line.find('=') != std::string::npos) {
+            return EvidenceError::kSchema;
+        }
+        while (start <= line.size()) {
+            const std::size_t space = line.find(' ', start);
+            if (space == std::string::npos) {
+                tokens.push_back(line.substr(start));
+                break;
+            }
+            if (space == start) {
+                return EvidenceError::kLexical;
+            }
+            tokens.push_back(line.substr(start, space - start));
+            start = space + 1;
+        }
+        if (tokens.size() != 11) {
+            return EvidenceError::kSchema;
+        }
+        AuthorityEntry entry;
+        entry.entry_id = tokens[0];
+        entry.role = tokens[1];
+        entry.public_key_blob_id = tokens[2];
+        if (const EvidenceError status = require_u64(tokens[3], entry.public_key_size);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        entry.public_key_sha256 = tokens[4];
+        entry.key_index_id = tokens[5];
+        if (const EvidenceError status = require_u64(tokens[6], entry.key_index_size);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        entry.key_index_sha256 = tokens[7];
+        entry.valid_from = tokens[8];
+        entry.valid_until = tokens[9];
+        entry.revoked = tokens[10];
+        if (const EvidenceError status = require_id(entry.entry_id); status != EvidenceError::kOk) {
+            return status;
+        }
+        if (!known_authority_role(entry.role)) {
+            return EvidenceError::kSchema;
+        }
+        if (entry.public_key_blob_id != entry.entry_id || entry.key_index_id != entry.entry_id) {
+            return EvidenceError::kSchema;
+        }
+        if (entry.public_key_size != 32) {
+            return EvidenceError::kSize;
+        }
+        if (const EvidenceError status = require_sha(entry.public_key_sha256, false);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (const EvidenceError status = require_sha(entry.key_index_sha256, false);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (const EvidenceError status = require_date(entry.valid_from);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (const EvidenceError status = require_date(entry.valid_until);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (entry.valid_from > entry.valid_until) {
+            return EvidenceError::kDate;
+        }
+        if (from_admission(validate_yes_no(entry.revoked)) != EvidenceError::kOk) {
+            return EvidenceError::kSchema;
+        }
+        if (!entries.empty() && entry.entry_id <= entries.back().entry_id) {
+            return EvidenceError::kDuplicate;
+        }
+        if (!ids.insert(entry.entry_id).second || !digests.insert(entry.public_key_sha256).second) {
+            return EvidenceError::kDuplicate;
+        }
+        entries.push_back(std::move(entry));
+    }
+    if (count != entries.size()) {
+        return EvidenceError::kSchema;
+    }
+    return EvidenceError::kOk;
+}
+
+constexpr std::string_view kVerificationKeys[] = {
+    "schema_version",         "record_kind",        "signature_id",         "signed_object_kind",
+    "signed_object_id",       "signed_object_path", "signed_object_size",   "signed_object_sha256",
+    "signature_blob_id",      "signature_index_id", "signature_index_path", "signature_index_size",
+    "signature_index_sha256", "signature_size",     "signature_sha256",     "signer_key_source",
+    "signer_key_id",          "public_key_size",    "public_key_sha256",    "key_index_id",
+    "key_index_size",         "key_index_sha256",   "fingerprint_sha256",   "algorithm",
+    "verification_result",    "verification_date",  "verifier_id"};
+
+constexpr std::string_view kBlobIndexKeys[] = {"schema_version",
+                                               "record_kind",
+                                               "blob_id",
+                                               "blob_class",
+                                               "raw_size",
+                                               "raw_sha256",
+                                               "storage_path",
+                                               "review_note_id",
+                                               "review_note_file_size",
+                                               "review_note_file_sha256"};
+
+EvidenceError check_verification_common(const ClosedRecord& record, std::string_view signature_id,
+                                        std::string_view signed_object_id,
+                                        std::uint64_t object_size, std::string_view object_digest,
+                                        std::string_view blob_id, std::string_view index_id,
+                                        std::uint64_t index_size, std::string_view index_digest,
+                                        std::string_view signature_digest,
+                                        std::string_view public_digest,
+                                        EvidenceError identity_mismatch = EvidenceError::kSchema) {
+    if (const EvidenceError status = field_is(record, "schema_version", "1");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(record, "record_kind", "signature_verification");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status =
+            field_binds(record, "signature_id", signature_id, identity_mismatch);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (signature_id == signed_object_id) {
+        return EvidenceError::kAuthorization;
+    }
+    if (const EvidenceError status = field_is(record, "signed_object_kind", "structured_file");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status =
+            field_binds(record, "signed_object_id", signed_object_id, identity_mismatch);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(record, "signed_object_path", "none");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t signed_size = 0;
+    if (const EvidenceError status = field_u64(record, "signed_object_size", signed_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (signed_size != object_size) {
+        return EvidenceError::kSize;
+    }
+    if (const EvidenceError status = field_is(record, "signed_object_sha256", object_digest);
+        status != EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    if (const EvidenceError status =
+            field_binds(record, "signature_blob_id", blob_id, identity_mismatch);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status =
+            field_binds(record, "signature_index_id", index_id, identity_mismatch);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(record, "signature_index_path", "none");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t recorded_index_size = 0;
+    if (const EvidenceError status = field_u64(record, "signature_index_size", recorded_index_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (recorded_index_size != index_size) {
+        return EvidenceError::kSize;
+    }
+    if (const EvidenceError status = field_is(record, "signature_index_sha256", index_digest);
+        status != EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    std::uint64_t signature_size = 0;
+    if (const EvidenceError status = field_u64(record, "signature_size", signature_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (signature_size != 64) {
+        return EvidenceError::kSize;
+    }
+    if (const EvidenceError status = field_is(record, "signature_sha256", signature_digest);
+        status != EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    std::uint64_t public_size = 0;
+    if (const EvidenceError status = field_u64(record, "public_key_size", public_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (public_size != 32) {
+        return EvidenceError::kSize;
+    }
+    if (const EvidenceError status = field_is(record, "public_key_sha256", public_digest);
+        status != EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    if (const EvidenceError status = field_is(record, "fingerprint_sha256", public_digest);
+        status != EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    if (const EvidenceError status = field_is(record, "algorithm", "ed25519");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(record, "verification_result", "verified");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(record, "verifier_id", kEd25519VerifierId);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    return EvidenceError::kOk;
+}
+
+EvidenceError check_blob_index(const ClosedRecord& index, std::string_view blob_id,
+                               std::string_view blob_class, std::uint64_t raw_size,
+                               std::string_view raw_digest, std::string_view storage_path,
+                               EvidenceError identity_mismatch = EvidenceError::kSchema) {
+    if (const EvidenceError status = field_is(index, "schema_version", "1");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(index, "record_kind", "blob_index");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_binds(index, "blob_id", blob_id, identity_mismatch);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(index, "blob_class", blob_class);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t size = 0;
+    if (const EvidenceError status = field_u64(index, "raw_size", size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (size != raw_size) {
+        return EvidenceError::kSize;
+    }
+    if (const EvidenceError status = field_is(index, "raw_sha256", raw_digest);
+        status != EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    if (const EvidenceError status = field_is(index, "storage_path", storage_path);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(index, "review_note_id", "none");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t review_size = 0;
+    if (const EvidenceError status = field_u64(index, "review_note_file_size", review_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (review_size != 0) {
+        return EvidenceError::kSize;
+    }
+    if (const EvidenceError status = field_is(index, "review_note_file_sha256", kZeroDigest);
+        status != EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    return EvidenceError::kOk;
+}
+
+struct PreparedCapability {
+    Fd current_fd;
+    std::uint64_t current_device{0};
+    std::uint64_t current_inode{0};
+    std::uint64_t current_size{0};
+    std::string current_bytes;
+    std::string successor_bytes;
+    std::string operation;
+    std::string authorization_bytes;
+    std::string path;
+    std::string target_id;
+    std::string evidence_root;
+    std::string admission_root;
+    std::uint64_t evidence_device{0};
+    std::uint64_t evidence_inode{0};
+    std::uint32_t evidence_kind{0};
+    std::uint64_t admission_device{0};
+    std::uint64_t admission_inode{0};
+    std::uint32_t admission_kind{0};
+    std::string trust_state_id;
+    std::string effective_date;
+    std::string signer_key_id;
+    std::string required_role;
+    std::string key_valid_from;
+    std::string key_valid_until;
+    std::string revocation_decision;
+    std::string signature_result;
+    Fd trust_fd;
+    Fd payload_fd;
+    std::string payload_path;
+    std::uint64_t payload_device{0};
+    std::uint64_t payload_inode{0};
+    std::uint32_t payload_mode{0};
+    std::uint64_t payload_nlink{0};
+    std::uint64_t payload_size{0};
+    std::string payload_bytes;
+};
+
+EvidenceError add_chain_bytes(std::uint64_t& total, std::uint64_t more) {
+    std::uint64_t sum = 0;
+    if (add_uint64(total, more, sum) != AdmissionError::kOk || sum > 4194304) {
+        return EvidenceError::kSize;
+    }
+    total = sum;
+    return EvidenceError::kOk;
+}
+
+EvidenceError require_absent_ref(const ClosedRecord& record, std::string_view id_key,
+                                 std::string_view size_key, std::string_view digest_key) {
+    if (const EvidenceError status = field_is(record, id_key, "none");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t size = 0;
+    if (const EvidenceError status = field_u64(record, size_key, size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (size != 0) {
+        return EvidenceError::kSize;
+    }
+    return field_is(record, digest_key, kZeroDigest);
+}
+
+EvidenceError require_lexical_ref(const ClosedRecord& record, std::string_view id_key,
+                                  std::string_view size_key, std::string_view digest_key) {
+    std::string ident;
+    if (const EvidenceError status = field_text(record, id_key, ident);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t size = 0;
+    if (const EvidenceError status = field_u64(record, size_key, size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::string digest;
+    if (const EvidenceError status = field_text(record, digest_key, digest);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (ident == "none") {
+        return size == 0 && digest == kZeroDigest ? EvidenceError::kOk : EvidenceError::kDigest;
+    }
+    if (const EvidenceError status = require_id(ident); status != EvidenceError::kOk) {
+        return status;
+    }
+    if (size == 0 || size > kMaxCanonicalRecordBytes) {
+        return EvidenceError::kSize;
+    }
+    return require_sha(digest, false);
+}
+
+struct ChainState {
+    ClosedRecord trust;
+    std::string trust_bytes;
+    LoadedRegistry registry;
+    std::string transition_date;
+    std::uint64_t revocation_generation{0};
+    std::string revocation_id;
+    std::string revocation_digest;
+    std::string payload_path;
+    Fd payload_fd;
+    std::uint64_t payload_device{0};
+    std::uint64_t payload_inode{0};
+    std::uint32_t payload_mode{0};
+    std::uint64_t payload_nlink{0};
+    std::uint64_t payload_size{0};
+    std::string payload_bytes;
+};
+
+EvidenceError load_signature_parts(int blob_root, std::string_view blob_path, int index_root,
+                                   std::string_view index_path, int record_root,
+                                   std::string_view record_path, std::string_view blob_id,
+                                   std::string_view index_id, std::string_view storage_path,
+                                   std::string& signature, ClosedRecord& index,
+                                   std::string& index_bytes, ClosedRecord& verification,
+                                   std::string& verification_bytes, std::uint64_t& chain_bytes,
+                                   FilePolicy policy = FilePolicy::kLegacy,
+                                   EvidenceError identity_mismatch = EvidenceError::kSchema) {
+    Fd blob;
+    struct stat blob_status{};
+    if (const EvidenceError opened = open_readonly(blob_root, blob_path, blob, blob_status, policy);
+        opened != EvidenceError::kOk) {
+        return unavailable_input(opened);
+    }
+    if (blob_status.st_size != 64) {
+        return EvidenceError::kSize;
+    }
+    if (const EvidenceError status = read_opened(blob.get(), 64, 64, signature);
+        status != EvidenceError::kOk) {
+        return unavailable_input(status);
+    }
+    if (const EvidenceError status = add_chain_bytes(chain_bytes, 64);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status =
+            read_tree_file(index_root, index_path, kMaxCanonicalRecordBytes, index_bytes, policy);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = add_chain_bytes(chain_bytes, index_bytes.size());
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = parse_closed(index_bytes, kBlobIndexKeys, index);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_id(index_id); status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status =
+            check_blob_index(index, blob_id, "signature_bytes", 64, digest_hex(signature),
+                             storage_path, identity_mismatch);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = read_tree_file(
+            record_root, record_path, kMaxCanonicalRecordBytes, verification_bytes, policy);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = add_chain_bytes(chain_bytes, verification_bytes.size());
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    return parse_closed(verification_bytes, kVerificationKeys, verification);
+}
+
+const AuthorityEntry* find_authority(const LoadedRegistry& registry, std::string_view entry_id) {
+    const AuthorityEntry* found = nullptr;
+    for (const AuthorityEntry& entry : registry.entries) {
+        if (entry.entry_id == entry_id) {
+            if (found != nullptr) {
+                return nullptr;
+            }
+            found = &entry;
+        }
+    }
+    return found;
+}
+
+EvidenceError load_registry(int admission_fd, int evidence_fd, std::string_view registry_id,
+                            std::string_view context_date, const std::string& bootstrap_key,
+                            const LoadedRegistry* predecessor, LoadedRegistry& out,
+                            std::uint64_t& chain_bytes) {
+    if (const EvidenceError status = require_id(registry_id); status != EvidenceError::kOk) {
+        return status;
+    }
+    const std::string record_path = "authority/registry-" + std::string(registry_id) + ".record";
+    const std::string list_path = "authority/registry-" + std::string(registry_id) + ".entries";
+    std::string registry_bytes;
+    if (const EvidenceError status =
+            read_tree_file(admission_fd, record_path, kMaxCanonicalRecordBytes, registry_bytes);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = add_chain_bytes(chain_bytes, registry_bytes.size());
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    static constexpr std::string_view kRegistryKeys[] = {"schema_version",
+                                                         "record_kind",
+                                                         "registry_id",
+                                                         "predecessor_registry_id",
+                                                         "predecessor_registry_file_size",
+                                                         "predecessor_registry_file_sha256",
+                                                         "entry_list_id",
+                                                         "entry_list_file_size",
+                                                         "entry_list_file_sha256",
+                                                         "entry_count"};
+    ClosedRecord registry;
+    if (const EvidenceError status = parse_closed(registry_bytes, kRegistryKeys, registry);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(registry, "schema_version", "1");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(registry, "record_kind", "authority_registry");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(registry, "registry_id", registry_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::string list_bytes;
+    if (const EvidenceError status =
+            read_tree_file(admission_fd, list_path, kMaxCanonicalRecordBytes, list_bytes);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = add_chain_bytes(chain_bytes, list_bytes.size());
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::string list_id;
+    std::vector<AuthorityEntry> entries;
+    if (const EvidenceError status = parse_authority_entries(list_bytes, list_id, entries);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(registry, "entry_list_id", list_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t list_size = 0;
+    if (const EvidenceError status = field_u64(registry, "entry_list_file_size", list_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (list_size != list_bytes.size()) {
+        return EvidenceError::kSize;
+    }
+    if (const EvidenceError status =
+            field_is(registry, "entry_list_file_sha256", digest_hex(list_bytes));
+        status != EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    std::uint64_t entry_count = 0;
+    if (const EvidenceError status = field_u64(registry, "entry_count", entry_count);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (entry_count != entries.size()) {
+        return EvidenceError::kSchema;
+    }
+    const std::string signature_id = "registry-envelope-signature-" + std::string(registry_id);
+    const std::string blob_id = "registry-envelope-sigblob-" + std::string(registry_id);
+    const std::string index_id = "registry-envelope-sigindex-" + std::string(registry_id);
+    const std::string blob_path = "benchmarks/generative_phase9c/signatures/" + blob_id + ".bin";
+    const std::string index_path = "signature-indexes/" + index_id + ".index";
+    const std::string verification_path = "signature-records/" + signature_id + ".record";
+    std::string signature;
+    std::string index_bytes;
+    std::string verification_bytes;
+    ClosedRecord index;
+    ClosedRecord verification;
+    if (const EvidenceError status =
+            load_signature_parts(evidence_fd, blob_path, admission_fd, index_path, admission_fd,
+                                 verification_path, blob_id, index_id, blob_path, signature, index,
+                                 index_bytes, verification, verification_bytes, chain_bytes);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    const bool first = predecessor == nullptr;
+    if (first) {
+        if (const EvidenceError status = require_absent_ref(registry, "predecessor_registry_id",
+                                                            "predecessor_registry_file_size",
+                                                            "predecessor_registry_file_sha256");
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (const EvidenceError status =
+                check_ed25519_preimage(registry_bytes, signature, bootstrap_key);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (const EvidenceError status = check_verification_common(
+                verification, signature_id, "registry-" + std::string(registry_id),
+                registry_bytes.size(), digest_hex(registry_bytes), blob_id, index_id,
+                index_bytes.size(), digest_hex(index_bytes), digest_hex(signature),
+                digest_hex(bootstrap_key));
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (const EvidenceError status =
+                field_is(verification, "signer_key_source", "bootstrap_handle");
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (const EvidenceError status = field_is(verification, "signer_key_id", "none");
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (const EvidenceError status = field_is(verification, "key_index_id", "none");
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        std::uint64_t key_index_size = 0;
+        if (const EvidenceError status = field_u64(verification, "key_index_size", key_index_size);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (key_index_size != 0) {
+            return EvidenceError::kSize;
+        }
+        if (const EvidenceError status = field_is(verification, "key_index_sha256", kZeroDigest);
+            status != EvidenceError::kOk) {
+            return EvidenceError::kDigest;
+        }
+    } else {
+        std::uint64_t predecessor_size = 0;
+        if (const EvidenceError status =
+                field_u64(registry, "predecessor_registry_file_size", predecessor_size);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (predecessor_size != predecessor->bytes.size() ||
+            field_is(registry, "predecessor_registry_id", predecessor->registry_id) !=
+                EvidenceError::kOk ||
+            field_is(registry, "predecessor_registry_file_sha256", predecessor->digest) !=
+                EvidenceError::kOk) {
+            return EvidenceError::kDigest;
+        }
+        std::string signer_id;
+        if (const EvidenceError status = field_text(verification, "signer_key_id", signer_id);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        const AuthorityEntry* admin = find_authority(*predecessor, signer_id);
+        if (admin == nullptr || admin->role != "authority_admin" || admin->revoked != "no" ||
+            !date_in_interval(context_date, admin->valid_from, admin->valid_until)) {
+            return EvidenceError::kAuthorization;
+        }
+        if (const EvidenceError status =
+                check_ed25519_preimage(registry_bytes, signature, admin->public_key);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (const EvidenceError status = check_verification_common(
+                verification, signature_id, "registry-" + std::string(registry_id),
+                registry_bytes.size(), digest_hex(registry_bytes), blob_id, index_id,
+                index_bytes.size(), digest_hex(index_bytes), digest_hex(signature),
+                digest_hex(admin->public_key));
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (const EvidenceError status = field_is(verification, "signer_key_source", "blob");
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (const EvidenceError status = field_is(verification, "key_index_id", admin->entry_id);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        std::uint64_t key_index_size = 0;
+        if (const EvidenceError status = field_u64(verification, "key_index_size", key_index_size);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (key_index_size != admin->key_index_size) {
+            return EvidenceError::kSize;
+        }
+        if (const EvidenceError status =
+                field_is(verification, "key_index_sha256", admin->key_index_sha256);
+            status != EvidenceError::kOk) {
+            return EvidenceError::kDigest;
+        }
+    }
+    std::string verification_date;
+    if (const EvidenceError status =
+            field_text(verification, "verification_date", verification_date);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_date(verification_date);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (verification_date != context_date) {
+        return EvidenceError::kDate;
+    }
+    for (AuthorityEntry& entry : entries) {
+        const std::string key_path =
+            "benchmarks/generative_phase9c/keys/" + entry.entry_id + ".bin";
+        const std::string key_index_path = "keys/" + entry.entry_id + ".index";
+        Fd key_file;
+        struct stat key_status{};
+        if (const EvidenceError opened = open_readonly(evidence_fd, key_path, key_file, key_status);
+            opened != EvidenceError::kOk) {
+            return unavailable_input(opened);
+        }
+        if (key_status.st_size != 32) {
+            return EvidenceError::kSize;
+        }
+        if (const EvidenceError status = read_opened(key_file.get(), 32, 32, entry.public_key);
+            status != EvidenceError::kOk) {
+            return unavailable_input(status);
+        }
+        if (digest_hex(entry.public_key) != entry.public_key_sha256) {
+            return EvidenceError::kDigest;
+        }
+        std::string key_index_bytes;
+        if (const EvidenceError status = read_tree_file(admission_fd, key_index_path,
+                                                        kMaxCanonicalRecordBytes, key_index_bytes);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (key_index_bytes.size() != entry.key_index_size ||
+            digest_hex(key_index_bytes) != entry.key_index_sha256) {
+            return EvidenceError::kDigest;
+        }
+        ClosedRecord key_index;
+        if (const EvidenceError status = parse_closed(key_index_bytes, kBlobIndexKeys, key_index);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (const EvidenceError status = check_blob_index(key_index, entry.entry_id, "public_key",
+                                                          32, entry.public_key_sha256, key_path);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+    }
+    out.registry_id = std::string(registry_id);
+    out.bytes = std::move(registry_bytes);
+    out.digest = digest_hex(out.bytes);
+    out.entries = std::move(entries);
+    return EvidenceError::kOk;
+}
+
+constexpr std::string_view kTrustStateKeys[] = {"schema_version",
+                                                "record_kind",
+                                                "trust_id",
+                                                "trust_generation",
+                                                "effective_date",
+                                                "terminal_transition_id",
+                                                "terminal_transition_path",
+                                                "revocation_generation",
+                                                "revocation_id",
+                                                "revocation_file_size",
+                                                "revocation_file_sha256",
+                                                "config_id",
+                                                "configuration_file_size",
+                                                "configuration_file_sha256",
+                                                "registry_id",
+                                                "authority_registry_file_size",
+                                                "authority_registry_file_sha256",
+                                                "authority_envelope_id",
+                                                "authority_envelope_file_size",
+                                                "authority_envelope_file_sha256",
+                                                "bootstrap_key_handle",
+                                                "bootstrap_key_size",
+                                                "bootstrap_key_sha256",
+                                                "admission_manifest_id",
+                                                "admission_root_manifest_file_size",
+                                                "admission_root_manifest_file_sha256",
+                                                "host_id",
+                                                "publication_kind",
+                                                "publication_authorization_id",
+                                                "publication_authorization_path",
+                                                "publication_authorization_file_size",
+                                                "publication_authorization_file_sha256",
+                                                "publication_authorization_preimage_sha256",
+                                                "signer_key_id",
+                                                "signer_publication_key_size",
+                                                "signer_publication_key_sha256",
+                                                "signature_family_id",
+                                                "lineage_kind",
+                                                "binding_record_kind",
+                                                "binding_record_size",
+                                                "binding_record_sha256",
+                                                "telemetry_mode",
+                                                "telemetry_governance_id",
+                                                "telemetry_governance_file_size",
+                                                "telemetry_governance_file_sha256",
+                                                "predecessor_trust_id",
+                                                "predecessor_file_size",
+                                                "predecessor_file_sha256"};
+
+constexpr std::string_view kTrustTransitionKeys[] = {"schema_version",
+                                                     "record_kind",
+                                                     "transition_id",
+                                                     "trust_generation",
+                                                     "transition_date",
+                                                     "predecessor_transition_id",
+                                                     "predecessor_transition_path",
+                                                     "predecessor_transition_file_size",
+                                                     "predecessor_transition_file_sha256",
+                                                     "predecessor_successor_trust_id",
+                                                     "predecessor_successor_trust_file_size",
+                                                     "predecessor_successor_trust_file_sha256",
+                                                     "successor_trust_id",
+                                                     "successor_trust_path",
+                                                     "successor_trust_file_size",
+                                                     "successor_trust_file_sha256",
+                                                     "bootstrap_key_sha256",
+                                                     "signer_key_id",
+                                                     "registry_id",
+                                                     "authority_registry_file_size",
+                                                     "authority_registry_file_sha256",
+                                                     "signed_payload_id",
+                                                     "signed_payload_path",
+                                                     "signed_payload_size",
+                                                     "signed_payload_sha256",
+                                                     "signature_id",
+                                                     "signature_blob_id",
+                                                     "signature_index_id",
+                                                     "signature_file_size",
+                                                     "signature_file_sha256",
+                                                     "publication_kind",
+                                                     "binding_record_kind",
+                                                     "binding_record_size",
+                                                     "binding_record_sha256"};
+
+EvidenceError append_bound(std::string& prefix, const ClosedRecord& record, std::string_view key) {
+    std::string value;
+    if (const EvidenceError status = field_text(record, key, value); status != EvidenceError::kOk) {
+        return status;
+    }
+    append_kv(prefix, key, value);
+    return EvidenceError::kOk;
+}
+
+bool allowed_publication_kind(std::string_view kind) {
+    return kind == "withdrawal" || kind == "ordinary" || kind == "revocation" ||
+           kind == "rollback" || kind == "native_initialization" || kind == "governance_pin" ||
+           kind == "activation";
+}
+
+EvidenceError check_one_way_binding(const ClosedRecord& trust, const ClosedRecord* transition) {
+    std::string kind;
+    if (const EvidenceError status = field_text(trust, "publication_kind", kind);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (!allowed_publication_kind(kind)) {
+        return EvidenceError::kSchema;
+    }
+    if (const EvidenceError status =
+            field_is(trust, "binding_record_kind", "transition_operation_binding");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(trust, "signature_family_id", "trust_transition");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t signer_size = 0;
+    if (const EvidenceError status = field_u64(trust, "signer_publication_key_size", signer_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (signer_size != 32) {
+        return EvidenceError::kSize;
+    }
+    std::string signer_digest;
+    if (const EvidenceError status =
+            field_text(trust, "signer_publication_key_sha256", signer_digest);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_sha(signer_digest, false);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (kind == "native_initialization") {
+        if (const EvidenceError status = field_is(trust, "publication_authorization_id", "none");
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (const EvidenceError status = field_is(trust, "publication_authorization_path", "none");
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        std::uint64_t authorization_size = 0;
+        if (const EvidenceError status =
+                field_u64(trust, "publication_authorization_file_size", authorization_size);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (authorization_size != 0) {
+            return EvidenceError::kSize;
+        }
+        if (field_is(trust, "publication_authorization_file_sha256", kZeroDigest) !=
+                EvidenceError::kOk ||
+            field_is(trust, "publication_authorization_preimage_sha256", kZeroDigest) !=
+                EvidenceError::kOk) {
+            return EvidenceError::kDigest;
+        }
+        if (const EvidenceError status = field_is(trust, "signer_key_id", "none");
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (const EvidenceError status = field_is(trust, "lineage_kind", "native");
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (const EvidenceError status = require_absent_ref(
+                trust, "predecessor_trust_id", "predecessor_file_size", "predecessor_file_sha256");
+            status != EvidenceError::kOk) {
+            return status;
+        }
+    } else {
+        std::string predecessor;
+        if (const EvidenceError status = field_text(trust, "predecessor_trust_id", predecessor);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (predecessor == "none") {
+            return EvidenceError::kSchema;
+        }
+        std::string predecessor_digest;
+        if (const EvidenceError status =
+                field_text(trust, "predecessor_file_sha256", predecessor_digest);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (predecessor_digest == kZeroDigest) {
+            return EvidenceError::kDigest;
+        }
+        std::string authorization_digest;
+        if (const EvidenceError status =
+                field_text(trust, "publication_authorization_file_sha256", authorization_digest);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (authorization_digest == kZeroDigest) {
+            return EvidenceError::kDigest;
+        }
+    }
+    std::string prefix;
+    append_kv(prefix, "schema_version", "1");
+    append_kv(prefix, "record_kind", "transition_operation_binding");
+    static constexpr std::string_view kCopied[] = {"publication_kind",
+                                                   "publication_authorization_id",
+                                                   "publication_authorization_path",
+                                                   "publication_authorization_file_size",
+                                                   "publication_authorization_file_sha256",
+                                                   "publication_authorization_preimage_sha256",
+                                                   "signer_key_id",
+                                                   "signer_publication_key_size",
+                                                   "signer_publication_key_sha256",
+                                                   "signature_family_id",
+                                                   "trust_id",
+                                                   "trust_generation",
+                                                   "effective_date",
+                                                   "terminal_transition_id",
+                                                   "terminal_transition_path",
+                                                   "predecessor_trust_id",
+                                                   "predecessor_file_size",
+                                                   "predecessor_file_sha256",
+                                                   "host_id",
+                                                   "lineage_kind",
+                                                   "revocation_generation",
+                                                   "revocation_id",
+                                                   "revocation_file_size",
+                                                   "revocation_file_sha256",
+                                                   "config_id",
+                                                   "configuration_file_size",
+                                                   "configuration_file_sha256",
+                                                   "registry_id",
+                                                   "authority_registry_file_size",
+                                                   "authority_registry_file_sha256",
+                                                   "authority_envelope_id",
+                                                   "authority_envelope_file_size",
+                                                   "authority_envelope_file_sha256",
+                                                   "bootstrap_key_handle",
+                                                   "bootstrap_key_size",
+                                                   "bootstrap_key_sha256",
+                                                   "admission_manifest_id",
+                                                   "admission_root_manifest_file_size",
+                                                   "admission_root_manifest_file_sha256"};
+    for (std::string_view key : kCopied) {
+        if (const EvidenceError status = append_bound(prefix, trust, key);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+    }
+    if (!prefix.empty() && prefix.back() != '\n') {
+        return EvidenceError::kInternal;
+    }
+    std::string binding;
+    if (const EvidenceError status = seal_prefix(prefix, binding); status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t recorded_size = 0;
+    if (const EvidenceError status = field_u64(trust, "binding_record_size", recorded_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (recorded_size != binding.size() ||
+        field_is(trust, "binding_record_sha256", digest_hex(binding)) != EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    if (transition != nullptr) {
+        if (field_is(*transition, "publication_kind", kind) != EvidenceError::kOk ||
+            field_is(*transition, "binding_record_kind", "transition_operation_binding") !=
+                EvidenceError::kOk ||
+            field_is(*transition, "binding_record_sha256", digest_hex(binding)) !=
+                EvidenceError::kOk) {
+            return EvidenceError::kDigest;
+        }
+        std::uint64_t transition_size = 0;
+        if (const EvidenceError status =
+                field_u64(*transition, "binding_record_size", transition_size);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (transition_size != binding.size()) {
+            return EvidenceError::kDigest;
+        }
+    }
+    return EvidenceError::kOk;
+}
+
+EvidenceError read_trust_state(int admission_fd, std::string_view trust_id, std::string& bytes,
+                               ClosedRecord& record, std::uint64_t& chain_bytes) {
+
+    const std::string path = "trust/trust-" + std::string(trust_id) + ".record";
+    if (const EvidenceError status =
+            read_tree_file(admission_fd, path, kMaxCanonicalRecordBytes, bytes);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = add_chain_bytes(chain_bytes, bytes.size());
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = parse_closed(bytes, kTrustStateKeys, record);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(record, "schema_version", "1");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(record, "record_kind", "trust_state");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(record, "trust_id", trust_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(record, "bootstrap_key_handle", "bootstrap-key-v1");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t bootstrap_size = 0;
+    if (const EvidenceError status = field_u64(record, "bootstrap_key_size", bootstrap_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (bootstrap_size != 32) {
+        return EvidenceError::kSize;
+    }
+    if (const EvidenceError status = field_is(record, "telemetry_mode", "disabled");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status =
+            require_absent_ref(record, "telemetry_governance_id", "telemetry_governance_file_size",
+                               "telemetry_governance_file_sha256");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_lexical_ref(
+            record, "revocation_id", "revocation_file_size", "revocation_file_sha256");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_lexical_ref(
+            record, "config_id", "configuration_file_size", "configuration_file_sha256");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_lexical_ref(record, "admission_manifest_id",
+                                                         "admission_root_manifest_file_size",
+                                                         "admission_root_manifest_file_sha256");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::string host;
+    if (const EvidenceError status = field_text(record, "host_id", host);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    return require_id(host);
+}
+
+EvidenceError payload_canonical_shape(std::string_view bytes) {
+    if (bytes.find('\0') != std::string_view::npos || bytes.find('\r') != std::string_view::npos) {
+        return EvidenceError::kSchema;
+    }
+    constexpr std::string_view checksum_key = "record_sha256=";
+    std::size_t line_start = std::string_view::npos;
+    const std::size_t marked = bytes.rfind("\nrecord_sha256=");
+    if (marked != std::string_view::npos) {
+        line_start = marked + 1;
+    } else if (bytes.size() >= checksum_key.size() &&
+               bytes.substr(0, checksum_key.size()) == checksum_key) {
+        line_start = 0;
+    }
+    constexpr std::size_t checksum_line = checksum_key.size() + 64;
+    if (line_start != std::string_view::npos && bytes.size() >= line_start + checksum_line + 1 &&
+        bytes[line_start + checksum_line] == '\n' &&
+        bytes.size() > line_start + checksum_line + 1) {
+        return EvidenceError::kSchema;
+    }
+    return EvidenceError::kOk;
+}
+
+EvidenceError load_transition_payload(int trust_fd, std::string_view relative, std::string& bytes,
+                                      struct stat& status, Fd& file) {
+    if (const EvidenceError opened =
+            open_readonly(trust_fd, relative, file, status, FilePolicy::kTrustFamily);
+        opened != EvidenceError::kOk) {
+        return unavailable_input(opened);
+    }
+    if (static_cast<std::uint64_t>(status.st_size) > kMaxCanonicalRecordBytes) {
+        return EvidenceError::kCap;
+    }
+    if (const EvidenceError read =
+            unavailable_input(read_opened(file.get(), static_cast<std::uint64_t>(status.st_size),
+                                          kMaxCanonicalRecordBytes, bytes));
+        read != EvidenceError::kOk) {
+        return read;
+    }
+    return payload_canonical_shape(bytes);
+}
+
+EvidenceError authenticate_transition_payload(
+    int trust_fd, ChainState& state, const ClosedRecord& transition, std::string_view transition_id,
+    std::string_view payload_path, std::string_view signature, std::string_view public_key,
+    const ClosedRecord& verification, std::string_view verification_bytes,
+    std::string_view index_bytes, std::string_view signature_id, std::string_view blob_id,
+    std::string_view index_id, std::uint64_t& chain_bytes) {
+    struct stat payload_status{};
+    std::string payload_bytes;
+    Fd payload_file;
+    if (const EvidenceError status = load_transition_payload(trust_fd, payload_path, payload_bytes,
+                                                             payload_status, payload_file);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = add_chain_bytes(chain_bytes, payload_bytes.size());
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    ClosedRecord payload;
+    if (const EvidenceError status = parse_closed(payload_bytes, kSignedPayloadKeys, payload);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(payload, "schema_version", "1");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status =
+            field_is(payload, "record_kind", "trust_transition_signed_payload");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    for (const std::string_view key : kPayloadSharedKeys) {
+        std::string payload_value;
+        std::string transition_value;
+        if (const EvidenceError status = field_text(payload, key, payload_value);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (const EvidenceError status = field_text(transition, key, transition_value);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (payload_value != transition_value) {
+            return key.find("sha256") != std::string_view::npos ? EvidenceError::kDigest
+                                                                : EvidenceError::kState;
+        }
+    }
+    const std::string payload_id = "transition-payload-" + std::string(transition_id);
+    if (const EvidenceError status = field_is(transition, "signed_payload_id", payload_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(transition, "signed_payload_path", payload_path);
+        status != EvidenceError::kOk) {
+        return status == EvidenceError::kSchema &&
+                       record_field(transition, "signed_payload_path") != nullptr
+                   ? EvidenceError::kPath
+                   : status;
+    }
+    std::uint64_t recorded_size = 0;
+    if (const EvidenceError status = field_u64(transition, "signed_payload_size", recorded_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (recorded_size != payload_bytes.size()) {
+        return EvidenceError::kSize;
+    }
+    if (const EvidenceError status =
+            field_is(transition, "signed_payload_sha256", digest_hex(payload_bytes));
+        status != EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    std::uint64_t signature_file_size = 0;
+    if (const EvidenceError status =
+            field_u64(transition, "signature_file_size", signature_file_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (signature_file_size != verification_bytes.size()) {
+        return EvidenceError::kSize;
+    }
+    std::string signature_file_digest;
+    if (const EvidenceError status =
+            field_text(transition, "signature_file_sha256", signature_file_digest);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (signature_file_digest == kZeroDigest ||
+        signature_file_digest != digest_hex(verification_bytes)) {
+        return EvidenceError::kDigest;
+    }
+    const std::string message = trust_transition_message(payload_bytes);
+    if (const EvidenceError status = check_ed25519_preimage(message, signature, public_key);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    const std::string index_digest = self_prefix_digest(index_bytes);
+    if (index_digest.empty()) {
+        return EvidenceError::kChecksum;
+    }
+    if (const EvidenceError status = check_verification_common(
+            verification, signature_id, payload_id, payload_bytes.size(), digest_hex(payload_bytes),
+            blob_id, index_id, index_bytes.size(), index_digest, digest_hex(signature),
+            digest_hex(public_key), EvidenceError::kState);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    state.payload_path = std::string(payload_path);
+    state.payload_device = static_cast<std::uint64_t>(payload_status.st_dev);
+    state.payload_inode = static_cast<std::uint64_t>(payload_status.st_ino);
+    state.payload_mode = static_cast<std::uint32_t>(payload_status.st_mode & 0777);
+    state.payload_nlink = static_cast<std::uint64_t>(payload_status.st_nlink);
+    state.payload_size = payload_bytes.size();
+    state.payload_bytes = std::move(payload_bytes);
+    state.payload_fd = std::move(payload_file);
+    return EvidenceError::kOk;
+}
+
+EvidenceError verify_genesis(int trust_fd, int admission_fd, int evidence_fd, ChainState& state,
+                             std::string& bootstrap_key, std::uint64_t& chain_bytes) {
+    if (const EvidenceError status =
+            read_tree_file(trust_fd, "key/bootstrap-key-v1", 32, bootstrap_key);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (bootstrap_key.size() != 32) {
+        return EvidenceError::kSize;
+    }
+    if (const EvidenceError status = add_chain_bytes(chain_bytes, 32);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+
+    std::string transition_bytes;
+    if (const EvidenceError status =
+            read_tree_file(trust_fd, "genesis/transition.record", kMaxCanonicalRecordBytes,
+                           transition_bytes, FilePolicy::kTrustFamily);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = add_chain_bytes(chain_bytes, transition_bytes.size());
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    ClosedRecord transition;
+    if (const EvidenceError status =
+            parse_closed(transition_bytes, kTrustTransitionKeys, transition);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(transition, "schema_version", "1");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(transition, "record_kind", "trust_transition");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(transition, "transition_id", "genesis-v1");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t generation = 0;
+    if (const EvidenceError status = field_u64(transition, "trust_generation", generation);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (generation < 1 || generation > 64) {
+        return EvidenceError::kSchema;
+    }
+    if (generation != 1) {
+        return EvidenceError::kState;
+    }
+    if (const EvidenceError status = require_absent_ref(transition, "predecessor_transition_id",
+                                                        "predecessor_transition_file_size",
+                                                        "predecessor_transition_file_sha256");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(transition, "predecessor_transition_path", "none");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_absent_ref(
+            transition, "predecessor_successor_trust_id", "predecessor_successor_trust_file_size",
+            "predecessor_successor_trust_file_sha256");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(transition, "signer_key_id", "none");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status =
+            field_is(transition, "bootstrap_key_sha256", digest_hex(bootstrap_key));
+        status != EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    if (const EvidenceError status =
+            field_is(transition, "signature_id", "transition-signature-genesis-v1");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::string blob_id;
+    std::string index_id;
+    if (const EvidenceError status = field_text(transition, "signature_blob_id", blob_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_text(transition, "signature_index_id", index_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_id(blob_id); status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_id(index_id); status != EvidenceError::kOk) {
+        return status;
+    }
+    std::string signature;
+    std::string index_bytes;
+    std::string verification_bytes;
+    ClosedRecord index;
+    ClosedRecord verification;
+    if (const EvidenceError status = load_signature_parts(
+            trust_fd, "genesis/signature.bin", trust_fd, "genesis/signature.index", trust_fd,
+            "genesis/verification.record", blob_id, index_id, "genesis/signature.bin", signature,
+            index, index_bytes, verification, verification_bytes, chain_bytes,
+            FilePolicy::kTrustFamily, EvidenceError::kState);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = authenticate_transition_payload(
+            trust_fd, state, transition, "genesis-v1", "genesis/transition.payload", signature,
+            bootstrap_key, verification, verification_bytes, index_bytes,
+            "transition-signature-genesis-v1", blob_id, index_id, chain_bytes);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::string transition_date;
+    if (const EvidenceError status = field_text(transition, "transition_date", transition_date);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_date(transition_date); status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status =
+            field_is(verification, "signer_key_source", "bootstrap_handle");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status =
+            field_binds(verification, "signer_key_id", "none", EvidenceError::kState);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(verification, "key_index_id", "none");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t key_index_size = 0;
+    if (const EvidenceError status = field_u64(verification, "key_index_size", key_index_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (key_index_size != 0 ||
+        field_is(verification, "key_index_sha256", kZeroDigest) != EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    if (const EvidenceError status = field_is(verification, "verification_date", transition_date);
+        status != EvidenceError::kOk) {
+        return EvidenceError::kDate;
+    }
+    std::string trust_id;
+    if (const EvidenceError status = field_text(transition, "successor_trust_id", trust_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_id(trust_id); status != EvidenceError::kOk) {
+        return status;
+    }
+    const std::string successor_path = "admission/trust/trust-" + trust_id + ".record";
+    if (const EvidenceError status = field_is(transition, "successor_trust_path", successor_path);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status =
+            read_trust_state(admission_fd, trust_id, state.trust_bytes, state.trust, chain_bytes);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t successor_size = 0;
+    if (const EvidenceError status =
+            field_u64(transition, "successor_trust_file_size", successor_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (successor_size != state.trust_bytes.size() ||
+        field_is(transition, "successor_trust_file_sha256", digest_hex(state.trust_bytes)) !=
+            EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    std::uint64_t trust_generation = 0;
+    if (const EvidenceError status = field_u64(state.trust, "trust_generation", trust_generation);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (trust_generation != 1 ||
+        field_is(state.trust, "effective_date", transition_date) != EvidenceError::kOk ||
+        field_is(state.trust, "terminal_transition_id", "genesis-v1") != EvidenceError::kOk ||
+        field_is(state.trust, "terminal_transition_path", "genesis/transition.record") !=
+            EvidenceError::kOk) {
+        return EvidenceError::kSchema;
+    }
+    if (const EvidenceError status = check_one_way_binding(state.trust, &transition);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status =
+            field_is(state.trust, "bootstrap_key_sha256", digest_hex(bootstrap_key));
+        status != EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    if (const EvidenceError status =
+            require_absent_ref(state.trust, "predecessor_trust_id", "predecessor_file_size",
+                               "predecessor_file_sha256");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::string registry_id;
+    if (const EvidenceError status = field_text(transition, "registry_id", registry_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(state.trust, "registry_id", registry_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status =
+            load_registry(admission_fd, evidence_fd, registry_id, transition_date, bootstrap_key,
+                          nullptr, state.registry, chain_bytes);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t registry_size = 0;
+    if (const EvidenceError status =
+            field_u64(transition, "authority_registry_file_size", registry_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (registry_size != state.registry.bytes.size() ||
+        field_is(transition, "authority_registry_file_sha256", state.registry.digest) !=
+            EvidenceError::kOk ||
+        field_u64(state.trust, "authority_registry_file_size", registry_size) !=
+            EvidenceError::kOk ||
+        registry_size != state.registry.bytes.size() ||
+        field_is(state.trust, "authority_registry_file_sha256", state.registry.digest) !=
+            EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    const std::string envelope_id = "registry-envelope-signature-" + registry_id;
+    if (const EvidenceError status = field_is(state.trust, "authority_envelope_id", envelope_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::string envelope_bytes;
+    if (const EvidenceError status =
+            read_tree_file(admission_fd, "signature-records/" + envelope_id + ".record",
+                           kMaxCanonicalRecordBytes, envelope_bytes);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t envelope_size = 0;
+    if (const EvidenceError status =
+            field_u64(state.trust, "authority_envelope_file_size", envelope_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (envelope_size != envelope_bytes.size() ||
+        field_is(state.trust, "authority_envelope_file_sha256", digest_hex(envelope_bytes)) !=
+            EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    if (const EvidenceError status =
+            field_u64(state.trust, "revocation_generation", state.revocation_generation);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_text(state.trust, "revocation_id", state.revocation_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status =
+            field_text(state.trust, "revocation_file_sha256", state.revocation_digest);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    state.transition_date = transition_date;
+    return EvidenceError::kOk;
+}
+
+EvidenceError verify_forward_transition(int trust_fd, int admission_fd, int evidence_fd,
+                                        const ChainState& previous, std::string_view transition_id,
+                                        const std::string& bootstrap_key, ChainState& next,
+                                        std::uint64_t& chain_bytes) {
+
+    const std::string relative = "transitions/" + std::string(transition_id) + "/transition.record";
+    std::string transition_bytes;
+    if (const EvidenceError status = read_tree_file(trust_fd, relative, kMaxCanonicalRecordBytes,
+                                                    transition_bytes, FilePolicy::kTrustFamily);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = add_chain_bytes(chain_bytes, transition_bytes.size());
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    ClosedRecord transition;
+    if (const EvidenceError status =
+            parse_closed(transition_bytes, kTrustTransitionKeys, transition);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (field_is(transition, "record_kind", "trust_transition") != EvidenceError::kOk ||
+        field_is(transition, "transition_id", transition_id) != EvidenceError::kOk ||
+        field_is(transition, "schema_version", "1") != EvidenceError::kOk) {
+        return EvidenceError::kSchema;
+    }
+    std::string previous_transition_id;
+    if (const EvidenceError status =
+            field_text(previous.trust, "terminal_transition_id", previous_transition_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t previous_generation = 0;
+    if (const EvidenceError status =
+            field_u64(previous.trust, "trust_generation", previous_generation);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t generation = 0;
+    if (const EvidenceError status = field_u64(transition, "trust_generation", generation);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (generation < 1 || generation > 64) {
+        return EvidenceError::kSchema;
+    }
+    if (generation != previous_generation + 1) {
+        return EvidenceError::kState;
+    }
+    const std::string previous_path =
+        previous_transition_id == "genesis-v1"
+            ? "genesis/transition.record"
+            : "transitions/" + previous_transition_id + "/transition.record";
+    if (field_is(transition, "predecessor_transition_id", previous_transition_id) !=
+            EvidenceError::kOk ||
+        field_is(transition, "predecessor_transition_path", previous_path) != EvidenceError::kOk) {
+        return EvidenceError::kSchema;
+    }
+    std::string previous_transition_bytes;
+    if (const EvidenceError status =
+            read_tree_file(trust_fd, previous_path, kMaxCanonicalRecordBytes,
+                           previous_transition_bytes, FilePolicy::kTrustFamily);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t predecessor_size = 0;
+    if (const EvidenceError status =
+            field_u64(transition, "predecessor_transition_file_size", predecessor_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (predecessor_size != previous_transition_bytes.size() ||
+        field_is(transition, "predecessor_transition_file_sha256",
+                 digest_hex(previous_transition_bytes)) != EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    std::string previous_trust_id;
+    if (const EvidenceError status = field_text(previous.trust, "trust_id", previous_trust_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t predecessor_trust_size = 0;
+    if (const EvidenceError status =
+            field_u64(transition, "predecessor_successor_trust_file_size", predecessor_trust_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (field_is(transition, "predecessor_successor_trust_id", previous_trust_id) !=
+            EvidenceError::kOk ||
+        predecessor_trust_size != previous.trust_bytes.size() ||
+        field_is(transition, "predecessor_successor_trust_file_sha256",
+                 digest_hex(previous.trust_bytes)) != EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    if (field_is(transition, "bootstrap_key_sha256", digest_hex(bootstrap_key)) !=
+        EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    std::string signer_id;
+    if (const EvidenceError status = field_text(transition, "signer_key_id", signer_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    const AuthorityEntry* signer = find_authority(previous.registry, signer_id);
+    if (signer == nullptr) {
+        return EvidenceError::kAuthorization;
+    }
+    const std::string signature_id = "transition-signature-" + std::string(transition_id);
+    if (field_is(transition, "signature_id", signature_id) != EvidenceError::kOk) {
+        return EvidenceError::kSchema;
+    }
+    std::string blob_id;
+    std::string index_id;
+    if (const EvidenceError status = field_text(transition, "signature_blob_id", blob_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_text(transition, "signature_index_id", index_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (require_id(blob_id) != EvidenceError::kOk || require_id(index_id) != EvidenceError::kOk) {
+        return EvidenceError::kSchema;
+    }
+    const std::string directory = "transitions/" + std::string(transition_id);
+    std::string signature;
+    std::string index_bytes;
+    std::string verification_bytes;
+    ClosedRecord index;
+    ClosedRecord verification;
+    if (const EvidenceError status = load_signature_parts(
+            trust_fd, directory + "/signature.bin", trust_fd, directory + "/signature.index",
+            trust_fd, directory + "/verification.record", blob_id, index_id,
+            directory + "/signature.bin", signature, index, index_bytes, verification,
+            verification_bytes, chain_bytes, FilePolicy::kTrustFamily, EvidenceError::kState);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = authenticate_transition_payload(
+            trust_fd, next, transition, transition_id, directory + "/transition.payload", signature,
+            signer->public_key, verification, verification_bytes, index_bytes, signature_id,
+            blob_id, index_id, chain_bytes);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::string transition_date;
+    if (const EvidenceError status = field_text(transition, "transition_date", transition_date);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_date(transition_date); status != EvidenceError::kOk) {
+        return status;
+    }
+    if (transition_date < previous.transition_date ||
+        !date_in_interval(transition_date, signer->valid_from, signer->valid_until)) {
+        return EvidenceError::kDate;
+    }
+    if (signer->role != "trust_admin" || signer->revoked != "no") {
+        return EvidenceError::kAuthorization;
+    }
+    if (const EvidenceError status = field_is(verification, "signer_key_source", "blob");
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status =
+            field_binds(verification, "signer_key_id", signer->entry_id, EvidenceError::kState);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_is(verification, "verification_date", transition_date);
+        status != EvidenceError::kOk) {
+        return record_field(verification, "verification_date") == nullptr ? status
+                                                                          : EvidenceError::kDate;
+    }
+    std::string trust_id;
+    if (const EvidenceError status = field_text(transition, "successor_trust_id", trust_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    const std::string successor_path = "admission/trust/trust-" + trust_id + ".record";
+    if (field_is(transition, "successor_trust_path", successor_path) != EvidenceError::kOk) {
+        return EvidenceError::kPath;
+    }
+    if (const EvidenceError status =
+            read_trust_state(admission_fd, trust_id, next.trust_bytes, next.trust, chain_bytes);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t successor_size = 0;
+    if (const EvidenceError status =
+            field_u64(transition, "successor_trust_file_size", successor_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (successor_size != next.trust_bytes.size() ||
+        field_is(transition, "successor_trust_file_sha256", digest_hex(next.trust_bytes)) !=
+            EvidenceError::kOk ||
+        field_is(next.trust, "effective_date", transition_date) != EvidenceError::kOk ||
+        field_is(next.trust, "terminal_transition_id", transition_id) != EvidenceError::kOk ||
+        field_is(next.trust, "terminal_transition_path", relative) != EvidenceError::kOk) {
+        return EvidenceError::kSchema;
+    }
+    if (const EvidenceError status = check_one_way_binding(next.trust, &transition);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t trust_generation = 0;
+    if (field_u64(next.trust, "trust_generation", trust_generation) != EvidenceError::kOk ||
+        trust_generation != generation) {
+        return EvidenceError::kSchema;
+    }
+    if (field_is(next.trust, "predecessor_trust_id", previous_trust_id) != EvidenceError::kOk) {
+        return EvidenceError::kSchema;
+    }
+    std::uint64_t predecessor_file_size = 0;
+    if (field_u64(next.trust, "predecessor_file_size", predecessor_file_size) !=
+            EvidenceError::kOk ||
+        predecessor_file_size != previous.trust_bytes.size() ||
+        field_is(next.trust, "predecessor_file_sha256", digest_hex(previous.trust_bytes)) !=
+            EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    if (field_is(next.trust, "bootstrap_key_sha256", digest_hex(bootstrap_key)) !=
+        EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    if (field_u64(next.trust, "revocation_generation", next.revocation_generation) !=
+            EvidenceError::kOk ||
+        next.revocation_generation < previous.revocation_generation) {
+        return EvidenceError::kAuthorization;
+    }
+    if (const EvidenceError status = field_text(next.trust, "revocation_id", next.revocation_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status =
+            field_text(next.trust, "revocation_file_sha256", next.revocation_digest);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (next.revocation_generation == previous.revocation_generation &&
+        (next.revocation_id != previous.revocation_id ||
+         next.revocation_digest != previous.revocation_digest)) {
+        return EvidenceError::kAuthorization;
+    }
+    std::string registry_id;
+    if (const EvidenceError status = field_text(next.trust, "registry_id", registry_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t registry_size = 0;
+    if (const EvidenceError status =
+            field_u64(next.trust, "authority_registry_file_size", registry_size);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::string registry_digest;
+    if (const EvidenceError status =
+            field_text(next.trust, "authority_registry_file_sha256", registry_digest);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (registry_digest == previous.registry.digest) {
+        if (registry_id != previous.registry.registry_id ||
+            registry_size != previous.registry.bytes.size()) {
+            return EvidenceError::kDigest;
+        }
+        next.registry = previous.registry;
+    } else {
+        if (const EvidenceError status =
+                load_registry(admission_fd, evidence_fd, registry_id, transition_date,
+                              bootstrap_key, &previous.registry, next.registry, chain_bytes);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        if (next.registry.bytes.size() != registry_size ||
+            next.registry.digest != registry_digest) {
+            return EvidenceError::kDigest;
+        }
+    }
+    if (field_is(transition, "registry_id", registry_id) != EvidenceError::kOk) {
+        return EvidenceError::kSchema;
+    }
+    std::uint64_t transition_registry_size = 0;
+    if (field_u64(transition, "authority_registry_file_size", transition_registry_size) !=
+            EvidenceError::kOk ||
+        transition_registry_size != next.registry.bytes.size() ||
+        field_is(transition, "authority_registry_file_sha256", next.registry.digest) !=
+            EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    next.transition_date = transition_date;
+    return EvidenceError::kOk;
+}
+
+EvidenceError reread_retained_current(PreparedCapability& prepared) {
+    struct stat status{};
+    if (fstat(prepared.current_fd.get(), &status) != 0) {
+        return EvidenceError::kIo;
+    }
+    if (!S_ISREG(status.st_mode) ||
+        static_cast<std::uint64_t>(status.st_dev) != prepared.current_device ||
+        static_cast<std::uint64_t>(status.st_ino) != prepared.current_inode ||
+        static_cast<std::uint64_t>(status.st_size) != prepared.current_size) {
+        return EvidenceError::kRace;
+    }
+    if (lseek(prepared.current_fd.get(), 0, SEEK_SET) < 0) {
+        return EvidenceError::kIo;
+    }
+    std::string again(static_cast<std::size_t>(prepared.current_size), '\0');
+    std::size_t got = 0;
+    while (got < again.size()) {
+        const ssize_t count =
+            read(prepared.current_fd.get(), again.data() + got, again.size() - got);
+        if (count < 0) {
+            return EvidenceError::kIo;
+        }
+        if (count == 0) {
+            return EvidenceError::kSize;
+        }
+        got += static_cast<std::size_t>(count);
+    }
+    if (again != prepared.current_bytes || again != prepared.successor_bytes) {
+        return EvidenceError::kRace;
+    }
+    if (!prepared.trust_fd || !prepared.payload_fd || prepared.payload_path.empty()) {
+        return EvidenceError::kInternal;
+    }
+    struct stat retained{};
+    if (fstat(prepared.payload_fd.get(), &retained) != 0) {
+        return EvidenceError::kIo;
+    }
+    if (!S_ISREG(retained.st_mode) ||
+        static_cast<std::uint32_t>(retained.st_mode & 0777) != prepared.payload_mode ||
+        static_cast<std::uint64_t>(retained.st_nlink) != prepared.payload_nlink ||
+        static_cast<std::uint64_t>(retained.st_dev) != prepared.payload_device ||
+        static_cast<std::uint64_t>(retained.st_ino) != prepared.payload_inode ||
+        static_cast<std::uint64_t>(retained.st_size) != prepared.payload_size) {
+        return EvidenceError::kRace;
+    }
+    std::string retained_bytes;
+    const EvidenceError retained_read = read_limited(
+        prepared.payload_fd.get(), prepared.payload_size, kMaxCanonicalRecordBytes, retained_bytes);
+    if (retained_read == EvidenceError::kIo) {
+        return retained_read;
+    }
+    if (retained_read != EvidenceError::kOk || retained_bytes != prepared.payload_bytes) {
+        return EvidenceError::kRace;
+    }
+    struct stat payload_status{};
+    Fd payload;
+    if (const EvidenceError opened =
+            open_readonly(prepared.trust_fd.get(), prepared.payload_path, payload, payload_status,
+                          FilePolicy::kTrustFamily);
+        opened != EvidenceError::kOk) {
+        return EvidenceError::kRace;
+    }
+    if (static_cast<std::uint64_t>(payload_status.st_dev) != prepared.payload_device ||
+        static_cast<std::uint64_t>(payload_status.st_ino) != prepared.payload_inode ||
+        static_cast<std::uint64_t>(payload_status.st_size) != prepared.payload_size ||
+        static_cast<std::uint64_t>(payload_status.st_dev) !=
+            static_cast<std::uint64_t>(retained.st_dev) ||
+        static_cast<std::uint64_t>(payload_status.st_ino) !=
+            static_cast<std::uint64_t>(retained.st_ino)) {
+        return EvidenceError::kRace;
+    }
+    std::string payload_again;
+    if (const EvidenceError reread_payload = read_opened(payload.get(), prepared.payload_size,
+                                                         kMaxCanonicalRecordBytes, payload_again);
+        reread_payload != EvidenceError::kOk || payload_again != prepared.payload_bytes) {
+        return EvidenceError::kRace;
+    }
+    return EvidenceError::kOk;
+}
+
+EvidenceError prepare_authenticated_capability(
+    std::string_view operation, std::string_view authorization_bytes,
+    std::string_view canonical_authorization_path, std::string_view target_id,
+    std::string_view trust_root, std::string_view evidence_root, std::string_view admission_root,
+    std::string_view terminal_trust_state_id, std::string_view terminal_effective_date,
+    std::string_view signer_key_id, std::string_view key_valid_from,
+    std::string_view key_valid_until, PreparedCapability& prepared) {
+    if (operation != "stale-lock" && operation != "reservation-deletion" &&
+        operation != "quarantine-deletion") {
+        return EvidenceError::kAuthorization;
+    }
+    if (authorization_bytes.empty()) {
+        return EvidenceError::kUnavailable;
+    }
+    if (const EvidenceError status = require_id(terminal_trust_state_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_id(signer_key_id); status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_date(terminal_effective_date);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_date(key_valid_from); status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = require_date(key_valid_until); status != EvidenceError::kOk) {
+        return status;
+    }
+    if (key_valid_from > key_valid_until) {
+        return EvidenceError::kDate;
+    }
+    if (canonical_authorization_path.empty() || target_id.empty()) {
+        return EvidenceError::kPath;
+    }
+    Fd trust;
+    Fd evidence;
+    Fd admission;
+    if (const EvidenceError status = open_root(trust_root, trust); status != EvidenceError::kOk) {
+        return unavailable_input(status);
+    }
+    if (const EvidenceError status = open_root(evidence_root, evidence);
+        status != EvidenceError::kOk) {
+        return unavailable_input(status);
+    }
+    if (const EvidenceError status = open_root(admission_root, admission);
+        status != EvidenceError::kOk) {
+        return unavailable_input(status);
+    }
+    if (const EvidenceError status =
+            directory_identity(evidence.get(), prepared.evidence_device, prepared.evidence_inode,
+                               prepared.evidence_kind);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status =
+            directory_identity(admission.get(), prepared.admission_device, prepared.admission_inode,
+                               prepared.admission_kind);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    struct stat current_status{};
+    if (const EvidenceError status =
+            open_readonly(trust.get(), "current", prepared.current_fd, current_status);
+        status != EvidenceError::kOk) {
+        return unavailable_input(status);
+    }
+    if (current_status.st_size == 0 ||
+        static_cast<std::uint64_t>(current_status.st_size) > kMaxCanonicalRecordBytes) {
+        return EvidenceError::kSize;
+    }
+    prepared.current_device = static_cast<std::uint64_t>(current_status.st_dev);
+    prepared.current_inode = static_cast<std::uint64_t>(current_status.st_ino);
+    prepared.current_size = static_cast<std::uint64_t>(current_status.st_size);
+    if (const EvidenceError status = read_opened(prepared.current_fd.get(), prepared.current_size,
+                                                 kMaxCanonicalRecordBytes, prepared.current_bytes);
+        status != EvidenceError::kOk) {
+        return unavailable_input(status);
+    }
+
+    ClosedRecord locator;
+    if (const EvidenceError status = parse_closed(prepared.current_bytes, kTrustStateKeys, locator);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::string terminal_id;
+    std::string terminal_path;
+    if (const EvidenceError status = field_text(locator, "terminal_transition_id", terminal_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_text(locator, "terminal_transition_path", terminal_path);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t terminal_generation = 0;
+    if (const EvidenceError status = field_u64(locator, "trust_generation", terminal_generation);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::uint64_t chain_bytes = prepared.current_bytes.size();
+    std::vector<std::string> forward_ids;
+    if (terminal_id == "genesis-v1") {
+        if (terminal_path != "genesis/transition.record" || terminal_generation != 1) {
+            return EvidenceError::kSchema;
+        }
+    } else {
+        if (terminal_generation < 1 || terminal_generation > 64) {
+            return EvidenceError::kSchema;
+        }
+        if (terminal_generation < 2) {
+            return EvidenceError::kState;
+        }
+        std::string walk_id = terminal_id;
+        std::string walk_path = terminal_path;
+        std::uint64_t walk_generation = terminal_generation;
+        std::set<std::string> seen_ids;
+        std::set<std::string> seen_paths;
+        std::vector<std::string> backward;
+        while (walk_id != "genesis-v1") {
+            if (!seen_ids.insert(walk_id).second || !seen_paths.insert(walk_path).second) {
+                return EvidenceError::kSchema;
+            }
+            if (backward.size() >= 63) {
+                return EvidenceError::kSize;
+            }
+            if (const EvidenceError status = require_id(walk_id); status != EvidenceError::kOk) {
+                return status;
+            }
+            const std::string expected = "transitions/" + walk_id + "/transition.record";
+            if (walk_path != expected) {
+                return EvidenceError::kPath;
+            }
+            std::string bytes;
+            if (const EvidenceError status =
+                    read_tree_file(trust.get(), walk_path, kMaxCanonicalRecordBytes, bytes,
+                                   FilePolicy::kTrustFamily);
+                status != EvidenceError::kOk) {
+                return status;
+            }
+            if (const EvidenceError status = add_chain_bytes(chain_bytes, bytes.size());
+                status != EvidenceError::kOk) {
+                return status;
+            }
+
+            ClosedRecord located;
+            if (const EvidenceError status = parse_closed(bytes, kTrustTransitionKeys, located);
+                status != EvidenceError::kOk) {
+                return status;
+            }
+            std::uint64_t file_generation = 0;
+            if (const EvidenceError status =
+                    field_u64(located, "trust_generation", file_generation);
+                status != EvidenceError::kOk) {
+                return status;
+            }
+            if (file_generation < 1 || file_generation > 64 || walk_generation == 0) {
+                return EvidenceError::kSchema;
+            }
+            if (file_generation != walk_generation) {
+                return EvidenceError::kState;
+            }
+            backward.push_back(walk_id);
+            if (const EvidenceError status =
+                    field_text(located, "predecessor_transition_id", walk_id);
+                status != EvidenceError::kOk) {
+                return status;
+            }
+            if (const EvidenceError status =
+                    field_text(located, "predecessor_transition_path", walk_path);
+                status != EvidenceError::kOk) {
+                return status;
+            }
+            --walk_generation;
+        }
+        if (walk_path != "genesis/transition.record") {
+            return EvidenceError::kSchema;
+        }
+        if (walk_generation != 1) {
+            return EvidenceError::kState;
+        }
+        forward_ids.assign(backward.rbegin(), backward.rend());
+    }
+    std::string bootstrap_key;
+    ChainState state;
+    if (const EvidenceError status = verify_genesis(trust.get(), admission.get(), evidence.get(),
+                                                    state, bootstrap_key, chain_bytes);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    for (const std::string& transition_id : forward_ids) {
+        ChainState successor;
+        if (const EvidenceError status =
+                verify_forward_transition(trust.get(), admission.get(), evidence.get(), state,
+                                          transition_id, bootstrap_key, successor, chain_bytes);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        state = std::move(successor);
+    }
+    if (state.trust_bytes != prepared.current_bytes) {
+        return EvidenceError::kRace;
+    }
+    prepared.successor_bytes = state.trust_bytes;
+    prepared.payload_path = state.payload_path;
+    prepared.payload_device = state.payload_device;
+    prepared.payload_inode = state.payload_inode;
+    prepared.payload_mode = state.payload_mode;
+    prepared.payload_nlink = state.payload_nlink;
+    prepared.payload_size = state.payload_size;
+    prepared.payload_bytes = std::move(state.payload_bytes);
+    prepared.payload_fd = std::move(state.payload_fd);
+    prepared.trust_fd = Fd(dup(trust.get()));
+    if (!prepared.trust_fd) {
+        return EvidenceError::kIo;
+    }
+    std::string authenticated_trust_id;
+    std::string authenticated_date;
+    if (const EvidenceError status = field_text(state.trust, "trust_id", authenticated_trust_id);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (const EvidenceError status = field_text(state.trust, "effective_date", authenticated_date);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (authenticated_trust_id != terminal_trust_state_id ||
+        authenticated_date != terminal_effective_date) {
+        return EvidenceError::kAuthorization;
+    }
+    std::string family_target;
+    std::string signature_id;
+    std::string blob_id;
+    std::string index_id;
+    std::string relative_path;
+    std::string bound_target;
+    std::string family_name;
+    if (operation == "stale-lock") {
+        StaleLockAuthorization authorization;
+        if (const EvidenceError status =
+                parse_stale_lock_authorization(authorization_bytes, authorization);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        family_name = "stale_lock_authorization";
+        family_target = "stale-" + authorization.authorization_id;
+        signature_id = "stalelock-signature-" + authorization.authorization_id;
+        blob_id = "stalelock-sigblob-" + authorization.authorization_id;
+        index_id = "stalelock-sigindex-" + authorization.authorization_id;
+        relative_path = stale_authorization_path(authorization.authorization_id);
+        bound_target = authorization.lock_path;
+    } else {
+        std::vector<std::string> lines;
+        if (const EvidenceError status = split_canonical(authorization_bytes, lines);
+            status != EvidenceError::kOk) {
+            return status;
+        }
+        std::string target_kind;
+        if (lines.size() > 3) {
+            if (const EvidenceError status = take_value(lines[3], "target_kind", target_kind);
+                status != EvidenceError::kOk) {
+                return status;
+            }
+        }
+        if (operation == "reservation-deletion") {
+            ReservationDeletionAuthorization authorization;
+            if (const EvidenceError status =
+                    parse_reservation_deletion(authorization_bytes, authorization);
+                status != EvidenceError::kOk) {
+                return status;
+            }
+            bound_target = authorization.target_id;
+            family_target = "deletion-" + authorization.authorization_id;
+            signature_id = "deletion-signature-" + authorization.authorization_id;
+            blob_id = "deletion-sigblob-" + authorization.authorization_id;
+            index_id = "deletion-sigindex-" + authorization.authorization_id;
+            relative_path = deletion_authorization_path(authorization.authorization_id);
+        } else {
+            QuarantineDeletionAuthorization authorization;
+            if (const EvidenceError status =
+                    parse_quarantine_deletion(authorization_bytes, authorization);
+                status != EvidenceError::kOk) {
+                return status;
+            }
+            bound_target = authorization.target_id;
+            family_target = "deletion-" + authorization.authorization_id;
+            signature_id = "deletion-signature-" + authorization.authorization_id;
+            blob_id = "deletion-sigblob-" + authorization.authorization_id;
+            index_id = "deletion-sigindex-" + authorization.authorization_id;
+            relative_path = deletion_authorization_path(authorization.authorization_id);
+        }
+        family_name = "deletion_authorization";
+        static_cast<void>(target_kind);
+    }
+    if (canonical_authorization_path != relative_path || target_id != bound_target) {
+        return EvidenceError::kAuthorization;
+    }
+    std::string stored_authorization;
+    if (const EvidenceError status = read_tree_file(admission.get(), relative_path,
+                                                    kMaxCanonicalRecordBytes, stored_authorization);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (stored_authorization != authorization_bytes) {
+        return EvidenceError::kDigest;
+    }
+    const std::string blob_path = "benchmarks/generative_phase9c/signatures/" + blob_id + ".bin";
+    const std::string index_path = "signature-indexes/" + index_id + ".index";
+    const std::string verification_path = "signature-records/" + signature_id + ".record";
+    std::string signature;
+    std::string index_bytes;
+    std::string verification_bytes;
+    ClosedRecord index;
+    ClosedRecord verification;
+    if (const EvidenceError status = load_signature_parts(
+            evidence.get(), blob_path, admission.get(), index_path, admission.get(),
+            verification_path, blob_id, index_id, blob_path, signature, index, index_bytes,
+            verification, verification_bytes, chain_bytes);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    std::string record_signer;
+    if (const EvidenceError status = field_text(verification, "signer_key_id", record_signer);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    const AuthorityEntry* entry = find_authority(state.registry, record_signer);
+    if (entry == nullptr) {
+        return EvidenceError::kAuthorization;
+    }
+    if (const EvidenceError status = check_verification_common(
+            verification, signature_id, family_target, authorization_bytes.size(),
+            digest_hex(authorization_bytes), blob_id, index_id, index_bytes.size(),
+            digest_hex(index_bytes), digest_hex(signature), digest_hex(entry->public_key));
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    if (field_is(verification, "signer_key_source", "blob") != EvidenceError::kOk ||
+        field_is(verification, "key_index_id", entry->entry_id) != EvidenceError::kOk) {
+        return EvidenceError::kAuthorization;
+    }
+    std::uint64_t key_index_size = 0;
+    if (field_u64(verification, "key_index_size", key_index_size) != EvidenceError::kOk ||
+        key_index_size != entry->key_index_size ||
+        field_is(verification, "key_index_sha256", entry->key_index_sha256) != EvidenceError::kOk ||
+        field_is(verification, "public_key_sha256", entry->public_key_sha256) !=
+            EvidenceError::kOk) {
+        return EvidenceError::kDigest;
+    }
+    std::string verification_date;
+    if (const EvidenceError status =
+            field_text(verification, "verification_date", verification_date);
+        status != EvidenceError::kOk) {
+        return status;
+    }
+    VerificationRequest request;
+    request.message = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(authorization_bytes.data()),
+        authorization_bytes.size());
+    request.signature = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(signature.data()), signature.size());
+    request.public_key = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(entry->public_key.data()), entry->public_key.size());
+    const std::string authorization_digest = digest_hex(authorization_bytes);
+    request.authorization_digest = authorization_digest;
+    request.signature_family_id = family_name;
+    request.terminal_trust_state_id = authenticated_trust_id;
+    request.terminal_effective_date = authenticated_date;
+    request.registry_entry_id = entry->entry_id;
+    request.signer_key_id = entry->entry_id;
+    request.key_valid_from = entry->valid_from;
+    request.key_valid_until = entry->valid_until;
+    request.role = "trust_admin";
+    request.revocation_result = "unrevoked";
+    request.verification_date = authenticated_date;
+    request.operation = operation;
+    request.canonical_authorization_path = relative_path;
+    request.target_id = bound_target;
+    const VerificationDecision decision = verify_ed25519(request);
+    if (decision.status == VerificationStatus::kUnavailable) {
+        return EvidenceError::kUnavailable;
+    }
+    if (decision.status == VerificationStatus::kMalformed) {
+        return EvidenceError::kSchema;
+    }
+    if (decision.status != VerificationStatus::kAccepted || !decision.accepted()) {
+        return EvidenceError::kAuthorization;
+    }
+    if (decision.authorization_digest != request.authorization_digest ||
+        decision.signature_family_id != family_name ||
+        decision.terminal_trust_state_id != authenticated_trust_id ||
+        decision.terminal_effective_date != authenticated_date ||
+        decision.registry_entry_id != entry->entry_id ||
+        decision.signer_key_id != entry->entry_id || decision.key_valid_from != entry->valid_from ||
+        decision.key_valid_until != entry->valid_until || decision.role != "trust_admin" ||
+        decision.revocation_result != "unrevoked" ||
+        decision.verification_date != authenticated_date || decision.operation != operation ||
+        decision.canonical_authorization_path != relative_path ||
+        decision.target_id != bound_target) {
+        return EvidenceError::kAuthorization;
+    }
+    if (!date_in_interval(authenticated_date, entry->valid_from, entry->valid_until)) {
+        return EvidenceError::kDate;
+    }
+    if (entry->role != "trust_admin" || entry->revoked != "no" ||
+        verification_date != authenticated_date || signer_key_id != entry->entry_id ||
+        key_valid_from != entry->valid_from || key_valid_until != entry->valid_until ||
+        record_signer != entry->entry_id) {
+        return EvidenceError::kAuthorization;
+    }
+    prepared.operation = std::string(operation);
+    prepared.authorization_bytes = std::string(authorization_bytes);
+    prepared.path = std::string(relative_path);
+    prepared.target_id = std::string(bound_target);
+    prepared.evidence_root = std::string(evidence_root);
+    prepared.admission_root = std::string(admission_root);
+    prepared.trust_state_id = authenticated_trust_id;
+    prepared.effective_date = authenticated_date;
+    prepared.signer_key_id = entry->entry_id;
+    prepared.required_role = "trust_admin";
+    prepared.key_valid_from = entry->valid_from;
+    prepared.key_valid_until = entry->valid_until;
+    prepared.revocation_decision = "unrevoked";
+    prepared.signature_result = "verified";
+    return EvidenceError::kOk;
+}
+
 } // namespace
 
 EvidenceError cleanup_reservation(EvidenceLock& lock, std::string_view admission_root,
@@ -4249,24 +6932,56 @@ AuthenticatedCapability CapabilityResult::release_capability() {
 CapabilityResult AuthenticatedCapability::authenticate(
     std::string_view operation, std::string_view authorization_bytes,
     std::string_view canonical_authorization_path, std::string_view target_id,
-    std::string_view evidence_root, std::string_view admission_root,
+    std::string_view trust_root, std::string_view evidence_root, std::string_view admission_root,
     std::string_view terminal_trust_state_id, std::string_view terminal_effective_date,
     std::string_view signer_key_id, std::string_view key_valid_from,
     std::string_view key_valid_until) {
     CapabilityResult result;
     result.impl_ = std::make_unique<CapabilityResult::Impl>();
-    static_cast<void>(operation);
-    static_cast<void>(authorization_bytes);
-    static_cast<void>(canonical_authorization_path);
-    static_cast<void>(target_id);
-    static_cast<void>(evidence_root);
-    static_cast<void>(admission_root);
-    static_cast<void>(terminal_trust_state_id);
-    static_cast<void>(terminal_effective_date);
-    static_cast<void>(signer_key_id);
-    static_cast<void>(key_valid_from);
-    static_cast<void>(key_valid_until);
-    result.impl_->status = EvidenceError::kUnavailable;
+    PreparedCapability prepared;
+    const EvidenceError status = prepare_authenticated_capability(
+        operation, authorization_bytes, canonical_authorization_path, target_id, trust_root,
+        evidence_root, admission_root, terminal_trust_state_id, terminal_effective_date,
+        signer_key_id, key_valid_from, key_valid_until, prepared);
+    if (status != EvidenceError::kOk) {
+        result.impl_->status = status;
+        return result;
+    }
+    const EvidenceError reread = reread_retained_current(prepared);
+    if (reread != EvidenceError::kOk) {
+        result.impl_->status = reread;
+        return result;
+    }
+    auto state = std::make_unique<State>();
+    state->stamp = &kCapabilityStamp;
+    state->operation = std::move(prepared.operation);
+    state->authorization_bytes = std::move(prepared.authorization_bytes);
+    state->path = std::move(prepared.path);
+    state->target_id = std::move(prepared.target_id);
+    state->evidence_root = std::move(prepared.evidence_root);
+    state->admission_root = std::move(prepared.admission_root);
+    state->evidence_device = prepared.evidence_device;
+    state->evidence_inode = prepared.evidence_inode;
+    state->evidence_kind = prepared.evidence_kind;
+    state->admission_device = prepared.admission_device;
+    state->admission_inode = prepared.admission_inode;
+    state->admission_kind = prepared.admission_kind;
+    state->trust_state_id = std::move(prepared.trust_state_id);
+    state->effective_date = std::move(prepared.effective_date);
+    state->signer_key_id = std::move(prepared.signer_key_id);
+    state->required_role = std::move(prepared.required_role);
+    state->key_valid_from = std::move(prepared.key_valid_from);
+    state->key_valid_until = std::move(prepared.key_valid_until);
+    state->revocation_decision = std::move(prepared.revocation_decision);
+    state->signature_result = std::move(prepared.signature_result);
+    auto capability = std::make_unique<AuthenticatedCapability>();
+    capability->state_ = std::move(state);
+    if (!capability->holds_authority()) {
+        result.impl_->status = EvidenceError::kInternal;
+        return result;
+    }
+    result.impl_->capability = std::move(capability);
+    result.impl_->status = EvidenceError::kOk;
     return result;
 }
 

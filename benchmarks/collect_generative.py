@@ -1429,6 +1429,10 @@ class WorkerSession:
                 return bytes(line)
             if time.monotonic() >= deadline:
                 self._consume_stderr(classify=True)
+                if self.stderr_overflow:
+                    if not self.stderr_overflow_reported:
+                        self.stderr_overflow_reported = True
+                    raise CollectorError("record_schema_invalid", "oversized stderr")
                 raise CollectorError("environment_command_failed", timeout_message)
             watch = [stdout_fd]
             stderr_fd: int | None = None
@@ -1463,9 +1467,7 @@ class WorkerSession:
                     raise CollectorError("record_schema_invalid", "oversized stderr")
                 chunk = os.read(stdout_fd, 4096)
                 if not chunk:
-                    self._consume_stderr(classify=True)
-                    self._note_exit()
-                    raise CollectorError("environment_command_failed", "unexpected EOF")
+                    self._classify_stdout_eof(deadline)
                 buf.extend(chunk)
                 if len(buf) > MAX_WORKER_LINE_BYTES:
                     self._consume_stderr(classify=True)
@@ -1477,6 +1479,10 @@ class WorkerSession:
                 continue
             if stderr_fd is None or stderr_fd not in readable:
                 self._consume_stderr(classify=True)
+                if self.stderr_overflow:
+                    if not self.stderr_overflow_reported:
+                        self.stderr_overflow_reported = True
+                    raise CollectorError("record_schema_invalid", "oversized stderr")
                 raise CollectorError("environment_command_failed", timeout_message)
 
     def _reject_extra_stdout(self) -> None:
@@ -1497,17 +1503,59 @@ class WorkerSession:
                     raise CollectorError("record_schema_invalid", "oversized stderr")
                 raise CollectorError("record_schema_invalid", "extra response")
 
-    def _note_exit(self) -> None:
-        self._consume_stderr(classify=True)
+    def _classify_stdout_eof(self, deadline: float) -> None:
+        while True:
+            self._consume_stderr(classify=True)
+            if self.stderr_overflow:
+                if not self.stderr_overflow_reported:
+                    self.stderr_overflow_reported = True
+                raise CollectorError("record_schema_invalid", "oversized stderr")
+            if self.stderr_read_error is not None:
+                raise self.stderr_read_error
+            abnormal = self._abnormal_exit_error()
+            if abnormal is not None:
+                raise abnormal
+            if self.process is not None and self.process.poll() == 0:
+                raise CollectorError("environment_command_failed", "unexpected EOF")
+            now = time.monotonic()
+            if now >= deadline or self.process is None:
+                raise CollectorError("environment_command_failed", "unexpected EOF")
+            remaining = deadline - now
+            stderr_fd: int | None = None
+            if not self.stderr_at_eof and self.stderr_nonblocking:
+                stderr_fd = self._stderr_fd()
+            if stderr_fd is not None:
+                try:
+                    select.select([stderr_fd], [], [], remaining)
+                except InterruptedError:
+                    continue
+                except OSError as exc:
+                    if exc.errno == errno.EINTR:
+                        continue
+                    raise
+                continue
+            try:
+                self.process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def _abnormal_exit_error(self) -> CollectorError | None:
         if self.process is None:
-            return
+            return None
         code = self.process.poll()
         if code is None:
-            return
+            return None
         if code < 0:
-            raise CollectorError("environment_command_failed", f"worker signal exit {-code}")
+            return CollectorError("environment_command_failed", f"worker signal exit {-code}")
         if code != 0:
-            raise CollectorError("environment_command_failed", f"worker nonzero exit {code}")
+            return CollectorError("environment_command_failed", f"worker nonzero exit {code}")
+        return None
+
+    def _note_exit(self) -> None:
+        self._consume_stderr(classify=True)
+        abnormal = self._abnormal_exit_error()
+        if abnormal is not None:
+            raise abnormal
 
     def _stderr_fd(self) -> int | None:
         if self.process is None or self.process.stderr is None:
@@ -1611,6 +1659,8 @@ class WorkerSession:
                         "environment_command_failed",
                         "worker shutdown timeout",
                     )
+                else:
+                    self.cleanup_error = self._abnormal_exit_error()
             return
         if self.stderr_read_error is not None:
             raise self.stderr_read_error
@@ -1619,6 +1669,9 @@ class WorkerSession:
         if not reaped:
             self.cleanup_error = CollectorError("environment_command_failed", "worker shutdown timeout")
             raise self.cleanup_error
+        abnormal = self._abnormal_exit_error()
+        if abnormal is not None:
+            raise abnormal
 
     def _close_owned_pipes(self) -> None:
         if self.pipes_closed:
@@ -1643,6 +1696,10 @@ class WorkerSession:
                     on_wait=None,
                     close_pipes=False,
                 )
+                if not active:
+                    abnormal = self._abnormal_exit_error()
+                    if abnormal is not None:
+                        raise abnormal
                 return
             reaped = reap_owned_process(
                 self.process,

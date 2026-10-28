@@ -88,8 +88,16 @@ add_executable(
     tests/oracle_digest_test.cpp
     src/evidence_store.cpp
     tests/evidence_store_test.cpp
+    src/ed25519_verify.cpp
+    tests/ed25519_verify_test.cpp
 )
 target_link_libraries(inferedge_tests PRIVATE inferedge_core GTest::gtest_main)
+if(NOT APPLE)
+    # Linux test-only openat interposition. Production targets do not use --wrap.
+    # Apple coordination rebinds the test executable's openat fixups in the test
+    # translation unit and adds no link option.
+    target_link_options(inferedge_tests PRIVATE "LINKER:--wrap=openat")
+endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/onnxruntime.cmake")
 
