@@ -2713,13 +2713,25 @@ class StderrCapTests(unittest.TestCase):
         kwargs.setdefault("shutdown_grace_s", 0.4)
         kwargs.setdefault("shutdown_term_s", 0.2)
         kwargs.setdefault("shutdown_kill_s", 0.4)
-        argv = [str(harness.ie), "--worker-stdio", "--package", str(harness.package), "--ready-path", str(root / "worker-ready")]
+        interpreter = Path(sys.executable)
+        self.assertTrue(interpreter.is_absolute())
+        launch_executable = interpreter.resolve()
+        ready_path = str(root / "worker-ready")
+        argv = [
+            str(launch_executable),
+            str(harness.ie),
+            "--worker-stdio",
+            "--package",
+            str(harness.package),
+            "--ready-path",
+            ready_path,
+        ]
         escaped = root / "escaped.pid"
         if behavior == "stderr_close_escaped":
             argv.extend(["--escaped-pid", str(escaped)])
         if isinstance(overflow_marker, Path):
             argv.extend(["--overflow-marker", str(overflow_marker)])
-        worker = collect.WorkerSession(harness.ie, argv, "inferedge", **kwargs)
+        worker = collect.WorkerSession(launch_executable, argv, "inferedge", **kwargs)
         if worker.process is not None:
             self.pids.append(worker.process.pid)
         return worker
@@ -3651,6 +3663,40 @@ class StderrCapTests(unittest.TestCase):
                     except CollectorError:
                         pass
         self._assert_no_background(before_threads, before_fds)
+
+    def test_stderr_cap_session_invokes_fake_worker_via_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            interpreter = Path(sys.executable)
+            self.assertTrue(interpreter.is_absolute())
+            launch_executable = interpreter.resolve()
+            worker = self._session(root, "ok", request_timeout_s=0.5)
+            fake_worker = root / "inferedge-overhead-ie"
+            self.assertTrue(fake_worker.is_file())
+            self.assertEqual(worker.executable, launch_executable)
+            self.assertEqual(worker.argv[0], str(launch_executable))
+            self.assertEqual(worker.argv[1], str(fake_worker))
+            self.assertEqual(worker.argv[2], "--worker-stdio")
+            self.assertEqual(worker.argv[3], "--package")
+            self.assertEqual(worker.argv[4], str(root / "package"))
+            self.assertEqual(worker.argv[5], "--ready-path")
+            self.assertEqual(worker.argv[6], str(root / "worker-ready"))
+            self.assertNotEqual(worker.executable, fake_worker)
+            self.assertNotEqual(worker.argv[0], str(fake_worker))
+            assert worker.process is not None
+            pid = worker.process.pid
+            try:
+                self._wait_ready(root)
+                identity = worker.request({"op": "identity"})
+                self.assertTrue(identity["ok"])
+                worker.close()
+                self._assert_closed(worker, pid)
+            finally:
+                if worker.process is not None:
+                    try:
+                        worker.close()
+                    except CollectorError:
+                        pass
 
     def test_stderr_cap_is_deterministic_under_contention(self) -> None:
         for _repetition in range(3):
