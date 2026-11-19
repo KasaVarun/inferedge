@@ -1604,20 +1604,31 @@ class WorkerSession:
                     self.stderr_overflow_reported = True
                     raise CollectorError("record_schema_invalid", "oversized stderr")
 
-    def _authoritative_drain(self, reaped: bool) -> None:
+    def _authoritative_drain(self, _reaped: bool) -> None:
         self._consume_stderr(classify=False)
-        if self.stderr_at_eof or not reaped:
+        if self.stderr_at_eof or self.stderr_overflow:
             return
         fd = self._stderr_fd()
         if fd is None:
             return
         deadline = time.monotonic() + self.shutdown_kill_s
-        while not self.stderr_at_eof:
+        while not self.stderr_at_eof and not self.stderr_overflow:
+            exited = self.process is not None and self.process.poll() is not None
+            if exited:
+                before_total = self.stderr_total
+                self._consume_stderr(classify=False)
+                if (
+                    self.stderr_at_eof
+                    or self.stderr_overflow
+                    or self.stderr_total != before_total
+                ):
+                    continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             try:
-                _readable, _, _ = select.select([fd], [], [], remaining)
+                slice_s = min(REAP_SLICE_S, remaining)
+                _readable, _, _ = select.select([fd], [], [], slice_s)
             except InterruptedError:
                 continue
             except OSError as exc:
@@ -1629,9 +1640,15 @@ class WorkerSession:
                         f"worker stderr read failed: {exc.errno}",
                     )
                 return
-            self._consume_stderr(classify=False)
-        if not self.stderr_at_eof:
-            self.stderr_inherited_open = True
+            if _readable:
+                self._consume_stderr(classify=False)
+                continue
+            if exited:
+                self._consume_stderr(classify=False)
+        if not self.stderr_at_eof and not self.stderr_overflow:
+            process_exited = self.process is None or self.process.poll() is not None
+            if _reaped and process_exited:
+                self.stderr_inherited_open = True
 
     def _classify_close(self, reaped: bool, active: bool) -> None:
         if self.stderr_overflow and not self.stderr_overflow_reported:
