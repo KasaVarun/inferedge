@@ -1,4 +1,4 @@
-# Pinned ONNX Runtime 1.31.0 CPU packages.
+# Pinned ONNX Runtime 1.31.0 from the official Microsoft NuGet package.
 #
 # The archives ship CMake files that point at include/onnxruntime and, on
 # Linux, lib64. Those paths are not in the archives. This module checks the
@@ -8,29 +8,33 @@ set(INFEREDGE_ONNXRUNTIME_VERSION "1.31.0")
 set(INFEREDGE_ONNXRUNTIME_ROOT "" CACHE PATH
     "Extracted ONNX Runtime 1.31.0 CPU package. Empty downloads the pinned archive.")
 
-set(INFEREDGE_ONNXRUNTIME_URL_BASE
-    "https://github.com/microsoft/onnxruntime/releases/download/v${INFEREDGE_ONNXRUNTIME_VERSION}")
+set(INFEREDGE_ONNXRUNTIME_OFFICIAL_NUPKG_ID "Microsoft.ML.OnnxRuntime")
+set(INFEREDGE_ONNXRUNTIME_OFFICIAL_NUPKG_VERSION "1.31.0")
+set(INFEREDGE_ONNXRUNTIME_NUPKG_ARCHIVE
+    "microsoft.ml.onnxruntime.${INFEREDGE_ONNXRUNTIME_OFFICIAL_NUPKG_VERSION}.nupkg")
+set(INFEREDGE_ONNXRUNTIME_NUPKG_SHA256
+    "7e35fdb4f5adb62f01e60798e2e5ed05108f5fbbe1cca03fbcc37903cf7c5e3b")
+set(INFEREDGE_ONNXRUNTIME_OFFICIAL_DOWNLOAD_URL
+    "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${INFEREDGE_ONNXRUNTIME_OFFICIAL_NUPKG_VERSION}/${INFEREDGE_ONNXRUNTIME_NUPKG_ARCHIVE}")
 
 if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
-    set(INFEREDGE_ONNXRUNTIME_ARCHIVE "onnxruntime-osx-arm64-${INFEREDGE_ONNXRUNTIME_VERSION}.tgz")
-    set(INFEREDGE_ONNXRUNTIME_SHA256
-        "1031b36dd3bdaa8d976a6130d9cf2a05e9be320b93ae804f8427b91dc3432afc")
+    set(INFEREDGE_ONNXRUNTIME_ARCHIVE "${INFEREDGE_ONNXRUNTIME_NUPKG_ARCHIVE}")
+    set(INFEREDGE_ONNXRUNTIME_SHA256 "${INFEREDGE_ONNXRUNTIME_NUPKG_SHA256}")
     set(INFEREDGE_ONNXRUNTIME_PACKAGE_DIR
         "onnxruntime-osx-arm64-${INFEREDGE_ONNXRUNTIME_VERSION}")
     set(INFEREDGE_ONNXRUNTIME_LIBRARY_RELATIVE "lib/libonnxruntime.1.31.0.dylib")
     set(INFEREDGE_ONNXRUNTIME_SONAME_RELATIVE "lib/libonnxruntime.1.dylib")
-    set(INFEREDGE_ONNXRUNTIME_OFFICIAL_DOWNLOAD_URL
-        "https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-osx-arm64-1.31.0.tgz")
+    set(INFEREDGE_ONNXRUNTIME_NUPKG_NATIVE_RELATIVE
+        "runtimes/osx-arm64/native/libonnxruntime.dylib")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-    set(INFEREDGE_ONNXRUNTIME_ARCHIVE "onnxruntime-linux-x64-${INFEREDGE_ONNXRUNTIME_VERSION}.tgz")
-    set(INFEREDGE_ONNXRUNTIME_SHA256
-        "cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57")
+    set(INFEREDGE_ONNXRUNTIME_ARCHIVE "${INFEREDGE_ONNXRUNTIME_NUPKG_ARCHIVE}")
+    set(INFEREDGE_ONNXRUNTIME_SHA256 "${INFEREDGE_ONNXRUNTIME_NUPKG_SHA256}")
     set(INFEREDGE_ONNXRUNTIME_PACKAGE_DIR
         "onnxruntime-linux-x64-${INFEREDGE_ONNXRUNTIME_VERSION}")
     set(INFEREDGE_ONNXRUNTIME_LIBRARY_RELATIVE "lib/libonnxruntime.so.1.31.0")
     set(INFEREDGE_ONNXRUNTIME_SONAME_RELATIVE "lib/libonnxruntime.so.1")
-    set(INFEREDGE_ONNXRUNTIME_OFFICIAL_DOWNLOAD_URL
-        "https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-1.31.0.tgz")
+    set(INFEREDGE_ONNXRUNTIME_NUPKG_NATIVE_RELATIVE
+        "runtimes/linux-x64/native/libonnxruntime.so")
 else()
     message(FATAL_ERROR
         "ONNX Runtime ${INFEREDGE_ONNXRUNTIME_VERSION} has no pinned CPU archive for "
@@ -345,6 +349,55 @@ endfunction()
 
 # inferedge:onnxruntime-download-helpers-end
 
+
+function(inferedge_onnxruntime_materialize_from_nupkg nupkg_root package_root)
+    set(include_src "${nupkg_root}/build/native/include")
+    set(native_src "${nupkg_root}/${INFEREDGE_ONNXRUNTIME_NUPKG_NATIVE_RELATIVE}")
+    if(NOT EXISTS "${include_src}/onnxruntime_cxx_api.h")
+        message(FATAL_ERROR
+            "Official ONNX Runtime NuGet at ${nupkg_root} is missing C++ headers.")
+    endif()
+    if(NOT EXISTS "${native_src}")
+        message(FATAL_ERROR
+            "Official ONNX Runtime NuGet at ${nupkg_root} is missing native library "
+            "${INFEREDGE_ONNXRUNTIME_NUPKG_NATIVE_RELATIVE}.")
+    endif()
+
+    file(MAKE_DIRECTORY "${package_root}/include")
+    file(COPY "${include_src}/" DESTINATION "${package_root}/include")
+
+    file(MAKE_DIRECTORY "${package_root}/lib")
+    if(APPLE)
+        set(versioned_lib "${package_root}/lib/libonnxruntime.1.31.0.dylib")
+        execute_process(
+            COMMAND "${CMAKE_COMMAND}" -E copy
+                "${native_src}" "${versioned_lib}")
+        file(CREATE_LINK
+            "libonnxruntime.1.31.0.dylib"
+            "${package_root}/lib/libonnxruntime.1.dylib"
+            SYMBOLIC)
+        file(CREATE_LINK
+            "libonnxruntime.1.31.0.dylib"
+            "${package_root}/lib/libonnxruntime.dylib"
+            SYMBOLIC)
+    else()
+        set(versioned_lib "${package_root}/lib/libonnxruntime.so.1.31.0")
+        execute_process(
+            COMMAND "${CMAKE_COMMAND}" -E copy
+                "${native_src}" "${versioned_lib}")
+        file(CREATE_LINK
+            "libonnxruntime.so.1.31.0"
+            "${package_root}/lib/libonnxruntime.so.1"
+            SYMBOLIC)
+        file(CREATE_LINK
+            "libonnxruntime.so.1"
+            "${package_root}/lib/libonnxruntime.so"
+            SYMBOLIC)
+    endif()
+
+    file(WRITE "${package_root}/VERSION_NUMBER" "${INFEREDGE_ONNXRUNTIME_VERSION}\n")
+endfunction()
+
 function(inferedge_require_onnxruntime_layout root)
     set(header "${root}/include/onnxruntime_cxx_api.h")
     set(library "${root}/${INFEREDGE_ONNXRUNTIME_LIBRARY_RELATIVE}")
@@ -402,18 +455,27 @@ else()
             set(inferedge_onnxruntime_need_extract FALSE)
         endif()
     endif()
+    set(INFEREDGE_ONNXRUNTIME_NUPKG_ROOT
+        "${INFEREDGE_ONNXRUNTIME_EXTRACT_DIR}/nupkg-${INFEREDGE_ONNXRUNTIME_OFFICIAL_NUPKG_VERSION}")
+    set(INFEREDGE_ONNXRUNTIME_PACKAGE_ROOT
+        "${INFEREDGE_ONNXRUNTIME_EXTRACT_DIR}/${INFEREDGE_ONNXRUNTIME_PACKAGE_DIR}")
+
     if(inferedge_onnxruntime_need_extract)
+        file(MAKE_DIRECTORY "${INFEREDGE_ONNXRUNTIME_NUPKG_ROOT}")
         file(ARCHIVE_EXTRACT
             INPUT "${INFEREDGE_ONNXRUNTIME_ARCHIVE_PATH}"
-            DESTINATION "${INFEREDGE_ONNXRUNTIME_EXTRACT_DIR}"
+            DESTINATION "${INFEREDGE_ONNXRUNTIME_NUPKG_ROOT}"
         )
+        file(MAKE_DIRECTORY "${INFEREDGE_ONNXRUNTIME_PACKAGE_ROOT}")
+        inferedge_onnxruntime_materialize_from_nupkg(
+            "${INFEREDGE_ONNXRUNTIME_NUPKG_ROOT}"
+            "${INFEREDGE_ONNXRUNTIME_PACKAGE_ROOT}")
         file(WRITE "${INFEREDGE_ONNXRUNTIME_STAMP}" "${INFEREDGE_ONNXRUNTIME_SHA256}\n")
     endif()
-    inferedge_require_onnxruntime_layout(
-        "${INFEREDGE_ONNXRUNTIME_EXTRACT_DIR}/${INFEREDGE_ONNXRUNTIME_PACKAGE_DIR}")
+    inferedge_require_onnxruntime_layout("${INFEREDGE_ONNXRUNTIME_PACKAGE_ROOT}")
     message(STATUS
-        "ONNX Runtime ${INFEREDGE_ONNXRUNTIME_VERSION} CPU archive verified "
-        "(${INFEREDGE_ONNXRUNTIME_ARCHIVE})")
+        "ONNX Runtime ${INFEREDGE_ONNXRUNTIME_VERSION} official NuGet verified "
+        "(${INFEREDGE_ONNXRUNTIME_OFFICIAL_NUPKG_ID} ${INFEREDGE_ONNXRUNTIME_OFFICIAL_NUPKG_VERSION})")
 endif()
 
 set(INFEREDGE_ONNXRUNTIME_INCLUDE_DIR "${INFEREDGE_ONNXRUNTIME_RESOLVED_ROOT}/include")
